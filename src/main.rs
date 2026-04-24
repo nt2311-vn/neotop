@@ -807,10 +807,7 @@ fn delete_halted_state(app: &mut App) {
         return;
     };
     let Some(row) = app.vms.get(i) else { return };
-    if row.state.phase == "halted"
-        || row.state.phase == "shutdown"
-        || row.state.phase == "error"
-    {
+    if row.state.phase == "halted" || row.state.phase == "shutdown" || row.state.phase == "error" {
         let _ = fs::remove_file(&row.path);
         if let Some(parent) = row.path.parent() {
             let _ = fs::remove_dir(parent);
@@ -1220,7 +1217,10 @@ fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .map_or_else(|| "—".to_string(), |v| format!("{v:.1}%"));
     let line = Line::from(vec![
         Span::styled("scan ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.1}ms", p.scan_ms), Style::default().fg(scan_color)),
+        Span::styled(
+            format!("{:.1}ms", p.scan_ms),
+            Style::default().fg(scan_color),
+        ),
         Span::raw(" "),
         Span::styled("render ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -1343,10 +1343,8 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let header = Row::new(vec![
-        "PID", "USER", "S", "CPU%", "RSS", "THR", "COMMAND",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["PID", "USER", "S", "CPU%", "RSS", "THR", "COMMAND"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
 
     let body: Vec<Row> = app
         .procs_visible
@@ -1403,7 +1401,9 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
 fn proc_state_style(c: char) -> Style {
     match c {
-        'R' => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        'R' => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         'D' => Style::default().fg(Color::Red),
         'Z' => Style::default().fg(Color::Magenta),
         'T' | 't' => Style::default().fg(Color::Yellow),

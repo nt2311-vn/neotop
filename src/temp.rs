@@ -179,11 +179,7 @@ mod tests {
 
     #[test]
     fn highlights_falls_back_to_hottest_when_no_priority_tag() {
-        let readings = vec![
-            r("acpitz", 40.0),
-            r("zone7", 80.0),
-            r("amd_pmf", 55.0),
-        ];
+        let readings = vec![r("acpitz", 40.0), r("zone7", 80.0), r("amd_pmf", 55.0)];
         let picks = highlights(&readings, 2);
         // No priority tag matches; sorted by hottest first.
         assert_eq!(picks[0].label, "zone7");

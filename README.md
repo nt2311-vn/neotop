@@ -1,5 +1,7 @@
 # neotop
 
+[![ci](https://github.com/nt2311/neotop/actions/workflows/ci.yml/badge.svg)](https://github.com/nt2311/neotop/actions/workflows/ci.yml)
+
 Live terminal observer for **neosandbox microVMs** and the host running
 them.
 
@@ -41,13 +43,18 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 
 ### Controls
 
-| Key | Action |
-| --- | --- |
-| `q` / `Ctrl-C` | quit |
-| `j` / `↓` | select next VM |
-| `k` / `↑` | select previous VM |
-| `r` | refresh now |
-| `x` | delete `state.json` for the selected halted VM |
+| Key | View | Action |
+| --- | --- | --- |
+| `q` / `Ctrl-C` | both | quit |
+| `Tab` | both | toggle Vms / Procs view |
+| `j` / `↓` | both | next row |
+| `k` / `↑` | both | previous row |
+| `r` | both | refresh now |
+| `x` | Vms | delete `state.json` for the selected halted VM |
+| `s` | Procs | cycle sort key (CPU → MEM → PID → CMD) |
+| `/` | Procs | enter filter mode (Esc clears, Enter applies) |
+| `K` | Procs | send SIGTERM to the selected pid (with confirm) |
+| `Ctrl-K` | Procs | send SIGKILL to the selected pid (with confirm) |
 
 ## What it shows
 
@@ -66,6 +73,17 @@ RSS IO MMIO HLT SHDN LAST_SERIAL`.
 right is a resource pane with live `/proc/<pid>/` stats, a 15-second
 CPU% sparkline, cgroup-v2 path + memory.current/max, and the rlimits
 that actually matter for microVMs.
+
+**Procs view (`Tab` to switch):** htop-style process table for every
+PID on the host — `PID USER STATE CPU% RSS THR COMMAND`. Sortable by
+CPU%, RSS, PID, or command. Substring filter, and SIGTERM/SIGKILL with
+a confirmation prompt before either signal is delivered.
+
+**Footer:** quick help on the left; on the right, neotop measures and
+shows its own overhead — scan/render time in milliseconds, our own
+VmRSS, our own CPU%, and the actual tick interval. If a `/proc` or
+`/sys` read fails non-fatally, the latest entry from the error ring
+appears between the help text and perf metrics for 5 seconds.
 
 ## State contract
 
