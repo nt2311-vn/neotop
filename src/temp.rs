@@ -10,15 +10,21 @@
 
 use std::fs;
 
+use crate::errors::ErrorRing;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Reading {
     pub(crate) label: String,
     pub(crate) celsius: f64,
 }
 
-pub(crate) fn snapshot() -> Vec<Reading> {
-    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
-        return Vec::new();
+pub(crate) fn snapshot(errors: &mut ErrorRing) -> Vec<Reading> {
+    let entries = match fs::read_dir("/sys/class/hwmon") {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push("hwmon", format!("/sys/class/hwmon: {e}"));
+            return Vec::new();
+        }
     };
     let mut readings = Vec::new();
 

@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::errors::ErrorRing;
+
 #[derive(Debug, Clone)]
 pub(crate) struct HostInfo {
     pub(crate) kernel: String,
@@ -43,9 +45,13 @@ pub(crate) struct CpuSamples {
     pub(crate) per_core: Vec<CpuSample>,
 }
 
-pub(crate) fn read_cpu_samples() -> CpuSamples {
-    let Ok(raw) = fs::read_to_string("/proc/stat") else {
-        return CpuSamples::default();
+pub(crate) fn read_cpu_samples(errors: &mut ErrorRing) -> CpuSamples {
+    let raw = match fs::read_to_string("/proc/stat") {
+        Ok(r) => r,
+        Err(e) => {
+            errors.push("host", format!("/proc/stat: {e}"));
+            return CpuSamples::default();
+        }
     };
     let mut agg: Option<CpuSample> = None;
     let mut per_core: Vec<CpuSample> = Vec::new();
@@ -105,8 +111,8 @@ fn delta_pct(prev: CpuSample, cur: CpuSample) -> Option<f64> {
     Some(pct)
 }
 
-pub(crate) fn snapshot(prev: Option<&CpuSamples>) -> HostInfo {
-    let cur = read_cpu_samples();
+pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> HostInfo {
+    let cur = read_cpu_samples(errors);
 
     let cpu_pct = match (prev.and_then(|p| p.aggregate), cur.aggregate) {
         (Some(p), Some(c)) => delta_pct(p, c),
@@ -123,13 +129,34 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>) -> HostInfo {
         Vec::new()
     };
 
+    let kernel = read_kernel().unwrap_or_else(|| {
+        errors.push("host", "/proc/version unreadable");
+        "unknown".into()
+    });
+    let cpu_model = read_cpu_model().unwrap_or_else(|| {
+        errors.push("host", "/proc/cpuinfo: no model name");
+        "unknown".into()
+    });
+    let mem_total_bytes = read_meminfo_kb("MemTotal:").map_or_else(
+        || {
+            errors.push("host", "/proc/meminfo: missing MemTotal");
+            0
+        },
+        |kb| kb * 1024,
+    );
+    let mem_avail_bytes = read_meminfo_kb("MemAvailable:").map_or(0, |kb| kb * 1024);
+    let loadavg_1 = read_loadavg().unwrap_or_else(|| {
+        errors.push("host", "/proc/loadavg unreadable");
+        0.0
+    });
+
     HostInfo {
-        kernel: read_kernel().unwrap_or_else(|| "unknown".into()),
+        kernel,
         cpu_count: read_cpu_count(),
-        cpu_model: read_cpu_model().unwrap_or_else(|| "unknown".into()),
-        mem_total_bytes: read_meminfo_kb("MemTotal:").map_or(0, |kb| kb * 1024),
-        mem_avail_bytes: read_meminfo_kb("MemAvailable:").map_or(0, |kb| kb * 1024),
-        loadavg_1: read_loadavg().unwrap_or(0.0),
+        cpu_model,
+        mem_total_bytes,
+        mem_avail_bytes,
+        loadavg_1,
         cpu_pct,
         per_core_pct,
         kvm_available: Path::new("/dev/kvm").exists(),

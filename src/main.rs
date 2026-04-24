@@ -27,6 +27,7 @@
 //!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
 
 mod battery;
+mod errors;
 mod host;
 mod net;
 mod proc;
@@ -473,6 +474,9 @@ struct App {
 
     // Self-profiling
     perf: PerfTracker,
+
+    // Non-fatal parser/IO errors surfaced in the footer.
+    errors: errors::ErrorRing,
 }
 
 impl App {
@@ -483,10 +487,11 @@ impl App {
         let mut net_tracker = net::Tracker::default();
         let mut procs_tracker = procs::Tracker::default();
         let passwd = procs::PasswdCache::load();
-        let prev_host_cpu = host::read_cpu_samples();
-        let host_info = host::snapshot(None);
-        let ifaces = net_tracker.snapshot();
-        let temps = temp::snapshot();
+        let mut errors = errors::ErrorRing::new();
+        let prev_host_cpu = host::read_cpu_samples(&mut errors);
+        let host_info = host::snapshot(None, &mut errors);
+        let ifaces = net_tracker.snapshot(&mut errors);
+        let temps = temp::snapshot(&mut errors);
         let batteries = battery::snapshot();
         let vms = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
         let procs_all = procs_tracker.snapshot(&passwd, clk_tck);
@@ -524,6 +529,7 @@ impl App {
             clk_tck,
             last_scan: Instant::now(),
             perf: PerfTracker::default(),
+            errors,
         }
     }
 
@@ -538,10 +544,10 @@ impl App {
         self.perf.last_scan_started = Some(started);
 
         self.vms = scan(run_dir, &mut self.prev_cpu, &mut self.history, self.clk_tck);
-        self.host_info = host::snapshot(Some(&self.prev_host_cpu));
-        self.prev_host_cpu = host::read_cpu_samples();
-        self.ifaces = self.net_tracker.snapshot();
-        self.temps = temp::snapshot();
+        self.host_info = host::snapshot(Some(&self.prev_host_cpu), &mut self.errors);
+        self.prev_host_cpu = host::read_cpu_samples(&mut self.errors);
+        self.ifaces = self.net_tracker.snapshot(&mut self.errors);
+        self.temps = temp::snapshot(&mut self.errors);
         self.batteries = battery::snapshot();
         self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
         self.recompute_procs();
@@ -1149,22 +1155,60 @@ fn compact_temp_label(label: &str) -> String {
     }
 }
 
-/// Bottom row: help/prompt on the left, perf metrics right-aligned.
-/// We allocate a fixed 44 columns to the perf block; the help block
-/// gets whatever's left. Below ~80 cols total the perf block is
-/// dropped — the help text is more important than self-stats.
+/// How long an error stays in the footer after it was last pushed.
+const ERROR_TTL: Duration = Duration::from_secs(5);
+
+/// Bottom row: help/prompt on the left, optional error badge in the
+/// middle, perf metrics right-aligned. We allocate fixed widths to
+/// the right-hand widgets; the help block gets whatever's left.
+/// Below ~80 cols total the perf block is dropped — the help text is
+/// more important than self-stats.
 fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     const PERF_W: u16 = 44;
-    if area.width <= PERF_W + 8 {
+    let err_entry = app.errors.latest_within(ERROR_TTL);
+    let err_text = err_entry.map(|e| {
+        format!(
+            " \u{26a0} {}: {} ({} err) ",
+            e.source,
+            e.message,
+            app.errors.total()
+        )
+    });
+    let err_w = err_text
+        .as_deref()
+        .map_or(0, |s| u16::try_from(s.chars().count()).unwrap_or(0));
+
+    if area.width <= PERF_W + err_w + 8 {
         draw_help(f, area, app);
         return;
     }
+
+    let mut constraints: Vec<Constraint> = vec![Constraint::Min(20)];
+    if err_w > 0 {
+        constraints.push(Constraint::Length(err_w));
+    }
+    constraints.push(Constraint::Length(PERF_W));
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(PERF_W)])
+        .constraints(constraints)
         .split(area);
     draw_help(f, chunks[0], app);
-    draw_perf(f, chunks[1], app);
+    let mut idx = 1;
+    if let Some(text) = err_text {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            chunks[idx],
+        );
+        idx += 1;
+    }
+    draw_perf(f, chunks[idx], app);
 }
 
 fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

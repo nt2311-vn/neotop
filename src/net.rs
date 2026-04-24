@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
+use crate::errors::ErrorRing;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // rx_bytes/tx_bytes reserved for a future "total since boot" column
 pub(crate) struct Iface {
@@ -38,9 +40,13 @@ pub(crate) struct Tracker {
 
 impl Tracker {
     /// Take a fresh snapshot; `prev` is updated for the next call.
-    pub(crate) fn snapshot(&mut self) -> Vec<Iface> {
-        let Ok(raw) = fs::read_to_string("/proc/net/dev") else {
-            return Vec::new();
+    pub(crate) fn snapshot(&mut self, errors: &mut ErrorRing) -> Vec<Iface> {
+        let raw = match fs::read_to_string("/proc/net/dev") {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push("net", format!("/proc/net/dev: {e}"));
+                return Vec::new();
+            }
         };
         let now = Instant::now();
         let mut ifaces = Vec::new();
