@@ -272,6 +272,30 @@ pub(crate) fn human_bytes(n: u64) -> String {
     }
 }
 
+// -----------------------------------------------------------------------------
+// /proc/self/* — used by the self-profiling perf footer
+// -----------------------------------------------------------------------------
+
+/// Cumulative `utime + stime` in clock ticks for *this* process. Used
+/// by the perf footer to compute its own CPU%.
+pub(crate) fn self_jiffies() -> Option<u64> {
+    let raw = fs::read_to_string("/proc/self/stat").ok()?;
+    let rparen = raw.rfind(')')?;
+    let after = raw.get(rparen + 2..)?;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// `VmRSS` for the current process, in bytes. Returns `None` if the
+/// field is missing — should never happen on Linux but the parser is
+/// robust to it.
+pub(crate) fn self_rss_bytes() -> Option<u64> {
+    let raw = fs::read_to_string("/proc/self/status").ok()?;
+    kb_line(&raw, "VmRSS:")
+}
+
 /// Compact limit value: "unlimited" stays short; pure numbers get byte
 /// formatting if the unit looks like bytes.
 pub(crate) fn format_limit_value(raw: &str, unit: &str) -> String {

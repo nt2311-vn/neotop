@@ -46,7 +46,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap};
@@ -277,6 +277,12 @@ fn scan(
     rows
 }
 
+/// Duration → milliseconds as `f64`. Convenience for the perf footer
+/// where sub-millisecond precision matters.
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
 fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -402,6 +408,38 @@ impl KillSig {
     }
 }
 
+/// Self-profiling counters. Updated on every scan + draw so the
+/// footer can show how much overhead neotop itself imposes. The point
+/// is honesty: if these numbers ever look bad, that's a bug to chase,
+/// not something to hide from the user.
+#[derive(Debug, Clone, Copy, Default)]
+struct Perf {
+    /// Wall-clock duration of the most recent `App::refresh` call.
+    scan_ms: f64,
+    /// Wall-clock duration of the most recent `terminal.draw` call.
+    render_ms: f64,
+    /// Time between the *start* of the last two scans. Should track
+    /// `args.refresh` closely; if it's much higher we're falling behind.
+    refresh_actual_ms: f64,
+    /// Our own `VmRSS` at the last sample. Re-read every `RSS_RETICK_EVERY`
+    /// scans because parsing /proc/self/status is the most expensive bit.
+    own_rss_bytes: u64,
+    /// Our own CPU% — same delta math as the per-VM tracker.
+    own_cpu_pct: Option<f64>,
+}
+
+/// Re-read `/proc/self/status` (for `VmRSS`) only every Nth scan tick.
+/// `VmRSS` doesn't move much for an idle TUI; once a second is plenty.
+const RSS_RETICK_EVERY: u32 = 4;
+
+#[derive(Debug, Default)]
+struct PerfTracker {
+    perf: Perf,
+    last_scan_started: Option<Instant>,
+    own_prev: Option<(Instant, u64)>,
+    rss_tick: u32,
+}
+
 struct App {
     view: View,
     input: InputMode,
@@ -432,6 +470,9 @@ struct App {
     // Tunables
     clk_tck: u64,
     last_scan: Instant,
+
+    // Self-profiling
+    perf: PerfTracker,
 }
 
 impl App {
@@ -482,11 +523,20 @@ impl App {
             batteries,
             clk_tck,
             last_scan: Instant::now(),
+            perf: PerfTracker::default(),
         }
     }
 
-    /// Re-sample everything that goes into the UI.
+    /// Re-sample everything that goes into the UI. Also updates the
+    /// self-profiling counters so the perf footer always shows the
+    /// most recent scan, not the previous one.
     fn refresh(&mut self, run_dir: &Path) {
+        let started = Instant::now();
+        if let Some(prev) = self.perf.last_scan_started {
+            self.perf.perf.refresh_actual_ms = duration_ms(started.duration_since(prev));
+        }
+        self.perf.last_scan_started = Some(started);
+
         self.vms = scan(run_dir, &mut self.prev_cpu, &mut self.history, self.clk_tck);
         self.host_info = host::snapshot(Some(&self.prev_host_cpu));
         self.prev_host_cpu = host::read_cpu_samples();
@@ -496,7 +546,39 @@ impl App {
         self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
         self.recompute_procs();
         self.clamp_selections();
+
+        self.update_self_perf(started);
+
+        self.perf.perf.scan_ms = duration_ms(started.elapsed());
         self.last_scan = Instant::now();
+    }
+
+    /// Read `/proc/self/{stat,status}` and refresh the own-CPU%/RSS
+    /// fields of the perf tracker. RSS is throttled to once per
+    /// `RSS_RETICK_EVERY` scans because it's the most expensive of the
+    /// two reads and barely moves between ticks.
+    fn update_self_perf(&mut self, now: Instant) {
+        if let Some(j) = proc::self_jiffies() {
+            self.perf.perf.own_cpu_pct = self.perf.own_prev.map(|(t, prev_j)| {
+                let dt = now.duration_since(t).as_secs_f64();
+                if dt <= 0.0 {
+                    0.0
+                } else {
+                    let dj = j.saturating_sub(prev_j);
+                    #[allow(clippy::cast_precision_loss)]
+                    let used = dj as f64 / self.clk_tck as f64;
+                    (used / dt) * 100.0
+                }
+            });
+            self.perf.own_prev = Some((now, j));
+        }
+        if self.perf.rss_tick == 0 {
+            if let Some(rss) = proc::self_rss_bytes() {
+                self.perf.perf.own_rss_bytes = rss;
+            }
+            self.perf.rss_tick = RSS_RETICK_EVERY;
+        }
+        self.perf.rss_tick = self.perf.rss_tick.saturating_sub(1);
     }
 
     fn recompute_procs(&mut self) {
@@ -560,7 +642,9 @@ fn run<B: ratatui::backend::Backend>(
     let mut app = App::new(run_dir);
 
     loop {
+        let render_started = Instant::now();
         terminal.draw(|f| draw(f, run_dir, &mut app))?;
+        app.perf.perf.render_ms = duration_ms(render_started.elapsed());
 
         // Wait for either keyboard input or the refresh interval, whichever
         // comes first. This keeps CPU at ~0 when idle.
@@ -772,7 +856,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     draw_table(f, chunks[2], &app.vms, &mut app.vms_table);
     draw_serial(f, bottom[0], selected);
     draw_resources(f, bottom[1], selected, &app.history);
-    draw_help(f, chunks[4], app);
+    draw_footer(f, chunks[4], app);
 }
 
 fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -797,7 +881,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.batteries,
     );
     draw_proc_table(f, chunks[2], app);
-    draw_help(f, chunks[3], app);
+    draw_footer(f, chunks[3], app);
 }
 
 fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize, view: View) {
@@ -1062,6 +1146,62 @@ fn compact_temp_label(label: &str) -> String {
         "acpi".into()
     } else {
         label.split_whitespace().next().unwrap_or(label).to_string()
+    }
+}
+
+/// Bottom row: help/prompt on the left, perf metrics right-aligned.
+/// We allocate a fixed 44 columns to the perf block; the help block
+/// gets whatever's left. Below ~80 cols total the perf block is
+/// dropped — the help text is more important than self-stats.
+fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    const PERF_W: u16 = 44;
+    if area.width <= PERF_W + 8 {
+        draw_help(f, area, app);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(PERF_W)])
+        .split(area);
+    draw_help(f, chunks[0], app);
+    draw_perf(f, chunks[1], app);
+}
+
+fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let p = &app.perf.perf;
+    let scan_color = ms_color(p.scan_ms);
+    let render_color = ms_color(p.render_ms);
+    let cpu = p
+        .own_cpu_pct
+        .map_or_else(|| "—".to_string(), |v| format!("{v:.1}%"));
+    let line = Line::from(vec![
+        Span::styled("scan ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.1}ms", p.scan_ms), Style::default().fg(scan_color)),
+        Span::raw(" "),
+        Span::styled("render ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:.1}ms", p.render_ms),
+            Style::default().fg(render_color),
+        ),
+        Span::raw(" "),
+        Span::styled("own ", Style::default().fg(Color::DarkGray)),
+        Span::raw(proc::human_bytes(p.own_rss_bytes)),
+        Span::raw(" "),
+        Span::raw(cpu),
+        Span::raw(" "),
+        Span::styled("tick ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{:.0}ms", p.refresh_actual_ms)),
+    ]);
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Right), area);
+}
+
+fn ms_color(ms: f64) -> Color {
+    if ms >= 100.0 {
+        Color::Red
+    } else if ms >= 20.0 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
     }
 }
 
