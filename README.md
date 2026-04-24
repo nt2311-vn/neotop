@@ -1,0 +1,111 @@
+# neotop
+
+Live terminal observer for **neosandbox microVMs** and the host running
+them.
+
+Built for the observability gap that generic system monitors (`btm`,
+`btop`, `htop`) leave open for KVM-based hypervisor projects: per-VM
+phase, exit counters, serial log, cgroup accounting, plus the host
+signals you actually need — CPU cores, RAM, network, temperatures,
+battery, `/dev/kvm` presence.
+
+## Platform
+
+**Linux only**, for now. Uses `/proc`, `/sys/class/hwmon`,
+`/sys/class/power_supply`, and `/sys/fs/cgroup` directly. macOS and
+Windows support would need per-OS modules (mach APIs / Performance
+Counters); PRs welcome — architecture is already split into one module
+per data source.
+
+## Install
+
+```sh
+cargo install --git https://github.com/nt2311/neotop
+```
+
+Or from a checkout:
+
+```sh
+git clone https://github.com/nt2311/neotop ~/src/neotop
+cd ~/src/neotop
+cargo install --path .
+```
+
+## Usage
+
+```sh
+neotop                              # watch $NEOSANDBOX_STATE or ./.neosandbox
+neotop --state-dir /var/run/neo     # watch a specific directory
+neotop --refresh-ms 500             # slower poll (default 250 ms)
+```
+
+### Controls
+
+| Key | Action |
+| --- | --- |
+| `q` / `Ctrl-C` | quit |
+| `j` / `↓` | select next VM |
+| `k` / `↑` | select previous VM |
+| `r` | refresh now |
+| `x` | delete `state.json` for the selected halted VM |
+
+## What it shows
+
+**Host overview (3 lines):**
+
+- `kvm:ok`/`kvm:MISSING` indicator, host CPU% with per-core bar glyphs,
+  memory used/total, 1-min load average
+- kernel version, CPU model, battery (`%` + `chg/dsch/full` + watts)
+- network RX/TX per interface, temperature readouts (CPU package, NVMe,
+  Wi-Fi…) colored green/yellow/red by severity
+
+**Fleet table:** one row per running VM — `PID PHASE MODE UPTIME CPU%
+RSS IO MMIO HLT SHDN LAST_SERIAL`.
+
+**Bottom pane (split):** left is the serial-tail for the selected VM;
+right is a resource pane with live `/proc/<pid>/` stats, a 15-second
+CPU% sparkline, cgroup-v2 path + memory.current/max, and the rlimits
+that actually matter for microVMs.
+
+## State contract
+
+`neotop` is a pure observer. It reads atomically-written JSON files at
+`$NEOSANDBOX_STATE/run/<pid>/state.json`. See
+[`docs/state.json`](./docs/state.json.md) for the schema, currently
+`v1`. The producer (`neosandbox`/`vmmd`) writes via
+`tmp + rename(2)`; neotop never sees a half-written file.
+
+## Data sources
+
+| Widget | Source |
+| --- | --- |
+| VM fleet | `$NEOSANDBOX_STATE/run/*/state.json` |
+| Per-VM `/proc` stats | `/proc/<pid>/{stat,status,limits,cgroup}` |
+| Per-VM cgroup memory | `/sys/fs/cgroup/<path>/memory.{current,max}` |
+| Host CPU | `/proc/stat` (aggregate + per-core) |
+| Memory | `/proc/meminfo` (`MemTotal`, `MemAvailable`) |
+| Kernel | `/proc/version` |
+| Load avg | `/proc/loadavg` |
+| Network | `/proc/net/dev` |
+| Temperatures | `/sys/class/hwmon/hwmon*/temp*_input` + `_label` |
+| Battery | `/sys/class/power_supply/BAT*/{capacity,status,power_now}` |
+| `/dev/kvm` | `Path::new("/dev/kvm").exists()` |
+
+No privileged syscalls. No `unsafe`. Two sampling passes per scan, no
+background threads.
+
+## Roadmap
+
+Things `btm`/`btop` have that neotop does not yet:
+
+- [ ] Process tree (walk all of `/proc/` not just VMs)
+- [ ] Per-device disk I/O (`/proc/diskstats`)
+- [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
+  via `intel_gpu_top`-style perf counters)
+- [ ] Memory history chart
+- [ ] Themes / layout config
+- [ ] macOS / Windows ports
+
+## License
+
+Apache-2.0.

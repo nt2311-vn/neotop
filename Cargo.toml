@@ -1,0 +1,43 @@
+[package]
+name = "neotop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/nt2311/neotop"
+description = "Live terminal observer for neosandbox microVMs and the host running them"
+authors = ["nt2311"]
+keywords = ["tui", "monitor", "kvm", "microvm"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "neotop"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rustix = { version = "0.38", features = ["param"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
