@@ -11,12 +11,9 @@
 //! the map can't grow unbounded.
 //!
 //! Status: parsing + sampling + sort/filter are implemented and
-//! covered by unit tests. The rendering path (view toggle, keybinds,
-//! kill action) is not wired into `main.rs` yet — see `PLAN.md`. The
-//! module-level `allow(dead_code)` goes away the moment the Procs
-//! view renders.
-
-#![allow(dead_code)]
+//! covered by unit tests. The Procs view in `main.rs` renders rows
+//! produced by `Tracker::snapshot`, sorted via `sort_rows`, and
+//! filtered via `matches`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,7 +22,12 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessRow {
     pub(crate) pid: i32,
+    /// Parent pid — reserved for a future process-tree view (`PLAN.md` deferred §1).
+    #[allow(dead_code)]
     pub(crate) ppid: i32,
+    /// Numeric user id. Stored for symmetry but not displayed — the
+    /// resolved `user` field below is what reaches the UI.
+    #[allow(dead_code)]
     pub(crate) uid: u32,
     /// Resolved via `/etc/passwd`; falls back to `uid=N` when unknown.
     pub(crate) user: String,
@@ -253,6 +255,11 @@ impl SortBy {
     }
 }
 
+/// Sort `rows` in place by the requested key. Currently only used by
+/// the unit tests — the live UI sorts indices via `main::compute_visible`
+/// to avoid moving full `ProcessRow` values around. Kept public so the
+/// behaviour stays test-locked.
+#[allow(dead_code)]
 pub(crate) fn sort_rows(rows: &mut [ProcessRow], by: SortBy) {
     match by {
         SortBy::Cpu => rows.sort_by(|a, b| {

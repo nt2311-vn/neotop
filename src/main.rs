@@ -16,10 +16,15 @@
 //!
 //! Controls:
 //!     q or Ctrl-C   quit
-//!     j / Down      next vm
-//!     k / Up        prev vm
+//!     Tab           switch between Vms and Procs view
+//!     j / Down      next row
+//!     k / Up        prev row
 //!     r             refresh immediately
-//!     x             delete the state file of the selected halted vm
+//!     x             (Vms)   delete state file of the selected halted vm
+//!     s             (Procs) cycle sort key (CPU → MEM → PID → CMD)
+//!     /             (Procs) enter filter mode (Esc to clear, Enter to confirm)
+//!     K             (Procs) send SIGTERM to selected pid (with confirm)
+//!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
 
 mod battery;
 mod host;
@@ -98,7 +103,7 @@ impl Args {
 
 fn print_help() {
     println!(
-        "neotop — live view of running neosandbox VMs\n\
+        "neotop — live view of running neosandbox VMs and host processes\n\
          \n\
          USAGE:\n    \
              neotop [--state-dir <path>] [--refresh-ms <n>]\n\
@@ -107,10 +112,15 @@ fn print_help() {
          \n\
          CONTROLS:\n    \
              q            quit\n    \
-             j / Down     next vm\n    \
-             k / Up       prev vm\n    \
+             Tab          toggle Vms / Procs view\n    \
+             j / Down     next row\n    \
+             k / Up       prev row\n    \
              r            refresh immediately\n    \
-             x            delete state file for selected halted vm"
+             x  (Vms)     delete state file for selected halted vm\n    \
+             s  (Procs)   cycle sort: CPU → MEM → PID → CMD\n    \
+             /  (Procs)   enter filter mode\n    \
+             K  (Procs)   SIGTERM selected pid (confirmed)\n    \
+             Ctrl-K       SIGKILL selected pid (confirmed)"
     );
 }
 
@@ -349,107 +359,371 @@ fn main() -> Result<()> {
     result
 }
 
+// -----------------------------------------------------------------------------
+// App state — what the run loop owns
+// -----------------------------------------------------------------------------
+
+/// Which table the user is currently driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Vms,
+    Procs,
+}
+
+/// Modal input state in the Procs view. `Normal` is the default;
+/// `Filter` captures every printable char into `App.proc_filter`;
+/// `Confirm` shows a y/N prompt for a queued kill signal.
+#[derive(Debug, Clone)]
+enum InputMode {
+    Normal,
+    Filter,
+    Confirm(KillSig),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum KillSig {
+    Term,
+    Kill,
+}
+
+impl KillSig {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Term => "SIGTERM",
+            Self::Kill => "SIGKILL",
+        }
+    }
+
+    fn signal(self) -> rustix::process::Signal {
+        match self {
+            Self::Term => rustix::process::Signal::Term,
+            Self::Kill => rustix::process::Signal::Kill,
+        }
+    }
+}
+
+struct App {
+    view: View,
+    input: InputMode,
+
+    // Vms view
+    vms: Vec<VmRow>,
+    vms_table: TableState,
+    prev_cpu: HashMap<i64, CpuSample>,
+    history: CpuHistory,
+
+    // Procs view
+    procs_tracker: procs::Tracker,
+    passwd: procs::PasswdCache,
+    procs_all: Vec<procs::ProcessRow>,
+    procs_visible: Vec<usize>, // indices into procs_all after sort+filter
+    procs_table: TableState,
+    procs_sort: procs::SortBy,
+    procs_filter: String,
+
+    // Host overview
+    prev_host_cpu: host::CpuSamples,
+    host_info: host::HostInfo,
+    net_tracker: net::Tracker,
+    ifaces: Vec<net::Iface>,
+    temps: Vec<temp::Reading>,
+    batteries: Vec<battery::Battery>,
+
+    // Tunables
+    clk_tck: u64,
+    last_scan: Instant,
+}
+
+impl App {
+    fn new(run_dir: &Path) -> Self {
+        let clk_tck = proc::clk_tck();
+        let mut prev_cpu: HashMap<i64, CpuSample> = HashMap::new();
+        let mut history = CpuHistory::default();
+        let mut net_tracker = net::Tracker::default();
+        let mut procs_tracker = procs::Tracker::default();
+        let passwd = procs::PasswdCache::load();
+        let prev_host_cpu = host::read_cpu_samples();
+        let host_info = host::snapshot(None);
+        let ifaces = net_tracker.snapshot();
+        let temps = temp::snapshot();
+        let batteries = battery::snapshot();
+        let vms = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
+        let procs_all = procs_tracker.snapshot(&passwd, clk_tck);
+
+        let mut vms_table = TableState::default();
+        if !vms.is_empty() {
+            vms_table.select(Some(0));
+        }
+        let mut procs_table = TableState::default();
+        let procs_visible = compute_visible(&procs_all, procs::SortBy::Cpu, "");
+        if !procs_visible.is_empty() {
+            procs_table.select(Some(0));
+        }
+
+        Self {
+            view: View::Vms,
+            input: InputMode::Normal,
+            vms,
+            vms_table,
+            prev_cpu,
+            history,
+            procs_tracker,
+            passwd,
+            procs_all,
+            procs_visible,
+            procs_table,
+            procs_sort: procs::SortBy::Cpu,
+            procs_filter: String::new(),
+            prev_host_cpu,
+            host_info,
+            net_tracker,
+            ifaces,
+            temps,
+            batteries,
+            clk_tck,
+            last_scan: Instant::now(),
+        }
+    }
+
+    /// Re-sample everything that goes into the UI.
+    fn refresh(&mut self, run_dir: &Path) {
+        self.vms = scan(run_dir, &mut self.prev_cpu, &mut self.history, self.clk_tck);
+        self.host_info = host::snapshot(Some(&self.prev_host_cpu));
+        self.prev_host_cpu = host::read_cpu_samples();
+        self.ifaces = self.net_tracker.snapshot();
+        self.temps = temp::snapshot();
+        self.batteries = battery::snapshot();
+        self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
+        self.recompute_procs();
+        self.clamp_selections();
+        self.last_scan = Instant::now();
+    }
+
+    fn recompute_procs(&mut self) {
+        self.procs_visible = compute_visible(&self.procs_all, self.procs_sort, &self.procs_filter);
+    }
+
+    fn clamp_selections(&mut self) {
+        let sel = self.vms_table.selected().unwrap_or(0);
+        if self.vms.is_empty() {
+            self.vms_table.select(None);
+        } else if sel >= self.vms.len() {
+            self.vms_table.select(Some(self.vms.len() - 1));
+        } else if self.vms_table.selected().is_none() {
+            self.vms_table.select(Some(0));
+        }
+
+        let psel = self.procs_table.selected().unwrap_or(0);
+        if self.procs_visible.is_empty() {
+            self.procs_table.select(None);
+        } else if psel >= self.procs_visible.len() {
+            self.procs_table.select(Some(self.procs_visible.len() - 1));
+        } else if self.procs_table.selected().is_none() {
+            self.procs_table.select(Some(0));
+        }
+    }
+
+    fn selected_proc(&self) -> Option<&procs::ProcessRow> {
+        let i = self.procs_table.selected()?;
+        let idx = *self.procs_visible.get(i)?;
+        self.procs_all.get(idx)
+    }
+}
+
+/// Build the indirection vector that maps display-row → `procs_all` index,
+/// after applying the current sort key and filter substring.
+fn compute_visible(rows: &[procs::ProcessRow], by: procs::SortBy, filter: &str) -> Vec<usize> {
+    let mut idxs: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| procs::matches(r, filter))
+        .map(|(i, _)| i)
+        .collect();
+    idxs.sort_by(|&a, &b| match by {
+        procs::SortBy::Cpu => rows[b]
+            .cpu_pct
+            .unwrap_or(0.0)
+            .partial_cmp(&rows[a].cpu_pct.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        procs::SortBy::Mem => rows[b].rss_bytes.cmp(&rows[a].rss_bytes),
+        procs::SortBy::Pid => rows[a].pid.cmp(&rows[b].pid),
+        procs::SortBy::Command => rows[a].command.cmp(&rows[b].command),
+    });
+    idxs
+}
+
 fn run<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     run_dir: &Path,
     refresh: Duration,
 ) -> Result<()> {
-    let clk_tck = proc::clk_tck();
-    let mut prev_cpu: HashMap<i64, CpuSample> = HashMap::new();
-    let mut history = CpuHistory::default();
-    let mut prev_host_cpu: host::CpuSamples = host::read_cpu_samples();
-    let mut host_info = host::snapshot(None);
-    let mut net_tracker = net::Tracker::default();
-    let mut ifaces = net_tracker.snapshot();
-    let mut temps = temp::snapshot();
-    let mut batteries = battery::snapshot();
-    let mut rows = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
-    let mut table_state = TableState::default();
-    if !rows.is_empty() {
-        table_state.select(Some(0));
-    }
-    let mut last_scan = Instant::now();
+    let mut app = App::new(run_dir);
 
     loop {
-        terminal.draw(|f| {
-            draw(
-                f,
-                run_dir,
-                &host_info,
-                &ifaces,
-                &temps,
-                &batteries,
-                &rows,
-                &history,
-                &mut table_state,
-            );
-        })?;
+        terminal.draw(|f| draw(f, run_dir, &mut app))?;
 
         // Wait for either keyboard input or the refresh interval, whichever
         // comes first. This keeps CPU at ~0 when idle.
-        let elapsed = last_scan.elapsed();
+        let elapsed = app.last_scan.elapsed();
         let wait = refresh.saturating_sub(elapsed);
         if event::poll(wait)? {
             if let Event::Key(k) = event::read()? {
-                match k.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(())
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if let Some(i) = table_state.selected() {
-                            let next = (i + 1).min(rows.len().saturating_sub(1));
-                            table_state.select(Some(next));
-                        } else if !rows.is_empty() {
-                            table_state.select(Some(0));
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if let Some(i) = table_state.selected() {
-                            table_state.select(Some(i.saturating_sub(1)));
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        // Force immediate rescan below.
-                        last_scan = Instant::now()
-                            .checked_sub(refresh)
-                            .unwrap_or_else(Instant::now);
-                    }
-                    KeyCode::Char('x') => {
-                        if let Some(i) = table_state.selected() {
-                            if let Some(row) = rows.get(i) {
-                                if row.state.phase == "halted"
-                                    || row.state.phase == "shutdown"
-                                    || row.state.phase == "error"
-                                {
-                                    let _ = fs::remove_file(&row.path);
-                                    if let Some(parent) = row.path.parent() {
-                                        let _ = fs::remove_dir(parent);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+                if handle_key(&mut app, k, refresh, run_dir) {
+                    return Ok(());
                 }
             }
         }
 
-        if last_scan.elapsed() >= refresh {
-            rows = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
-            host_info = host::snapshot(Some(&prev_host_cpu));
-            prev_host_cpu = host::read_cpu_samples();
-            ifaces = net_tracker.snapshot();
-            temps = temp::snapshot();
-            batteries = battery::snapshot();
-            last_scan = Instant::now();
-            // Keep selection in bounds after fleet changes.
-            let sel = table_state.selected().unwrap_or(0);
-            if rows.is_empty() {
-                table_state.select(None);
-            } else if sel >= rows.len() {
-                table_state.select(Some(rows.len() - 1));
+        if app.last_scan.elapsed() >= refresh {
+            app.refresh(run_dir);
+        }
+    }
+}
+
+/// Returns `true` if the loop should exit.
+fn handle_key(
+    app: &mut App,
+    k: crossterm::event::KeyEvent,
+    refresh: Duration,
+    _run_dir: &Path,
+) -> bool {
+    // Quit shortcuts apply in every mode.
+    if matches!(k.code, KeyCode::Char('q')) && matches!(app.input, InputMode::Normal) {
+        return true;
+    }
+    if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
+    match app.input.clone() {
+        InputMode::Filter => handle_filter_key(app, k),
+        InputMode::Confirm(sig) => handle_confirm_key(app, k, sig),
+        InputMode::Normal => handle_normal_key(app, k, refresh),
+    }
+    false
+}
+
+fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent, refresh: Duration) {
+    match k.code {
+        KeyCode::Tab => {
+            app.view = match app.view {
+                View::Vms => View::Procs,
+                View::Procs => View::Vms,
+            };
+        }
+        KeyCode::Char('j') | KeyCode::Down => move_selection(app, 1),
+        // Ctrl-k is SIGKILL in Procs view; check that *before* the bare
+        // `k` nav binding, otherwise the latter eats every Char('k') event.
+        KeyCode::Char('k')
+            if app.view == View::Procs && k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if app.selected_proc().is_some() {
+                app.input = InputMode::Confirm(KillSig::Kill);
             }
+        }
+        KeyCode::Char('k') | KeyCode::Up => move_selection(app, -1),
+        KeyCode::PageDown => move_selection(app, 10),
+        KeyCode::PageUp => move_selection(app, -10),
+        KeyCode::Char('r') => {
+            // Force an immediate scan on the next loop iteration.
+            app.last_scan = Instant::now()
+                .checked_sub(refresh)
+                .unwrap_or_else(Instant::now);
+        }
+        KeyCode::Char('x') if app.view == View::Vms => delete_halted_state(app),
+        KeyCode::Char('s') if app.view == View::Procs => {
+            app.procs_sort = app.procs_sort.next();
+            app.recompute_procs();
+            app.clamp_selections();
+        }
+        KeyCode::Char('/') if app.view == View::Procs => {
+            app.input = InputMode::Filter;
+        }
+        KeyCode::Char('K') if app.view == View::Procs => {
+            // Shift+k. Capital K is SIGTERM by default; Ctrl+k is SIGKILL (handled above).
+            if app.selected_proc().is_some() {
+                app.input = InputMode::Confirm(KillSig::Term);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_filter_key(app: &mut App, k: crossterm::event::KeyEvent) {
+    match k.code {
+        KeyCode::Esc => {
+            app.procs_filter.clear();
+            app.input = InputMode::Normal;
+            app.recompute_procs();
+            app.clamp_selections();
+        }
+        KeyCode::Enter => {
+            app.input = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.procs_filter.pop();
+            app.recompute_procs();
+            app.clamp_selections();
+        }
+        KeyCode::Char(c) => {
+            // Skip the modifier-bearing combos that crossterm still
+            // surfaces as `Char`s — Ctrl+C was already handled upstream.
+            if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT)
+            {
+                app.procs_filter.push(c);
+                app.recompute_procs();
+                app.clamp_selections();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_confirm_key(app: &mut App, k: crossterm::event::KeyEvent, sig: KillSig) {
+    match k.code {
+        KeyCode::Char('y' | 'Y') => {
+            if let Some(row) = app.selected_proc() {
+                let pid = row.pid;
+                if let Some(p) = rustix::process::Pid::from_raw(pid) {
+                    let _ = rustix::process::kill_process(p, sig.signal());
+                }
+            }
+            app.input = InputMode::Normal;
+        }
+        _ => {
+            app.input = InputMode::Normal;
+        }
+    }
+}
+
+fn move_selection(app: &mut App, delta: i32) {
+    let (state, len) = match app.view {
+        View::Vms => (&mut app.vms_table, app.vms.len()),
+        View::Procs => (&mut app.procs_table, app.procs_visible.len()),
+    };
+    if len == 0 {
+        return;
+    }
+    let cur = i64::try_from(state.selected().unwrap_or(0)).unwrap_or(0);
+    let max = i64::try_from(len.saturating_sub(1)).unwrap_or(0);
+    let next = (cur + i64::from(delta)).clamp(0, max);
+    let next_us = usize::try_from(next).unwrap_or(0);
+    state.select(Some(next_us));
+}
+
+fn delete_halted_state(app: &mut App) {
+    let Some(i) = app.vms_table.selected() else {
+        return;
+    };
+    let Some(row) = app.vms.get(i) else { return };
+    if row.state.phase == "halted"
+        || row.state.phase == "shutdown"
+        || row.state.phase == "error"
+    {
+        let _ = fs::remove_file(&row.path);
+        if let Some(parent) = row.path.parent() {
+            let _ = fs::remove_dir(parent);
         }
     }
 }
@@ -458,18 +732,14 @@ fn run<B: ratatui::backend::Backend>(
 // Rendering
 // -----------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn draw(
-    f: &mut ratatui::Frame<'_>,
-    run_dir: &Path,
-    host_info: &host::HostInfo,
-    ifaces: &[net::Iface],
-    temps: &[temp::Reading],
-    batteries: &[battery::Battery],
-    rows: &[VmRow],
-    history: &CpuHistory,
-    table_state: &mut TableState,
-) {
+fn draw(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
+    match app.view {
+        View::Vms => draw_vms(f, run_dir, app),
+        View::Procs => draw_procs(f, app),
+    }
+}
+
+fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -488,17 +758,53 @@ fn draw(
         .constraints([Constraint::Min(30), Constraint::Length(46)])
         .split(chunks[3]);
 
-    let selected = rows.get(table_state.selected().unwrap_or(0));
+    let selected = app.vms.get(app.vms_table.selected().unwrap_or(0));
 
-    draw_title(f, chunks[0], run_dir, rows.len());
-    draw_host(f, chunks[1], host_info, ifaces, temps, batteries);
-    draw_table(f, chunks[2], rows, table_state);
+    draw_title(f, chunks[0], run_dir, app.vms.len(), app.view);
+    draw_host(
+        f,
+        chunks[1],
+        &app.host_info,
+        &app.ifaces,
+        &app.temps,
+        &app.batteries,
+    );
+    draw_table(f, chunks[2], &app.vms, &mut app.vms_table);
     draw_serial(f, bottom[0], selected);
-    draw_resources(f, bottom[1], selected, history);
-    draw_help(f, chunks[4]);
+    draw_resources(f, bottom[1], selected, &app.history);
+    draw_help(f, chunks[4], app);
 }
 
-fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize) {
+fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(3), // host overview
+            Constraint::Min(5),    // procs table
+            Constraint::Length(1), // help / prompt
+        ])
+        .split(area);
+
+    draw_title_procs(f, chunks[0], app);
+    draw_host(
+        f,
+        chunks[1],
+        &app.host_info,
+        &app.ifaces,
+        &app.temps,
+        &app.batteries,
+    );
+    draw_proc_table(f, chunks[2], app);
+    draw_help(f, chunks[3], app);
+}
+
+fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize, view: View) {
+    let view_label = match view {
+        View::Vms => " VMs ",
+        View::Procs => " Procs ",
+    };
     let title = Line::from(vec![
         Span::styled(
             " neosandbox top ",
@@ -507,7 +813,42 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usi
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw(" "),
+        Span::styled(
+            view_label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("  watching {} — {count} VM(s)", run_dir.display())),
+    ]);
+    f.render_widget(Paragraph::new(title), area);
+}
+
+fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let total = app.procs_all.len();
+    let visible = app.procs_visible.len();
+    let title = Line::from(vec![
+        Span::styled(
+            " neosandbox top ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            " Procs ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "  {visible}/{total} processes · sort {}",
+            app.procs_sort.label(),
+        )),
     ]);
     f.render_widget(Paragraph::new(title), area);
 }
@@ -724,18 +1065,174 @@ fn compact_temp_label(label: &str) -> String {
     }
 }
 
-fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect) {
-    let help = Line::from(vec![
+fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    // Modal prompts take over the help bar entirely.
+    match &app.input {
+        InputMode::Filter => {
+            let line = Line::from(vec![
+                Span::styled(
+                    " filter ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    app.procs_filter.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+                Span::raw("   "),
+                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" apply   "),
+                Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" clear"),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        InputMode::Confirm(sig) => {
+            let target = app.selected_proc().map_or_else(
+                || "(no selection)".to_string(),
+                |r| format!("pid {} · {}", r.pid, r.command),
+            );
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", sig.label()),
+                    Style::default().fg(Color::White).bg(Color::Red),
+                ),
+                Span::raw(format!(" {target}   ")),
+                Span::styled(" y ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" confirm   "),
+                Span::styled(" any ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" cancel"),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        InputMode::Normal => {}
+    }
+
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit  "),
+        Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" view  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" navigate  "),
+        Span::raw(" nav  "),
         Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" refresh  "),
-        Span::styled(" x ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" delete halted state"),
-    ]);
-    f.render_widget(Paragraph::new(help), area);
+    ];
+    match app.view {
+        View::Vms => {
+            spans.extend([
+                Span::styled(" x ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" delete halted"),
+            ]);
+        }
+        View::Procs => {
+            spans.extend([
+                Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" sort  "),
+                Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" filter  "),
+                Span::styled(" K ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" SIGTERM  "),
+                Span::styled(" ^K ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" SIGKILL"),
+            ]);
+            if !app.procs_filter.is_empty() {
+                spans.push(Span::raw("    "));
+                spans.push(Span::styled(
+                    "filter:",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    format!(" {} ", app.procs_filter),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let header = Row::new(vec![
+        "PID", "USER", "S", "CPU%", "RSS", "THR", "COMMAND",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let body: Vec<Row> = app
+        .procs_visible
+        .iter()
+        .filter_map(|&i| app.procs_all.get(i))
+        .map(|r| {
+            let cpu = r
+                .cpu_pct
+                .map_or_else(|| "—".to_string(), |p| format!("{p:.1}"));
+            let cpu_style = Style::default().fg(cpu_glyph_color(r.cpu_pct.unwrap_or(0.0)));
+            let state_style = proc_state_style(r.state);
+            Row::new(vec![
+                Cell::from(r.pid.to_string()),
+                Cell::from(truncate_lossy(&r.user, 10)),
+                Cell::from(Span::styled(r.state.to_string(), state_style)),
+                Cell::from(Span::styled(cpu, cpu_style)),
+                Cell::from(proc::human_bytes(r.rss_bytes)),
+                Cell::from(r.threads.to_string()),
+                Cell::from(truncate_lossy(&r.command, 200)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(10),
+        Constraint::Length(2),
+        Constraint::Length(6),
+        Constraint::Length(9),
+        Constraint::Length(4),
+        Constraint::Min(30),
+    ];
+
+    let title = format!(
+        " processes · by {}{} ",
+        app.procs_sort.label(),
+        if app.procs_filter.is_empty() {
+            String::new()
+        } else {
+            format!(" · /{}", app.procs_filter)
+        },
+    );
+    let table = Table::new(body, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_stateful_widget(table, area, &mut app.procs_table);
+}
+
+fn proc_state_style(c: char) -> Style {
+    match c {
+        'R' => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        'D' => Style::default().fg(Color::Red),
+        'Z' => Style::default().fg(Color::Magenta),
+        'T' | 't' => Style::default().fg(Color::Yellow),
+        'I' => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn truncate_lossy(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
 }
 
 fn draw_table(
