@@ -309,3 +309,39 @@ pub(crate) fn format_limit_value(raw: &str, unit: &str) -> String {
     }
     raw.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_thresholds() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1 MiB");
+        // 1.5 GiB → "1.5 GiB"
+        assert_eq!(human_bytes(1024 * 1024 * 1024 * 3 / 2), "1.5 GiB");
+    }
+
+    #[test]
+    fn format_limit_value_handles_unlimited() {
+        assert_eq!(format_limit_value("unlimited", "bytes"), "∞");
+        assert_eq!(format_limit_value("unlimited", "us"), "∞");
+    }
+
+    #[test]
+    fn format_limit_value_humanises_byte_units() {
+        assert_eq!(
+            format_limit_value(&(1024 * 1024).to_string(), "bytes"),
+            "1 MiB"
+        );
+    }
+
+    #[test]
+    fn format_limit_value_passes_through_non_bytes() {
+        // Non-byte units are kept verbatim — caller decides formatting.
+        assert_eq!(format_limit_value("4096", "files"), "4096");
+        assert_eq!(format_limit_value("1024", "us"), "1024");
+    }
+}

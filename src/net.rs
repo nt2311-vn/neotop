@@ -48,32 +48,20 @@ impl Tracker {
                 return Vec::new();
             }
         };
-        let now = Instant::now();
+        self.snapshot_from_str(&raw, Instant::now())
+    }
+
+    /// Test seam: same logic as `snapshot`, but takes the raw file
+    /// content + a clock value so callers can verify rate computation
+    /// without touching the real filesystem.
+    pub(crate) fn snapshot_from_str(&mut self, raw: &str, now: Instant) -> Vec<Iface> {
         let mut ifaces = Vec::new();
         let mut seen: Vec<String> = Vec::new();
 
-        // First two lines are the header.
-        for line in raw.lines().skip(2) {
-            let Some((name, rest)) = line.split_once(':') else {
-                continue;
-            };
-            let name = name.trim().to_string();
+        for (name, rx_bytes, tx_bytes) in parse_proc_net_dev(raw) {
             if skip_iface(&name) {
                 continue;
             }
-            let parts: Vec<u64> = rest
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            // Columns: rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo,
-            //          rx_frame, rx_compressed, rx_multicast,
-            //          tx_bytes, tx_packets, ...
-            if parts.len() < 9 {
-                continue;
-            }
-            let rx_bytes = parts[0];
-            let tx_bytes = parts[8];
-
             let (rx_rate, tx_rate) = match self.prev.get(&name) {
                 Some(p) => {
                     let dt = now.duration_since(p.when).as_secs_f64();
@@ -117,6 +105,31 @@ impl Tracker {
     }
 }
 
+/// Parse `/proc/net/dev` into `(name, rx_bytes, tx_bytes)` triples.
+/// The first two header lines are skipped. Lines with fewer than 9
+/// numeric fields are ignored — that's the kernel's RX (8 fields) +
+/// TX bytes column position.
+pub(crate) fn parse_proc_net_dev(raw: &str) -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    for line in raw.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let parts: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        // Columns: rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo,
+        //          rx_frame, rx_compressed, rx_multicast,
+        //          tx_bytes, tx_packets, ...
+        if parts.len() < 9 {
+            continue;
+        }
+        out.push((name.trim().to_string(), parts[0], parts[8]));
+    }
+    out
+}
+
 /// Interfaces we hide from the header line — they're rarely interesting
 /// for a quick glance. `br-*` and `veth*` are Docker; `lo` is loopback.
 fn skip_iface(name: &str) -> bool {
@@ -147,5 +160,85 @@ pub(crate) fn human_rate(bps: Option<u64>) -> String {
         format!("{:.0} KB/s", f / 1e3)
     } else {
         format!("{b} B/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const PROC_NET_DEV_FIXTURE: &str = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1234567   100   0    0    0    0    0    0   1234567   100   0    0    0    0    0    0
+  eth0: 1000      10    0    0    0    0    0    0   2000      20    0    0    0    0    0    0
+ wlan0: 5000      50    0    0    0    0    0    0   3000      30    0    0    0    0    0    0
+";
+
+    #[test]
+    fn parse_proc_net_dev_extracts_name_and_byte_columns() {
+        let parsed = parse_proc_net_dev(PROC_NET_DEV_FIXTURE);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], ("lo".into(), 1_234_567, 1_234_567));
+        assert_eq!(parsed[1], ("eth0".into(), 1000, 2000));
+        assert_eq!(parsed[2], ("wlan0".into(), 5000, 3000));
+    }
+
+    #[test]
+    fn parse_proc_net_dev_skips_short_lines() {
+        let raw = "\
+Inter-| header
+ face | header
+broken: 1 2 3 4
+ok:    100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0
+";
+        let parsed = parse_proc_net_dev(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "ok");
+    }
+
+    #[test]
+    fn skip_iface_filters_lo_and_bridges() {
+        assert!(skip_iface("lo"));
+        assert!(skip_iface("docker0"));
+        assert!(skip_iface("br-abc123"));
+        assert!(skip_iface("veth9af"));
+        assert!(skip_iface("virbr0"));
+        assert!(!skip_iface("eth0"));
+        assert!(!skip_iface("wlan0"));
+        assert!(!skip_iface("enp0s3"));
+    }
+
+    #[test]
+    fn snapshot_from_str_computes_rates_between_two_samples() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        // First sample establishes the baseline; rates must be None.
+        let first = t.snapshot_from_str(PROC_NET_DEV_FIXTURE, t0);
+        assert!(first.iter().all(|i| i.rx_rate.is_none()));
+
+        // Second sample, 1s later, with eth0 having received +1000 bytes.
+        let raw2 = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 2000      20    0    0    0    0    0    0   2000      20    0    0    0    0    0    0
+ wlan0: 5000      50    0    0    0    0    0    0   3000      30    0    0    0    0    0    0
+";
+        let second = t.snapshot_from_str(raw2, t0 + Duration::from_secs(1));
+        let eth0 = second.iter().find(|i| i.name == "eth0").expect("eth0");
+        assert_eq!(eth0.rx_rate, Some(1000));
+        // tx unchanged → rate 0 (not None).
+        assert_eq!(eth0.tx_rate, Some(0));
+    }
+
+    #[test]
+    fn human_rate_formats_compact_units() {
+        assert_eq!(human_rate(None), "—");
+        assert_eq!(human_rate(Some(0)), "0");
+        assert_eq!(human_rate(Some(500)), "500 B/s");
+        assert_eq!(human_rate(Some(2_500)), "2 KB/s");
+        assert_eq!(human_rate(Some(2_500_000)), "2.5 MB/s");
+        assert_eq!(human_rate(Some(2_500_000_000)), "2.5 GB/s");
     }
 }

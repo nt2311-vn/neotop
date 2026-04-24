@@ -46,13 +46,21 @@ pub(crate) struct CpuSamples {
 }
 
 pub(crate) fn read_cpu_samples(errors: &mut ErrorRing) -> CpuSamples {
-    let raw = match fs::read_to_string("/proc/stat") {
-        Ok(r) => r,
+    match fs::read_to_string("/proc/stat") {
+        Ok(r) => parse_cpu_samples(&r),
         Err(e) => {
             errors.push("host", format!("/proc/stat: {e}"));
-            return CpuSamples::default();
+            CpuSamples::default()
         }
-    };
+    }
+}
+
+/// Pure parser for `/proc/stat`. Splits the aggregate `cpu  ...` line
+/// from per-core `cpuN ...` lines and stops as soon as we leave the
+/// CPU section (kernel guarantees those are first). Lines with fewer
+/// than 5 numeric fields are ignored — same shape kernels older than
+/// 2.6.x had, which we don't bother to support.
+pub(crate) fn parse_cpu_samples(raw: &str) -> CpuSamples {
     let mut agg: Option<CpuSample> = None;
     let mut per_core: Vec<CpuSample> = Vec::new();
 
@@ -85,12 +93,10 @@ pub(crate) fn read_cpu_samples(errors: &mut ErrorRing) -> CpuSamples {
             } else {
                 per_core.push(sample);
             }
-        } else {
-            // Once we're past the cpu lines, we can stop — they're
+        } else if agg.is_some() {
+            // Once we're past the cpu lines we can stop — they're
             // always first in `/proc/stat`.
-            if agg.is_some() {
-                break;
-            }
+            break;
         }
     }
     CpuSamples {
@@ -164,30 +170,58 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
 }
 
 // -----------------------------------------------------------------------------
+// Pure parsers — kept separate from the fs reads so they can be tested
+// against canned fixture strings without root or a Linux kernel.
+// -----------------------------------------------------------------------------
 
 fn read_kernel() -> Option<String> {
-    // /proc/version is e.g. "Linux version 6.11.2-arch1-1 (...) (gcc ...) ..."
-    let raw = fs::read_to_string("/proc/version").ok()?;
-    // Just the version field for compactness.
-    raw.split_whitespace().nth(2).map(str::to_string)
+    fs::read_to_string("/proc/version")
+        .ok()
+        .and_then(|s| parse_kernel(&s))
 }
 
 fn read_cpu_count() -> usize {
     fs::read_to_string("/proc/cpuinfo")
-        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
+        .map(|s| parse_cpu_count(&s))
         .unwrap_or(0)
 }
 
 fn read_cpu_model() -> Option<String> {
-    let raw = fs::read_to_string("/proc/cpuinfo").ok()?;
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| parse_cpu_model(&s))
+}
+
+fn read_meminfo_kb(key: &str) -> Option<u64> {
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| parse_meminfo_kb(&s, key))
+}
+
+fn read_loadavg() -> Option<f64> {
+    fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| parse_loadavg(&s))
+}
+
+/// `/proc/version` looks like `Linux version 6.11.2-arch1-1 (...) ...`;
+/// we keep the bare version field.
+pub(crate) fn parse_kernel(raw: &str) -> Option<String> {
+    raw.split_whitespace().nth(2).map(str::to_string)
+}
+
+pub(crate) fn parse_cpu_count(raw: &str) -> usize {
+    raw.lines().filter(|l| l.starts_with("processor")).count()
+}
+
+/// Pull the first `model name : ...` line out of `/proc/cpuinfo` and
+/// strip the noisy "(R)"/"(TM)" trademark markers + collapse runs of
+/// whitespace.
+pub(crate) fn parse_cpu_model(raw: &str) -> Option<String> {
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("model name") {
             return rest.split_once(':').map(|(_, v)| {
-                let v = v.trim();
-                // Collapse "(R)" / "(TM)" / repeated spaces to a compact
-                // label. These strings are long; the overview bar has
-                // maybe 60 cols for the model name.
-                let trimmed = v.replace("(R)", "").replace("(TM)", "");
+                let trimmed = v.trim().replace("(R)", "").replace("(TM)", "");
                 let mut out = String::with_capacity(trimmed.len());
                 let mut prev_space = false;
                 for c in trimmed.chars() {
@@ -205,8 +239,7 @@ fn read_cpu_model() -> Option<String> {
     None
 }
 
-fn read_meminfo_kb(key: &str) -> Option<u64> {
-    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+pub(crate) fn parse_meminfo_kb(raw: &str, key: &str) -> Option<u64> {
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix(key) {
             return rest.split_whitespace().next()?.parse().ok();
@@ -215,7 +248,116 @@ fn read_meminfo_kb(key: &str) -> Option<u64> {
     None
 }
 
-fn read_loadavg() -> Option<f64> {
-    let raw = fs::read_to_string("/proc/loadavg").ok()?;
+pub(crate) fn parse_loadavg(raw: &str) -> Option<f64> {
     raw.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STAT_FIXTURE: &str = "\
+cpu  3357 0 4313 1362393 9 0 0 0 0 0
+cpu0 1839 0 2090 681284 5 0 0 0 0 0
+cpu1 1518 0 2223 681108 3 0 0 0 0 0
+intr 1234567
+ctxt 2345678
+btime 1700000000
+";
+
+    #[test]
+    fn parse_cpu_samples_aggregate_and_cores() {
+        let s = parse_cpu_samples(STAT_FIXTURE);
+        let agg = s.aggregate.expect("aggregate present");
+        // total = 3357 + 4313 + 1362393 + 9 = 1370072 (the line above)
+        assert_eq!(agg.total, 3357 + 4313 + 1_362_393 + 9);
+        // idle = parts[3] + parts[4] = 1_362_393 + 9
+        assert_eq!(agg.idle, 1_362_393 + 9);
+        assert_eq!(s.per_core.len(), 2);
+    }
+
+    #[test]
+    fn parse_cpu_samples_handles_empty() {
+        let s = parse_cpu_samples("");
+        assert!(s.aggregate.is_none());
+        assert!(s.per_core.is_empty());
+    }
+
+    #[test]
+    fn parse_cpu_samples_skips_short_lines() {
+        // <5 numeric fields → ignored.
+        let s = parse_cpu_samples("cpu 1 2 3\n");
+        assert!(s.aggregate.is_none());
+    }
+
+    const MEMINFO_FIXTURE: &str = "\
+MemTotal:       16374804 kB
+MemFree:         3221408 kB
+MemAvailable:    9876543 kB
+Buffers:           45224 kB
+";
+
+    #[test]
+    fn parse_meminfo_kb_finds_keys() {
+        assert_eq!(
+            parse_meminfo_kb(MEMINFO_FIXTURE, "MemTotal:"),
+            Some(16_374_804)
+        );
+        assert_eq!(
+            parse_meminfo_kb(MEMINFO_FIXTURE, "MemAvailable:"),
+            Some(9_876_543)
+        );
+    }
+
+    #[test]
+    fn parse_meminfo_kb_returns_none_for_missing() {
+        assert_eq!(parse_meminfo_kb(MEMINFO_FIXTURE, "NotAKey:"), None);
+    }
+
+    #[test]
+    fn parse_loadavg_takes_first_field() {
+        assert!((parse_loadavg("0.42 0.30 0.20 1/256 12345").unwrap() - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_loadavg_rejects_garbage() {
+        assert_eq!(parse_loadavg(""), None);
+        assert_eq!(parse_loadavg("not a number"), None);
+    }
+
+    #[test]
+    fn parse_kernel_extracts_version_field() {
+        let raw = "Linux version 6.11.2-arch1-1 (linux@archlinux) (gcc 14) #1 SMP";
+        assert_eq!(parse_kernel(raw).as_deref(), Some("6.11.2-arch1-1"));
+    }
+
+    #[test]
+    fn parse_cpu_count_counts_processor_lines() {
+        let raw = "\
+processor       : 0
+vendor_id       : GenuineIntel
+processor       : 1
+vendor_id       : GenuineIntel
+processor       : 2
+";
+        assert_eq!(parse_cpu_count(raw), 3);
+    }
+
+    #[test]
+    fn parse_cpu_model_strips_trademark_and_whitespace() {
+        let raw = "\
+processor       : 0
+model name      : Intel(R) Core(TM) i7-1185G7 @ 3.00GHz
+cache size      : 12288 KB
+";
+        assert_eq!(
+            parse_cpu_model(raw).as_deref(),
+            Some("Intel Core i7-1185G7 @ 3.00GHz")
+        );
+    }
+
+    #[test]
+    fn parse_cpu_model_returns_none_when_absent() {
+        assert_eq!(parse_cpu_model("processor : 0\n"), None);
+    }
 }

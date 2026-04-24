@@ -132,3 +132,70 @@ pub(crate) enum Severity {
     Warm,
     Hot,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(label: &str, c: f64) -> Reading {
+        Reading {
+            label: label.into(),
+            celsius: c,
+        }
+    }
+
+    #[test]
+    fn severity_thresholds() {
+        assert_eq!(severity(20.0), Severity::Cool);
+        assert_eq!(severity(69.9), Severity::Cool);
+        assert_eq!(severity(70.0), Severity::Warm);
+        assert_eq!(severity(84.9), Severity::Warm);
+        assert_eq!(severity(85.0), Severity::Hot);
+        assert_eq!(severity(120.0), Severity::Hot);
+    }
+
+    #[test]
+    fn group_of_takes_first_word() {
+        assert_eq!(group_of("coretemp Package id 0"), "coretemp");
+        assert_eq!(group_of("nvme Composite"), "nvme");
+        assert_eq!(group_of("singleword"), "singleword");
+    }
+
+    #[test]
+    fn highlights_prioritises_package_over_other_groups() {
+        let readings = vec![
+            r("coretemp Core 0", 50.0),
+            r("coretemp Package id 0", 60.0),
+            r("nvme Composite", 40.0),
+            r("acpitz", 30.0),
+        ];
+        let picks = highlights(&readings, 3);
+        // Package wins for the coretemp group; then nvme Composite,
+        // then the next-hottest from a new group (acpitz).
+        assert_eq!(picks[0].label, "coretemp Package id 0");
+        assert_eq!(picks[1].label, "nvme Composite");
+        assert_eq!(picks[2].label, "acpitz");
+    }
+
+    #[test]
+    fn highlights_falls_back_to_hottest_when_no_priority_tag() {
+        let readings = vec![
+            r("acpitz", 40.0),
+            r("zone7", 80.0),
+            r("amd_pmf", 55.0),
+        ];
+        let picks = highlights(&readings, 2);
+        // No priority tag matches; sorted by hottest first.
+        assert_eq!(picks[0].label, "zone7");
+        assert_eq!(picks[1].label, "amd_pmf");
+    }
+
+    #[test]
+    fn highlights_respects_limit() {
+        let readings = (0..5)
+            .map(|i| r(&format!("group{i}"), f64::from(50 + i)))
+            .collect::<Vec<_>>();
+        assert_eq!(highlights(&readings, 2).len(), 2);
+        assert_eq!(highlights(&readings, 0).len(), 0);
+    }
+}

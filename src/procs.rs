@@ -199,17 +199,25 @@ pub(crate) struct PasswdCache {
 
 impl PasswdCache {
     pub(crate) fn load() -> Self {
+        fs::read_to_string("/etc/passwd")
+            .map(|raw| Self::parse(&raw))
+            .unwrap_or_default()
+    }
+
+    /// Pure parser, factored out of `load` so it can be unit-tested
+    /// without involving `/etc/passwd`. Lines with fewer than 3
+    /// colon-separated fields are skipped silently — same behaviour
+    /// as `getpwent_r`.
+    pub(crate) fn parse(raw: &str) -> Self {
         let mut users = HashMap::new();
-        if let Ok(raw) = fs::read_to_string("/etc/passwd") {
-            for line in raw.lines() {
-                // name:pass:uid:gid:gecos:home:shell
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() < 3 {
-                    continue;
-                }
-                if let Ok(uid) = parts[2].parse::<u32>() {
-                    users.insert(uid, parts[0].to_string());
-                }
+        for line in raw.lines() {
+            // name:pass:uid:gid:gecos:home:shell
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            if let Ok(uid) = parts[2].parse::<u32>() {
+                users.insert(uid, parts[0].to_string());
             }
         }
         Self { users }
@@ -391,6 +399,44 @@ mod tests {
     #[test]
     fn passwd_cache_handles_missing_uid() {
         let cache = PasswdCache::default();
+        assert_eq!(cache.lookup(9999), "uid=9999");
+    }
+
+    #[test]
+    fn matches_handles_unicode_filter() {
+        // Filter is case-insensitive ASCII; non-ASCII chars match
+        // exactly (we don't fold Unicode case for the filter input —
+        // that would imply locale data we don't carry).
+        let row = ProcessRow {
+            pid: 1,
+            ppid: 0,
+            uid: 0,
+            user: "root".into(),
+            state: 'S',
+            cpu_pct: None,
+            rss_bytes: 0,
+            threads: 1,
+            command: "café-server".into(),
+        };
+        assert!(matches(&row, "café"));
+        assert!(matches(&row, "CAF")); // ascii prefix still matches
+        assert!(!matches(&row, "CAFÉ")); // upper-case é is not folded to lower-case é
+    }
+
+    #[test]
+    fn passwd_cache_parses_typical_file() {
+        let raw = "\
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+short:line
+alice:x:1000:1000::/home/alice:/bin/zsh
+";
+        let cache = PasswdCache::parse(raw);
+        assert_eq!(cache.lookup(0), "root");
+        assert_eq!(cache.lookup(1), "daemon");
+        assert_eq!(cache.lookup(1000), "alice");
+        // The "short:line" entry has only 2 fields — silently skipped.
+        // Unknown uids fall back to "uid=N".
         assert_eq!(cache.lookup(9999), "uid=9999");
     }
 
