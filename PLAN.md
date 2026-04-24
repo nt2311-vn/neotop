@@ -1,5 +1,10 @@
 # neotop — plan to v0.1.0 (daily-driver quality)
 
+> **Status (2026-04-25):** v0.1.0 has shipped. All five tasks below are
+> ✅. The current document remains as the design record for that
+> release; new work tracks in `CHANGELOG.md` under `[Unreleased]` and
+> in fresh PLAN-vN.md files.
+
 Working document. Each section lists a concrete task, not a dream. The
 target is a tool that passes the "would I uninstall btm and use this
 instead?" bar on a Linux laptop running neosandbox.
@@ -9,8 +14,8 @@ instead?" bar on a Linux laptop running neosandbox.
 ```sh
 cd ~/Projects/Rust/neotop
 cat PLAN.md                 # this file
-cargo test                  # baseline: 9 tests pass
-cargo clippy --all-targets -- -D warnings  # baseline: clean
+cargo test                  # 43 tests pass at v0.1.0
+cargo clippy --all-targets -- -D warnings  # clean
 git log --oneline           # see where the last session stopped
 ```
 
@@ -44,7 +49,7 @@ Then pick the first **⬜ pending** item below and drive it to done.
 
 Five tasks. Roughly ordered by ratio of value to effort. Each should be its own git commit.
 
-### 1. ⬜ Wire `procs` into the UI (process table view)
+### 1. ✅ Wire `procs` into the UI (process table view) — shipped in v0.1.0
 
 **Goal:** pressing `Tab` switches the table between "VMs" (current) and "Procs" (all PIDs). Rendering parity with `htop`'s default view.
 
@@ -64,7 +69,7 @@ Five tasks. Roughly ordered by ratio of value to effort. Each should be its own 
 
 **Rough size:** ~220 lines added to `main.rs`, ~0 to `procs.rs`.
 
-### 2. ⬜ Self-profiling footer ("performance governance")
+### 2. ✅ Self-profiling footer ("performance governance") — shipped in v0.1.0
 
 **Goal:** neotop measures its own overhead and displays it. This is both an honest signal to the user and a safety net when we add expensive widgets.
 
@@ -86,7 +91,7 @@ Five tasks. Roughly ordered by ratio of value to effort. Each should be its own 
 
 **Rough size:** ~60 lines in `main.rs`, plus 2 lines in `proc.rs` to expose a `self_jiffies()` helper.
 
-### 3. ⬜ Error surface (stop swallowing `/proc` errors)
+### 3. ✅ Error surface (stop swallowing `/proc` errors) — shipped in v0.1.0
 
 **Goal:** when a file we expected to read disappears or parses badly, show it in the UI instead of silently returning `None` / `Vec::new()`. At the moment a half-broken `/sys/class/hwmon` returns an empty temps vec with no explanation.
 
@@ -111,7 +116,7 @@ struct Entry { when: Instant, source: &'static str, message: String }
 
 **Rough size:** ~100 lines, mostly plumbing.
 
-### 4. ⬜ Unit tests across all parsers
+### 4. ✅ Unit tests across all parsers — shipped in v0.1.0 (43 tests)
 
 **Goal:** `cargo test` covers every module's parsing path with representative fixture strings. ~25 tests total.
 
@@ -127,7 +132,7 @@ struct Entry { when: Instant, source: &'static str, message: String }
 
 **Rough size:** ~300 lines, mostly fixtures.
 
-### 5. ⬜ CI via GitHub Actions
+### 5. ✅ CI via GitHub Actions — shipped in v0.1.0
 
 **Goal:** `.github/workflows/ci.yml` that runs on every push + PR, covering rustfmt, clippy pedantic, tests, and a release build. Matrix: stable + MSRV (1.80).
 
@@ -155,7 +160,7 @@ jobs:
 
 **Rough size:** 40 lines of yaml + README update.
 
-### 6. ⬜ CHANGELOG.md + v0.1.0 tag
+### 6. ✅ CHANGELOG.md + v0.1.0 tag
 
 After the five above land:
 
@@ -191,11 +196,11 @@ its own milestone later:
 Write the answer next to each one before you code. These are the
 questions I stopped on this session:
 
-1. **Tab cycling:** should `Tab` cycle `Vms → Procs → Vms` or `Vms → Procs → Host → Vms`? The Host view would be a dedicated screen with all the widgets the current overview has, larger. Decision: _______
-2. **Kill confirmation UX:** inline prompt (a single line overlayed) or modal (Centered popup with Y/N)? htop does a modal, btop inlines. Decision: _______
-3. **When to flush `ErrorRing`:** after 5s of no new entries, or never (let the user scroll through all)? Decision: _______
-4. **Clock source for perf metrics:** `Instant` (monotonic) is obvious for deltas. But for comparing against `args.refresh`, we want wall-clock stable. Decision: _______ (probably `Instant` throughout; wall-clock only for `updated_at_ns` in state.json).
-5. **Should `procs::Tracker` walk `/proc/<pid>/task/*` for per-thread stats?** Current answer is **no, too expensive** — one file read per thread × 1000 threads × 4 Hz = 16k reads/s. Reconsider only if `htop`-style thread view becomes a requirement.
+1. **Tab cycling:** should `Tab` cycle `Vms → Procs → Vms` or `Vms → Procs → Host → Vms`? Decision: **`Vms ↔ Procs`** (binary toggle). A dedicated Host screen is deferred — the current overview already lives in the top three lines of both views.
+2. **Kill confirmation UX:** inline prompt or modal popup? Decision: **inline on the help bar**, btop-style. The help bar is already there and re-purposing it keeps the layout stable.
+3. **When to flush `ErrorRing`:** after 5s of no new entries, or never? Decision: **5 s TTL** for the *visible* badge; the ring (cap 16) keeps older entries for a future browser.
+4. **Clock source for perf metrics:** Decision: **`Instant` throughout.** Wall-clock is only used by `updated_at_ns` in state.json, which is the producer's concern.
+5. **Should `procs::Tracker` walk `/proc/<pid>/task/*` for per-thread stats?** Decision: **no.** One file read per thread × ~1000 threads × 4 Hz = ~16k reads/s. Reconsider only if an `htop`-style thread view becomes a hard requirement.
 
 ---
 
