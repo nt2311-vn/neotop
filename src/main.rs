@@ -26,7 +26,7 @@
 //!     x             (Vms)   delete state file of the selected halted vm
 //!     s             (Procs) cycle sort key (CPU → MEM → PID → CMD)
 //!     t             (Procs) toggle tree view (parent → children)
-//!     H             (Procs) toggle per-core CPU heatmap (cores × time)
+//!     H             (Procs) toggle per-core CPU spectrum (sparkline + % + gauge per core)
 //!     /             (Procs) enter filter mode (Esc to clear, Enter to confirm)
 //!     K             (Procs) send SIGTERM to selected pid (with confirm)
 //!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
@@ -572,13 +572,14 @@ struct App {
     /// instead of the sortable flat list. Sort and filter are ignored
     /// in tree mode (a future iteration may layer them back on).
     tree_mode: bool,
-    /// When true, the per-core CPU panel is replaced by a 2D
-    /// heatmap (cores × time). Toggled with `H`. Default off
-    /// because it's a power-user view that costs vertical real
-    /// estate proportional to the core count — fine on a 14-core
-    /// laptop with a tall terminal, less so on a 4-row VT in a
-    /// recovery shell.
-    per_core_heatmap: bool,
+    /// When true, the per-core CPU panel is replaced by the
+    /// "spectrum" view — one row per core combining a 60-second
+    /// sparkline, the live %, and a proportional gauge. Toggled
+    /// with `H`. Default off because it's a power-user view that
+    /// costs vertical real estate proportional to the core count
+    /// — fine on a 14-core laptop with a tall terminal, less so
+    /// on a 4-row VT in a recovery shell.
+    per_core_spectrum: bool,
 
     // Host overview
     prev_host_cpu: host::CpuSamples,
@@ -705,7 +706,7 @@ impl App {
             procs_sort: procs::SortBy::Cpu,
             procs_filter: String::new(),
             tree_mode: false,
-            per_core_heatmap: false,
+            per_core_spectrum: false,
             prev_host_cpu,
             host_info,
             net_tracker,
@@ -1272,14 +1273,15 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.clamp_selections();
         }
         KeyCode::Char('H') if app.view == View::Procs => {
-            // Per-core heatmap toggle. Capital H so it doesn't
-            // shadow any future vim-style left-motion key. The
-            // first toggle "on" is essentially free at frame time
-            // because `host_history.per_core` has been filling
-            // since launch — the user instantly sees the last
-            // 60 s of per-core activity without waiting for a
-            // sample window to accumulate.
-            app.per_core_heatmap = !app.per_core_heatmap;
+            // Per-core spectrum-view toggle. Capital H so it
+            // doesn't shadow any future vim-style left-motion key.
+            // The first toggle "on" is essentially free at frame
+            // time because `host_history.per_core` has been
+            // filling since launch — the user instantly sees the
+            // last 60 s of per-core activity (sparkline + numeric
+            // % + gauge) without waiting for a sample window to
+            // accumulate.
+            app.per_core_spectrum = !app.per_core_spectrum;
         }
         KeyCode::Char('/') if app.view == View::Procs => {
             app.input = InputMode::Filter;
@@ -1452,7 +1454,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
         ),
         kv_line(
             "  H ",
-            "toggle per-core CPU heatmap (cores × time, last 60 s)",
+            "toggle per-core CPU spectrum (60 s history + live % + gauge)",
             kb,
             dim,
         ),
@@ -1625,7 +1627,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         app.host_info.per_core_pct.len(),
         area.width,
         area.height,
-        app.per_core_heatmap,
+        app.per_core_spectrum,
     );
     let host_h = host_overview_rows(&app.gpus);
     // The memory composition bar needs 3 rows (top border, content,
@@ -1657,8 +1659,13 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.gpus,
     );
     if percore_h > 0 {
-        if app.per_core_heatmap {
-            draw_per_core_heatmap(f, chunks[2], &app.host_history.per_core);
+        if app.per_core_spectrum {
+            draw_per_core_spectrum(
+                f,
+                chunks[2],
+                &app.host_history.per_core,
+                &app.host_info.per_core_pct,
+            );
         } else {
             draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
         }
@@ -1702,88 +1709,197 @@ fn host_overview_rows(gpus: &[gpu::Gpu]) -> u16 {
     }
 }
 
-fn percore_height(num_cores: usize, width: u16, term_h: u16, heatmap: bool) -> u16 {
+fn percore_height(num_cores: usize, width: u16, term_h: u16, spectrum: bool) -> u16 {
     if num_cores == 0 {
         return 0;
     }
-    if heatmap {
-        // One row per core, capped at a third of the terminal so
-        // the procs body still gets a usable list. Floor at 3 so
-        // a 4-core box on a tall window doesn't squeeze the chart
-        // into illegible nubs.
-        let cap = u16::try_from(num_cores).unwrap_or(u16::MAX);
-        let dyn_cap = (term_h / 3).max(3);
-        return cap.min(dyn_cap);
+    if spectrum {
+        // One row per core + 1 row for the time-axis tick label,
+        // capped at a third of the terminal so the procs body
+        // still gets ~two-thirds of the screen. Floor at 4 so
+        // even a 6-row terminal gets 3 cores + axis rather than
+        // collapsing into nubs.
+        let want = u16::try_from(num_cores.saturating_add(1)).unwrap_or(u16::MAX);
+        let dyn_cap = (term_h / 3).max(4);
+        return want.min(dyn_cap);
     }
     let per_row = (width / PERCORE_CELL_W).max(1) as usize;
     let rows = num_cores.div_ceil(per_row);
     u16::try_from(rows.min(PERCORE_MAX_ROWS as usize)).unwrap_or(PERCORE_MAX_ROWS)
 }
 
-/// Reserve 5 cells for the heatmap row label `" c{:<2} "` (4 visible
-/// chars plus a trailing space). Lifted out of the function body so
+/// Reserve 5 cells for the row label `" c{:<2} "` (4 visible chars
+/// plus a trailing space). Lifted to module scope so
 /// `clippy::items_after_statements` stays happy.
-const HEATMAP_LABEL_W: u16 = 5;
+const SPECTRUM_LABEL_W: u16 = 5;
+/// Width of the trailing `"  99% "` numeric percent column.
+const SPECTRUM_PCT_W: u16 = 6;
+/// Width of the trailing gauge ` ▕XXXXXXXXXXXX▏` — 1 leading space,
+/// 1 cell `▕`, `SPECTRUM_GAUGE_CELLS` bar slots, 1 cell `▏`. Tuned so
+/// the gauge reads at a glance without dominating the row.
+const SPECTRUM_GAUGE_CELLS: u16 = 12;
+const SPECTRUM_GAUGE_W: u16 = 1 + 1 + SPECTRUM_GAUGE_CELLS + 1;
+const SPECTRUM_FIXED_W: u16 = SPECTRUM_LABEL_W + SPECTRUM_PCT_W + SPECTRUM_GAUGE_W;
 
-/// Cores × time heatmap. Each row = one core (top = `c00`); each
-/// cell = one time sample (oldest left, newest right) painted as a
-/// solid background colour from the same green/yellow/red ramp the
-/// `now` strip uses. The picture answers questions the `now` strip
-/// can't:
+/// Per-core "spectrum" view. Each row triple-encodes one core:
 ///
-/// * Did this load just appear, or has it been steady for a minute?
-/// * Is one core hot, or all of them?
-/// * Is the scheduler ping-ponging a single hot job between cores?
+/// * **Time series** — a 60-second sparkline drawn with the
+///   `▁▂▃▄▅▆▇█` block ramp, every cell *also* coloured by the
+///   green/yellow/red load palette. The eye reads height **and**
+///   colour, so a glance separates "long quiet stretch with a
+///   recent spike" from "hot all minute" without conscious work.
+/// * **Live %** — the most recent sample as a numeric percent.
+/// * **Gauge** — a proportional bar `▕████░░░░░░░░▏` so a busy core
+///   pops visually next to the quieter ones.
 ///
-/// htop / btm / btop all show the live per-core %, but none show
-/// the *time axis*. That's the win.
-fn draw_per_core_heatmap(f: &mut ratatui::Frame<'_>, area: Rect, rings: &[VecDeque<u64>]) {
-    if rings.is_empty() || area.height == 0 {
+/// htop / btm / btop all show the live per-core %; btop's heatmap
+/// shows the time axis. Combining height-coded sparkline +
+/// numeric + gauge per row gives three readouts where the
+/// existing tools give one or two — and groups them per-core so
+/// you can scan the whole CPU like an EKG strip.
+///
+/// The last row of the panel is reserved for a thin time-axis
+/// tick label (`-Ns ──── now`) so a new user instantly sees the
+/// chart's reach.
+fn draw_per_core_spectrum(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    rings: &[VecDeque<u64>],
+    live: &[f64],
+) {
+    if rings.is_empty() || area.height == 0 || area.width <= SPECTRUM_FIXED_W {
         return;
     }
-    let cells = area.width.saturating_sub(HEATMAP_LABEL_W) as usize;
-    if cells == 0 {
+    let spark_w = (area.width - SPECTRUM_FIXED_W) as usize;
+    if spark_w == 0 {
         return;
     }
-    let max_rows = area.height as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows);
-    for (i, ring) in rings.iter().take(max_rows).enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells + 1);
-        spans.push(Span::styled(
-            format!(" c{i:<2} "),
-            Style::default().fg(Color::DarkGray),
-        ));
-        // Take the most recent `cells` samples; left-pad with empty
-        // (black) cells when the buffer hasn't filled yet so a
-        // freshly-launched neotop doesn't render right-justified.
-        let start = ring.len().saturating_sub(cells);
-        let visible: Vec<u64> = ring.range(start..).copied().collect();
-        let pad = cells.saturating_sub(visible.len());
-        for _ in 0..pad {
-            spans.push(Span::raw(" "));
-        }
-        for &v in &visible {
-            spans.push(Span::styled(
-                " ",
-                Style::default().bg(heatmap_cell_color(v)),
-            ));
-        }
-        lines.push(Line::from(spans));
+
+    // Last visible row is the axis label; everything above is cores.
+    let core_rows_budget = (area.height as usize).saturating_sub(1);
+    let core_rows = core_rows_budget.min(rings.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(core_rows + 1);
+    for (i, ring) in rings.iter().take(core_rows).enumerate() {
+        lines.push(spectrum_row(i, ring, live.get(i).copied(), spark_w));
     }
+    lines.push(spectrum_axis_row(spark_w));
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Background colour ramp for a single heatmap cell. Same
-/// breakpoints as `cpu_glyph_color` so the eye reads the heatmap
-/// and the `now` strip with one mental model. Idle is dark grey
-/// rather than black so a quiet core still shows as "there" —
-/// black against terminal background would just disappear.
-fn heatmap_cell_color(pct: u64) -> Color {
-    match pct {
-        0..=19 => Color::DarkGray,
-        20..=49 => Color::Green,
-        50..=79 => Color::Yellow,
-        _ => Color::Red,
+/// Build one core's row. Public-ish so unit tests can exercise the
+/// span layout without a real `Frame`.
+fn spectrum_row(
+    core_idx: usize,
+    ring: &VecDeque<u64>,
+    live_pct: Option<f64>,
+    spark_w: usize,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(spark_w + 8);
+    spans.push(Span::styled(
+        format!(" c{core_idx:<2} "),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    // Sparkline. Take the most recent `spark_w` samples and left-pad
+    // with blanks so a freshly-launched neotop doesn't render
+    // right-justified before the buffer fills.
+    let start = ring.len().saturating_sub(spark_w);
+    let visible: Vec<u64> = ring.range(start..).copied().collect();
+    let pad = spark_w.saturating_sub(visible.len());
+    for _ in 0..pad {
+        spans.push(Span::raw(" "));
+    }
+    for &v in &visible {
+        #[allow(clippy::cast_precision_loss)]
+        let pct = v as f64;
+        spans.push(Span::styled(
+            bar_glyph(pct).to_string(),
+            Style::default().fg(cpu_load_color(pct)),
+        ));
+    }
+
+    // Numeric %. Prefer the smoothed live value the rest of the UI
+    // shows; fall back to the latest ring sample if the topology
+    // ring just got resized and `live` lags by a tick.
+    #[allow(clippy::cast_precision_loss)]
+    let cur = live_pct.unwrap_or_else(|| ring.back().copied().unwrap_or(0) as f64);
+    let cur_color = cpu_load_color(cur);
+    spans.push(Span::styled(
+        format!("  {cur:>3.0}% "),
+        Style::default().fg(cur_color),
+    ));
+
+    // Gauge.
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        "▕".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.extend(gauge_cells(cur, SPECTRUM_GAUGE_CELLS as usize, cur_color));
+    spans.push(Span::styled(
+        "▏".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
+}
+
+/// Bottom tick row: `-Ns ──────────────── now`, where `N` is the
+/// sparkline width in samples (= seconds, since we tick at 1 Hz).
+/// Under the label column we leave whitespace so the axis sits
+/// flush with the start of the sparkline.
+fn spectrum_axis_row(spark_w: usize) -> Line<'static> {
+    let style = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    // 5 spaces under the label column.
+    spans.push(Span::raw(" ".repeat(SPECTRUM_LABEL_W as usize)));
+    let lhs = format!("-{spark_w}s ");
+    let rhs = " now";
+    let dashes = spark_w
+        .saturating_sub(lhs.chars().count())
+        .saturating_sub(rhs.chars().count());
+    spans.push(Span::styled(lhs, style));
+    spans.push(Span::styled("─".repeat(dashes), style));
+    spans.push(Span::styled(rhs.to_string(), style));
+    Line::from(spans)
+}
+
+/// Render a horizontal gauge of `cells` characters: filled cells in
+/// `fill_color`, empties in `DarkGray`. Returns the cells as spans
+/// (no surrounding brackets — those are emitted at the call site so
+/// the caller can colour them independently).
+fn gauge_cells(pct: f64, cells: usize, fill_color: Color) -> Vec<Span<'static>> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let filled = ((pct.clamp(0.0, 100.0) / 100.0) * cells as f64).round() as usize;
+    let filled = filled.min(cells);
+    vec![
+        Span::styled("█".repeat(filled), Style::default().fg(fill_color)),
+        Span::styled(
+            "░".repeat(cells - filled),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+/// Four-stop colour ramp shared by the spectrum sparkline cells,
+/// the live % readout, and the gauge fill. Idle (≤19 %) is dark
+/// grey rather than green so a quiet core fades into the
+/// background and the eye is drawn to active cores. Same upper
+/// breakpoints as `cpu_glyph_color` so the rest of the UI keeps
+/// one mental model.
+fn cpu_load_color(pct: f64) -> Color {
+    if pct >= 80.0 {
+        Color::Red
+    } else if pct >= 50.0 {
+        Color::Yellow
+    } else if pct >= 20.0 {
+        Color::Green
+    } else {
+        Color::DarkGray
     }
 }
 
@@ -2250,11 +2366,19 @@ fn draw_host(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// One-line summary covering every detected GPU. AMD cards report
-/// real numbers (busy %, VRAM, watts); NVIDIA / Intel cards are
-/// shown by name with a `(driver pending)` tag so the user knows
-/// the hardware *is* recognised — the metrics just aren't wired up
-/// in this neotop yet.
+/// Width of each inline GPU gauge `▕XXXXXXXX▏`. Eight cells is
+/// enough to read the fill at a glance without crowding the line —
+/// busy % and VRAM each get their own gauge so the overview shows
+/// the same triple readout (numeric + gauge + history-via-sparkline-up-top)
+/// that the per-core spectrum view shows for CPU.
+const GPU_GAUGE_CELLS: usize = 8;
+
+/// One-line summary covering every detected GPU. AMD + NVIDIA
+/// cards report real numbers (busy %, VRAM, watts) plus inline
+/// gauges visualising current load and VRAM occupancy. Intel
+/// cards are shown by name with a `(driver pending)` tag so the
+/// user knows the hardware *is* recognised — the metrics just
+/// aren't wired up in this neotop yet.
 fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
         vec![Span::styled(" gpu ", Style::default().fg(Color::DarkGray))];
@@ -2269,10 +2393,23 @@ fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
         if let Some(busy) = g.busy_pct {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let busy_int = busy.round() as i64;
+            let busy_color = gpu_busy_color(busy);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{busy_int:>3}%"),
-                Style::default().fg(gpu_busy_color(busy)),
+                Style::default().fg(busy_color),
+            ));
+            // Inline busy gauge so a 92 %-pegged card shouts at you
+            // visually, not just numerically.
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "▕".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.extend(gauge_cells(busy, GPU_GAUGE_CELLS, busy_color));
+            spans.push(Span::styled(
+                "▏".to_string(),
+                Style::default().fg(Color::DarkGray),
             ));
         }
         if g.vram_total > 0 {
@@ -2285,6 +2422,22 @@ fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
                 proc::human_bytes(g.vram_used),
                 proc::human_bytes(g.vram_total),
             )));
+            // VRAM gauge — the "current use / capacity" readout
+            // in chart form. A card 95 % full of VRAM is a
+            // pre-OOM signal you can spot from across the room.
+            if let Some(vram_pct) = g.vram_pct() {
+                let vram_color = cpu_load_color(vram_pct);
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    "▕".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.extend(gauge_cells(vram_pct, GPU_GAUGE_CELLS, vram_color));
+                spans.push(Span::styled(
+                    "▏".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
         }
         if let Some(w) = g.power_watts {
             spans.push(Span::raw(format!(" {w:.1}W")));
@@ -3340,7 +3493,7 @@ mod tests {
     #[test]
     fn percore_height_zero_when_no_cores() {
         assert_eq!(percore_height(0, 200, 40, false), 0);
-        // Heatmap mode also collapses to 0 with no cores.
+        // Spectrum mode also collapses to 0 with no cores.
         assert_eq!(percore_height(0, 200, 40, true), 0);
     }
 
@@ -3365,30 +3518,94 @@ mod tests {
     }
 
     #[test]
-    fn percore_height_heatmap_one_row_per_core_with_room() {
-        // 8 cores in a tall terminal: every core gets a row.
-        assert_eq!(percore_height(8, 200, 60, true), 8);
+    fn percore_height_spectrum_one_row_per_core_plus_axis_with_room() {
+        // 8 cores in a tall terminal: every core gets a row + 1
+        // for the time-axis tick label = 9 rows.
+        assert_eq!(percore_height(8, 200, 60, true), 9);
     }
 
     #[test]
-    fn percore_height_heatmap_caps_at_third_of_terminal() {
+    fn percore_height_spectrum_caps_at_third_of_terminal() {
         // 32 cores in a 24-row terminal: cap at 24/3 = 8 rows so
         // the procs body keeps two-thirds of the screen.
         assert_eq!(percore_height(32, 200, 24, true), 8);
     }
 
     #[test]
-    fn heatmap_cell_color_steps() {
-        // Same breakpoints as cpu_glyph_color so the eye keeps one
-        // mental model across the heatmap and the "now" strip.
-        assert!(matches!(heatmap_cell_color(0), Color::DarkGray));
-        assert!(matches!(heatmap_cell_color(19), Color::DarkGray));
-        assert!(matches!(heatmap_cell_color(20), Color::Green));
-        assert!(matches!(heatmap_cell_color(49), Color::Green));
-        assert!(matches!(heatmap_cell_color(50), Color::Yellow));
-        assert!(matches!(heatmap_cell_color(79), Color::Yellow));
-        assert!(matches!(heatmap_cell_color(80), Color::Red));
-        assert!(matches!(heatmap_cell_color(100), Color::Red));
+    fn cpu_load_color_steps() {
+        // Four-stop ramp shared by sparkline cells, live %, and
+        // gauge fill. Idle (≤19 %) is dark grey so quiet cores
+        // recede; the upper breakpoints match cpu_glyph_color.
+        assert!(matches!(cpu_load_color(0.0), Color::DarkGray));
+        assert!(matches!(cpu_load_color(19.0), Color::DarkGray));
+        assert!(matches!(cpu_load_color(20.0), Color::Green));
+        assert!(matches!(cpu_load_color(49.0), Color::Green));
+        assert!(matches!(cpu_load_color(50.0), Color::Yellow));
+        assert!(matches!(cpu_load_color(79.0), Color::Yellow));
+        assert!(matches!(cpu_load_color(80.0), Color::Red));
+        assert!(matches!(cpu_load_color(100.0), Color::Red));
+    }
+
+    #[test]
+    fn gauge_cells_round_to_nearest() {
+        // 0% empty.
+        let s = gauge_cells(0.0, 10, Color::Green);
+        let total: usize = s.iter().map(|sp| sp.content.chars().count()).sum();
+        assert_eq!(total, 10);
+        assert_eq!(s[0].content.as_ref(), "");
+        // 50% gives exactly 5 filled out of 10.
+        let s = gauge_cells(50.0, 10, Color::Green);
+        assert_eq!(s[0].content.chars().count(), 5);
+        assert_eq!(s[1].content.chars().count(), 5);
+        // 100% fully filled, no empties.
+        let s = gauge_cells(100.0, 10, Color::Red);
+        assert_eq!(s[0].content.chars().count(), 10);
+        assert_eq!(s[1].content.as_ref(), "");
+        // Out-of-range values clamp rather than panic.
+        let s = gauge_cells(-50.0, 8, Color::Green);
+        assert_eq!(s[0].content.as_ref(), "");
+        let s = gauge_cells(150.0, 8, Color::Red);
+        assert_eq!(s[0].content.chars().count(), 8);
+    }
+
+    #[test]
+    fn spectrum_row_left_pads_short_ring() {
+        // A ring with 5 samples drawn in 10 spark cells should be
+        // left-padded with 5 spaces so newly-launched neotop
+        // doesn't render right-justified.
+        let mut ring: VecDeque<u64> = VecDeque::new();
+        for v in [10, 20, 30, 40, 50] {
+            ring.push_back(v);
+        }
+        let line = spectrum_row(0, &ring, Some(50.0), 10);
+        // First span is the label; spans 1..=5 should be the
+        // five blank pad cells before the bar glyphs start.
+        let pads: usize = line
+            .spans
+            .iter()
+            .skip(1)
+            .take(5)
+            .filter(|s| s.content.as_ref() == " ")
+            .count();
+        assert_eq!(pads, 5);
+    }
+
+    #[test]
+    fn spectrum_axis_row_widths_match_sparkline() {
+        // Axis row layout: 5 spaces (label column) + "-Ns " + dashes
+        // + " now". The total visible width past the label must
+        // equal the sparkline width so the tick lines up.
+        let line = spectrum_axis_row(40);
+        let visible_after_label: usize = line
+            .spans
+            .iter()
+            .skip(1)
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(visible_after_label, 40);
+        // Empty sparkline still renders without panicking.
+        let line = spectrum_axis_row(0);
+        assert!(!line.spans.is_empty());
     }
 
     #[test]
@@ -3422,12 +3639,12 @@ mod tests {
     }
 
     #[test]
-    fn percore_height_heatmap_floor_at_three() {
+    fn percore_height_spectrum_floor_at_four() {
         // Even on a tiny 6-row terminal, we still try to give the
-        // user 3 rows of heatmap rather than collapsing it to 1
-        // — a one-row heatmap is just a sparkline you can already
-        // see in the strip below.
-        assert_eq!(percore_height(8, 200, 6, true), 3);
+        // user 4 rows of spectrum (3 cores + axis) rather than
+        // collapsing into nubs. A one-core "spectrum" is just a
+        // sparkline you can already see in the strip below.
+        assert_eq!(percore_height(8, 200, 6, true), 4);
     }
 
     #[test]

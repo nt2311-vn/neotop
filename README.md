@@ -204,8 +204,12 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Memory composition bar (used / buffers / cached / free) — shipped in 0.8.0
 - [x] NVIDIA GPU metrics via `nvml-wrapper` — shipped in 0.9.0
 - [x] Per-core CPU heatmap (cores × time grid; `H` to toggle) — shipped in 0.10.0
+- [x] Per-core CPU **spectrum view** (sparkline + % + gauge per core) — shipped in 0.11.0
+- [x] GPU gauges (busy + VRAM, inline with the host overview) — shipped in 0.11.0
+- [x] Time-axis tick label on the spectrum (`-Ns ── now`) — shipped in 0.11.0
 - [ ] Intel via `intel_gpu_top`-style perf counters
-- [ ] Themes / layout config
+- [ ] Themes / layout config (TOML)
+- [ ] SMT / NUMA grouping in the spectrum view
 - [ ] macOS / Windows ports
 
 ## License

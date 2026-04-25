@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-04-25
+
+The "spectrum view". v0.10.0's heatmap was a flat colour grid —
+btop has the same idea, and the user pointed out it was "too
+normal". v0.11.0 replaces the flat grid with a per-core row that
+**triple-encodes** load: a height-coded *and* colour-coded
+sparkline + the live numeric % + a proportional gauge. Same `H`
+toggle. Same 60-second window. Strictly more information per
+glance.
+
+The same triple-readout idea now applies to GPUs in the host
+overview — busy % and VRAM each get an inline gauge alongside
+their numeric. So the rule is now:
+
+> Anything that has a 0..100 % current value and a 60-second
+> history gets **sparkline + numeric + gauge**, painted with the
+> same green/yellow/red ramp.
+
+### Added
+
+- **Per-core CPU spectrum view** (`H`, replaces the flat
+  heatmap). One row per core:
+  - Label `c00` plus trailing space (4 chars wide).
+  - 60-second sparkline drawn with the `▁▂▃▄▅▆▇█` block ramp.
+    Each cell is *also* coloured by load — height + colour so
+    a long quiet stretch with a recent spike reads
+    differently from "hot all minute" without conscious work.
+  - Live numeric % in the same colour.
+  - Proportional gauge `▕████░░░░░░░░▏` so a busy core pops
+    visually next to quieter ones.
+- **Time-axis tick row.** The bottom row of the spectrum panel
+  reads `-Ns ────── now` so a new user instantly sees the
+  chart's reach (the smallest roadmap item, knocked out
+  alongside the visual rework).
+- **GPU gauges** in `host_line_gpu`. Every card with live
+  metrics now shows two inline gauges — one for busy %, one
+  for VRAM occupancy — alongside the existing numeric and the
+  GPU sparkline up top. A T1000 at 92 % busy with 95 % VRAM
+  used now *looks* alarming, not just reads alarming.
+- **`cpu_load_color` (4-stop ramp)** — DarkGray idle (≤19 %),
+  Green active-low (20–49 %), Yellow active-mid (50–79 %), Red
+  hot (≥80 %). Idle is dark grey rather than green so quiet
+  cores recede and the eye is drawn to active cores. Shared
+  by sparkline cells, the live %, the spectrum gauge, and
+  the GPU VRAM gauge.
+- **`gauge_cells(pct, cells, color)`** helper — single source
+  of truth for the proportional bar fill across CPU spectrum
+  rows and GPU gauges. Out-of-range inputs clamp rather than
+  panic.
+
+### Changed
+
+- `App.per_core_heatmap` → `App.per_core_spectrum`. Same key
+  (`H`), same default (off), same passive-fill behaviour
+  (`host_history.per_core` accumulates from launch so the
+  first toggle "on" instantly shows 60 s of history).
+- `percore_height()` in spectrum mode now returns
+  `min(num_cores + 1, term_h / 3)` with a floor of 4, so the
+  axis row always has space and even tiny terminals get
+  3 cores + axis rather than collapsing into nubs.
+- `heatmap_cell_color(u64)` removed — its solid-bg use case
+  is gone. The colour ramp lives on as `cpu_load_color(f64)`.
+
+### Tests
+
+- 90 passing (was 87). Six replaced/added:
+  - `cpu_load_color_steps` — verifies the four-stop ramp at
+    the breakpoints (0/19/20/49/50/79/80/100).
+  - `gauge_cells_round_to_nearest` — 0 / 50 / 100 % all give
+    correct cell counts; out-of-range values clamp.
+  - `spectrum_row_left_pads_short_ring` — short rings render
+    left-padded, not right-justified, so newly-launched
+    neotop doesn't look broken for the first minute.
+  - `spectrum_axis_row_widths_match_sparkline` — the tick
+    label aligns flush with the start of the sparkline at any
+    width.
+  - `percore_height_spectrum_one_row_per_core_plus_axis_with_room`
+  - `percore_height_spectrum_caps_at_third_of_terminal`
+  - `percore_height_spectrum_floor_at_four`
+
+### Out of scope (tracked for v0.12.0+)
+
+- **Themes / TOML config** — substantial; deserves its own
+  release.
+- **Intel via i915 / Xe perf counters** — needs `CAP_PERFMON`
+  or root; gate behind a feature flag.
+- **macOS / Windows ports** — quarter of work, separate
+  arc.
+- **SMT / NUMA grouping** — read
+  `/sys/devices/system/cpu/cpu*/topology/core_id` and visually
+  group SMT siblings. Useful on hybrid-core CPUs (Intel P/E).
+
 ## [0.10.0] — 2026-04-25
 
 The per-core CPU heatmap. v0.8.0 shipped two "thousand words"
@@ -625,7 +717,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/nt2311/neotop/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/nt2311/neotop/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/nt2311/neotop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/nt2311/neotop/compare/v0.7.0...v0.8.0
