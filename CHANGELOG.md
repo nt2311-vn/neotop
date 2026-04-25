@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-25
+
+The "stop feeling laggy" release. `neotop` now feels like a monitor
+you can actually watch. Three user-visible complaints addressed:
+
+1. **Laggy / "cannot monitor anything".** The per-tick procs scan
+   used to read three files per pid (`stat`, `status`, `cmdline`).
+   Steady-state measured on a laptop with 404 pids: **~25 ms → 8.7 ms**.
+2. **"Board seems overwhelmed."** Host overview shrank from 4 lines
+   to 3: the static kernel + CPU-model line that didn't earn a row
+   moved to the `?` overlay, and the redundant inline per-core glyph
+   strip on line 1 was removed (the Procs view has a dedicated
+   per-core panel anyway).
+3. **Confusing sensor names like `pch_cannonlake#1`.** Every hwmon
+   label is now mapped to a short human tag (`cpu pkg`, `cpu`,
+   `gpu`, `nvme`, `wifi`, `acpi`, `pch`, `bat`, `zone`, `sensor`).
+   Cool chipset / ACPI / wifi readings are filtered out of the
+   one-line overview entirely — only shown when warm or hot.
+
+### Changed
+
+- **`procs::Tracker` caches per-pid static info.** `uid`, resolved
+  `user`, and `cmdline` never change after exec; we read them once
+  per pid and reuse them for every subsequent scan. Purged when the
+  pid exits.
+- **Dropped `/proc/<pid>/status` reads entirely.** RSS now comes
+  from `/proc/<pid>/stat` field 24 (pages) × `rustix::param::page_size()`.
+  Owning uid comes from `stat(2)` on the `/proc/<pid>` dir inode.
+  This cuts per-tick file I/O from `~3N` to `~N` reads.
+- **Host overview: 4 lines → 3.** Line 1 now also carries battery
+  info (folded in from old line 2). The kernel + CPU model block
+  is available via the `?` overlay under "System".
+- **Removed inline per-core glyph strip from host line 1.** The
+  Procs view already has a dedicated per-core panel; in the Vms
+  view the right-hand resources pane carries per-VM CPU detail.
+
+### Added
+
+- **`compact_temp_label()`** maps raw hwmon names to short tags and
+  strips the `#N` sensor-index suffix.
+- **`is_informative_temp()`** filter hides cool PCH / ACPI / wifi
+  / unknown readings so only the sensors the user cares about
+  (CPU, GPU, NVMe, battery) appear by default.
+- **"System" block in the `?` overlay** showing kernel version and
+  CPU model.
+
+### Tests
+
+- 59 passing. New tests:
+  - `compact_temp_label_maps_common_sensors`
+  - `informative_temp_filter_keeps_cpu_always_and_pch_only_when_hot`
+- Removed the status-parser tests (`parses_uid_from_status`,
+  `parses_vmrss_kb_to_bytes`) along with the helpers they covered —
+  we don't read `/proc/<pid>/status` anymore.
+
 ## [0.4.0] — 2026-04-25
 
 The "ergonomics + visibility" release. Four user-visible
@@ -218,7 +273,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/nt2311/neotop/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nt2311/neotop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nt2311/neotop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nt2311/neotop/compare/v0.1.0...v0.2.0

@@ -1122,20 +1122,37 @@ fn draw(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     // Modal overlays are painted *after* the per-view draw so they
     // sit on top of whichever table is current.
     if matches!(app.input, InputMode::Help) {
-        draw_help_overlay(f);
+        draw_help_overlay(f, &app.host_info);
     }
 }
 
 /// Centered keybindings popup. Toggled by `?`; dismissed by
 /// `?` / `Esc` / `q` / `Enter`. The Clear widget blanks out the
 /// rectangle first so the popup isn't see-through.
-fn draw_help_overlay(f: &mut ratatui::Frame<'_>) {
-    let area = centered_rect(64, 22, f.area());
+///
+/// Also carries the "about this machine" block (kernel + CPU model)
+/// that used to live on line 2 of the host overview — that info is
+/// static and doesn't earn a line of the always-visible header.
+fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
+    let area = centered_rect(64, 26, f.area());
     f.render_widget(Clear, area);
 
     let dim = Style::default().fg(Color::DarkGray);
     let kb = Style::default().fg(Color::Black).bg(Color::Yellow);
     let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  System",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  kernel  ", dim),
+            Span::raw(h.kernel.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("  cpu     ", dim),
+            Span::raw(h.cpu_model.clone()),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             "  Global",
@@ -1223,7 +1240,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // title
-            Constraint::Length(4),  // host overview (4 lines: summary, hw, net+temp, disk)
+            Constraint::Length(3),  // host overview (summary, net+temp, disk)
             Constraint::Min(5),     // fleet table
             Constraint::Length(16), // serial + resources pane
             Constraint::Length(1),  // help
@@ -1324,7 +1341,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),         // title
-            Constraint::Length(4),         // host overview
+            Constraint::Length(3),         // host overview (summary, net+temp, disk)
             Constraint::Length(percore_h), // per-core CPU grid (0..=2)
             Constraint::Length(3),         // CPU + MEM + NET\u{2193} + NET\u{2191} sparklines
             Constraint::Min(5),            // procs table + detail pane (split horiz)
@@ -1665,14 +1682,22 @@ fn draw_host(
     batteries: &[battery::Battery],
     disks: &[disk::Disk],
 ) {
-    let line1 = host_line1(h);
-    let line2 = host_line2(h, batteries);
-    let line3 = host_line3(ifaces, temps);
-    let line4 = host_line4(disks);
-    f.render_widget(Paragraph::new(vec![line1, line2, line3, line4]), area);
+    // Three tighter lines instead of four:
+    //   1. kvm + CPU% + MEM + load + battery (the "tell me now" line)
+    //   2. net + temps (moving-parts line)
+    //   3. disks
+    // The kernel/CPU-model line was static information that didn't
+    // earn its row — it now lives in the `?` overlay. The inline
+    // per-core bar strip was also removed from line 1 because the
+    // Procs view has a dedicated per-core panel; the Vms view gets
+    // per-core detail from its right-hand resources pane anyway.
+    let line1 = host_line1(h, batteries);
+    let line2 = host_line_net_temp(ifaces, temps);
+    let line3 = host_line4(disks);
+    f.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
 }
 
-fn host_line1(h: &host::HostInfo) -> Line<'static> {
+fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'static> {
     let kvm = if h.kvm_available {
         Span::styled(
             " kvm:ok ",
@@ -1694,21 +1719,9 @@ fn host_line1(h: &host::HostInfo) -> Line<'static> {
         Span::raw(" "),
         kvm,
         Span::raw("  "),
-        Span::styled("host CPU", Style::default().fg(Color::DarkGray)),
+        Span::styled("CPU", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {cpu_pct}  ")),
-    ];
-    if !h.per_core_pct.is_empty() {
-        spans.push(Span::styled("cores ", Style::default().fg(Color::DarkGray)));
-        for &pct in &h.per_core_pct {
-            spans.push(Span::styled(
-                bar_glyph(pct).to_string(),
-                Style::default().fg(cpu_glyph_color(pct)),
-            ));
-        }
-        spans.push(Span::raw("  "));
-    }
-    spans.extend([
-        Span::styled("mem", Style::default().fg(Color::DarkGray)),
+        Span::styled("MEM", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(
             " {}/{} ({mem_pct:>4.1}%)  ",
             proc::human_bytes(mem_used),
@@ -1716,25 +1729,12 @@ fn host_line1(h: &host::HostInfo) -> Line<'static> {
         )),
         Span::styled("load", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {:.2}", h.loadavg_1)),
-    ]);
-    Line::from(spans)
-}
-
-fn host_line2(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(" kernel ", Style::default().fg(Color::DarkGray)),
-        Span::raw(h.kernel.clone()),
-        Span::raw("   "),
-        Span::styled("cpu ", Style::default().fg(Color::DarkGray)),
-        Span::raw(h.cpu_model.clone()),
     ];
     if !batteries.is_empty() {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled("bat ", Style::default().fg(Color::DarkGray)));
-        for (i, b) in batteries.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("  "));
-            }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("bat", Style::default().fg(Color::DarkGray)));
+        for b in batteries {
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{}%", b.percent),
                 Style::default().fg(battery_color(b)),
@@ -1750,7 +1750,7 @@ fn host_line2(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
     Line::from(spans)
 }
 
-fn host_line3(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
+fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
         vec![Span::styled(" net ", Style::default().fg(Color::DarkGray))];
     if ifaces.is_empty() {
@@ -1774,7 +1774,16 @@ fn host_line3(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
     spans.push(Span::raw("   "));
     spans.push(Span::styled("temp ", Style::default().fg(Color::DarkGray)));
 
-    let picks = temp::highlights(temps, 3);
+    // Prefer "informative" sensors (CPU / GPU / NVMe / battery) and
+    // drop noisy chipset / ACPI readings unless they're actually hot.
+    // Without this filter the overview would surface labels like
+    // `pch_cannonlake#1  30°C` that don't help anyone.
+    let filtered: Vec<temp::Reading> = temps
+        .iter()
+        .filter(|r| is_informative_temp(r))
+        .cloned()
+        .collect();
+    let picks = temp::highlights(&filtered, 3);
     if picks.is_empty() {
         spans.push(Span::raw("—"));
     } else {
@@ -1787,7 +1796,10 @@ fn host_line3(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
                 temp::Severity::Warm => Color::Yellow,
                 temp::Severity::Hot => Color::Red,
             };
-            spans.push(Span::raw(compact_temp_label(&r.label)));
+            spans.push(Span::styled(
+                compact_temp_label(&r.label).to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{:>4.1}°C", r.celsius),
@@ -1881,25 +1893,55 @@ fn short_bat_status(s: &str) -> &'static str {
     }
 }
 
-fn compact_temp_label(label: &str) -> String {
-    if label.starts_with("coretemp") {
-        if label.contains("Package") {
-            "cpu pkg".into()
-        } else if label.contains("Core") {
-            label
-                .split_once(' ')
-                .map_or_else(|| label.into(), |(_, t)| t.to_lowercase())
-        } else {
-            "cpu".into()
-        }
-    } else if label.starts_with("nvme") {
-        "nvme".into()
-    } else if label.starts_with("iwlwifi") {
-        "wifi".into()
-    } else if label.starts_with("acpitz") {
-        "acpi".into()
-    } else {
-        label.split_whitespace().next().unwrap_or(label).to_string()
+/// Map a raw hwmon label (e.g. `coretemp Package id 0`, `nvme Composite`,
+/// `pch_cannonlake#1`, `k10temp`) to a short, human-friendly tag that
+/// fits in the one-line host overview. Falls back to the first word
+/// with any trailing `#N` sensor-index suffix stripped so we never
+/// surface raw kernel names like `pch_cannonlake#1` to the user.
+fn compact_temp_label(label: &str) -> &'static str {
+    // Order matters: more-specific strings like "coretemp Package"
+    // are checked before their broader "coretemp" siblings.
+    let lower = label.to_ascii_lowercase();
+    let first = lower
+        .split(['#', ' ', '\t'])
+        .next()
+        .unwrap_or(lower.as_str());
+    match first {
+        // CPU packages / cores.
+        "coretemp" if lower.contains("package") => "cpu pkg",
+        "coretemp" | "k10temp" | "zenpower" => "cpu",
+        // Discrete + integrated GPUs.
+        "amdgpu" | "nouveau" | "i915" | "xe" | "radeon" | "nvidia" => "gpu",
+        // Storage.
+        "nvme" => "nvme",
+        "drivetemp" => "disk",
+        // Wireless + ACPI + chipsets (these are usually noise, but
+        // better to label them than show `pch_cannonlake#1`).
+        "iwlwifi" | "iwlwifi_1" => "wifi",
+        "acpitz" => "acpi",
+        s if s.starts_with("pch_") => "pch",
+        // Firmware-exposed thermal zones and random sensors.
+        s if s.starts_with("thermal") => "zone",
+        s if s.starts_with("bat") => "bat",
+        s if s.starts_with("tctl") => "cpu",
+        // Last resort: return a short fallback. We deliberately avoid
+        // leaking the raw `first` word so the overview stays clean
+        // even on exotic hardware \u2014 the user can always see the full
+        // sensor name in future detailed-view work; here they just
+        // get `sensor`.
+        _ => "sensor",
+    }
+}
+
+/// Hide temperature readings that won't help the user. PCH, ACPI,
+/// wifi, and the fallback `sensor` bucket are dropped unless they're
+/// actually *hot* (warm or hot severity) \u2014 at which point the user
+/// probably does want to know. CPU, GPU, `NVMe`, and battery are
+/// always surfaced.
+fn is_informative_temp(r: &temp::Reading) -> bool {
+    match compact_temp_label(&r.label) {
+        "cpu pkg" | "cpu" | "gpu" | "nvme" | "disk" | "bat" => true,
+        _ => !matches!(temp::severity(r.celsius), temp::Severity::Cool),
     }
 }
 
@@ -2605,5 +2647,45 @@ mod tests {
         // 1 col-per-cell minimum; 2 cores in a 5-col terminal still
         // returns at least 1 row, never panics.
         assert!(percore_height(2, 5) >= 1);
+    }
+
+    #[test]
+    fn compact_temp_label_maps_common_sensors() {
+        // The regression we care about: the raw `pch_cannonlake#1`
+        // name that confused the user before 0.4.1 must collapse to
+        // something short and human-readable.
+        assert_eq!(compact_temp_label("pch_cannonlake#1"), "pch");
+        assert_eq!(compact_temp_label("pch_skylake#2"), "pch");
+        // Intel + AMD CPUs, package and per-core.
+        assert_eq!(compact_temp_label("coretemp Package id 0"), "cpu pkg");
+        assert_eq!(compact_temp_label("coretemp Core 0"), "cpu");
+        assert_eq!(compact_temp_label("k10temp Tctl"), "cpu");
+        // GPUs + NVMe + wifi + ACPI.
+        assert_eq!(compact_temp_label("amdgpu edge"), "gpu");
+        assert_eq!(compact_temp_label("nvme Composite"), "nvme");
+        assert_eq!(compact_temp_label("iwlwifi"), "wifi");
+        assert_eq!(compact_temp_label("acpitz"), "acpi");
+        // Unknown sensors collapse to a safe fallback, never the raw
+        // kernel name.
+        assert_eq!(compact_temp_label("some_weird_chip#3"), "sensor");
+    }
+
+    #[test]
+    fn informative_temp_filter_keeps_cpu_always_and_pch_only_when_hot() {
+        let cpu_cool = temp::Reading {
+            label: "coretemp Package id 0".into(),
+            celsius: 35.0,
+        };
+        let pch_cool = temp::Reading {
+            label: "pch_cannonlake#1".into(),
+            celsius: 30.0,
+        };
+        let pch_warm = temp::Reading {
+            label: "pch_cannonlake#1".into(),
+            celsius: 75.0,
+        };
+        assert!(is_informative_temp(&cpu_cool));
+        assert!(!is_informative_temp(&pch_cool));
+        assert!(is_informative_temp(&pch_warm));
     }
 }
