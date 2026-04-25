@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-25
+
+The "refined daily-driver" release. The Procs view picks up six
+quality-of-life improvements that turn it from "works" into the
+htop replacement neotop set out to be.
+
+### Added
+
+- **PID-locked cursor.** Before each refresh — and on every sort /
+  filter / tree mutation — neotop captures the PID under the cursor
+  and re-anchors the row index to wherever that PID ends up after
+  the recompute. Sorting by CPU% no longer slides the selection
+  from process to process as load shifts.
+- **Keybindings overlay (`?`).** A centered popup lists every
+  binding split into Global / Vms / Procs sections. Esc / ? / q /
+  Enter dismiss. Status bar grew a `?  help` chip so the binding
+  is discoverable.
+- **Tunable refresh tick (`+` / `-`).** App now owns the refresh
+  `Duration`, initialised from `--refresh-ms`. `+` (or `=`) halves
+  the tick down to 50 ms; `-` (or `_`) doubles up to 5 s. The perf
+  footer's tick metric grew a `actual/configured` form (e.g.
+  `252/250ms`) so drift is visible.
+- **Process detail pane.** When the terminal is ≥ 110 cols wide,
+  the Procs body splits 60/48 with a live detail pane on the right
+  showing PID, PPID, user, state, CPU%, threads, RSS, VSZ, the
+  cgroup-v2 path + memory.current/max, the curated rlimits, and
+  the wrapped full command line.
+- **Tree view (`t`).** Toggle Procs between flat-list mode and a
+  parent → children tree. Tree rendering uses the standard glyph
+  set (`├─`, `└─`, `│`). Roots are pids whose ppid is 0 or whose
+  ppid isn't in the row set (covers exec races + kernel threads).
+  Sort and filter are disabled in tree mode for now — a future
+  iteration may layer them back on.
+- **Sort-direction indicator.** Procs title shows `sort CPU%↓` /
+  `sort PID↑` so the user doesn't have to guess which way numbers
+  flow.
+
+### Changed
+
+- `App::refresh` renamed to `App::tick` so the field/method names
+  don't collide.
+- `procs_visible: Vec<usize>` → `Vec<ProcRender>` (idx + prefix)
+  so the tree-glyph chain travels with each rendered row.
+
+### Tests
+
+- 54 passing (was 51). Adds three tests in `main.rs`:
+  - `tree_orders_parents_then_children_in_pid_order` — caught a
+    real bug during dev where the root's `is_last_sibling` was
+    leaking into its children's prefix; fixed by adding a depth
+    parameter to `dfs_tree`.
+  - `tree_handles_orphans_as_roots`
+  - `flat_visible_respects_filter_and_sort`
+
 ## [0.2.0] — 2026-04-25
 
 The "neotop is now usable as a general system monitor" release. The
@@ -109,6 +163,7 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nt2311/neotop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nt2311/neotop/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nt2311/neotop/releases/tag/v0.1.0

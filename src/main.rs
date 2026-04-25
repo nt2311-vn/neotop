@@ -20,7 +20,7 @@
 //!     Tab           switch between Vms and Procs view
 //!     j / Down      next row
 //!     k / Up        prev row
-//!     PgDn / PgUp   jump 10 rows
+//!     `PgDn` / `PgUp`   jump 10 rows
 //!     r             refresh immediately
 //!     + / -         halve / double the refresh interval (50 ms .. 5 s)
 //!     x             (Vms)   delete state file of the selected halted vm

@@ -46,12 +46,16 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 | Key | View | Action |
 | --- | --- | --- |
 | `q` / `Ctrl-C` | both | quit |
+| `?` | both | toggle keybindings overlay |
 | `Tab` | both | toggle Vms / Procs view |
 | `j` / `↓` | both | next row |
 | `k` / `↑` | both | previous row |
+| `PgDn` / `PgUp` | both | jump 10 rows |
 | `r` | both | refresh now |
+| `+` / `-` | both | speed up / slow down the refresh tick (50 ms..5 s) |
 | `x` | Vms | delete `state.json` for the selected halted VM |
 | `s` | Procs | cycle sort key (CPU → MEM → PID → CMD) |
+| `t` | Procs | toggle tree view (parent → children) |
 | `/` | Procs | enter filter mode (Esc clears, Enter applies) |
 | `K` | Procs | send SIGTERM to the selected pid (with confirm) |
 | `Ctrl-K` | Procs | send SIGKILL to the selected pid (with confirm) |
@@ -77,11 +81,27 @@ CPU% sparkline, cgroup-v2 path + memory.current/max, and the rlimits
 that actually matter for microVMs.
 
 **Procs view (`Tab` to switch):** htop-style process table for every
-PID on the host — `PID USER STATE CPU% RSS THR COMMAND`. Sortable by
-CPU%, RSS, PID, or command. Substring filter, and SIGTERM/SIGKILL with
-a confirmation prompt before either signal is delivered. Above the
-table, two 15-second sparklines track host CPU% (green) and host
-memory% (magenta).
+PID on the host — `PID USER STATE CPU% RSS THR COMMAND`. The cursor
+is pid-locked, so sorting by CPU% never slides the selection off the
+process you were watching. Sortable by CPU%, RSS, PID, or command
+(`s`). Substring filter (`/`). SIGTERM/SIGKILL via `K` / `Ctrl-K`
+with a y/N prompt. Press `t` to switch to tree view (parent →
+children, standard `├─ │ └─` glyphs). Above the table, two 15-second
+sparklines track host CPU% (green) and host memory% (magenta).
+
+When the terminal is at least 110 columns wide, a **detail pane**
+appears on the right of the Procs table showing the selected
+process's PID, PPID, user, state, CPU%, threads, RSS, VSZ, the
+cgroup-v2 path with memory.current / memory.max, the curated
+rlimits, and the wrapped full command line.
+
+Press `?` for a centered keybindings overlay listing every binding
+with a short description.
+
+Use `+` / `-` (or `=` / `_` if you don't want to reach for shift)
+to speed up or slow down the refresh tick at runtime; the perf
+footer shows both the live and configured values, e.g.
+`tick 252/250ms`.
 
 **Default view:** when `$NEOSANDBOX_STATE/run` doesn't exist, neotop
 opens directly in Procs so it's immediately useful as a system
@@ -127,9 +147,10 @@ background threads.
 
 Things `btm`/`btop` have that neotop does not yet:
 
-- [ ] Process tree (walk parent links in the existing Procs view)
+- [x] Process tree — shipped in 0.3.0 (`t` toggle in Procs view)
 - [x] Per-device disk I/O (`/proc/diskstats`) — shipped in 0.2.0
 - [x] Memory history chart — shipped in 0.2.0
+- [ ] Sort + filter inside tree mode (currently disabled when `t` is on)
 - [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
   via `intel_gpu_top`-style perf counters)
 - [ ] Themes / layout config
