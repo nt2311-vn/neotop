@@ -33,6 +33,28 @@ cd ~/src/neotop
 cargo install --path .
 ```
 
+## Develop
+
+The repository ships a [`justfile`](./justfile) with every common
+task wrapped behind a memorable name. After cloning, run
+[`just`](https://github.com/casey/just) (no args) to list every recipe
+with a one-line summary:
+
+```sh
+just setup       # verify rustc / cargo / rustfmt / clippy
+just run         # debug build, run
+just dev         # watch & rerun on save (needs cargo-watch)
+just test        # cargo test --all-targets --locked
+just check       # mirror CI: fmt-check, clippy -D warnings, test
+just fix         # auto-apply rustfmt + safe clippy fixes
+just release     # optimized build at target/release/neotop
+just bench-hwmon # show how slow each /sys/class/hwmon device is
+```
+
+If you're new to the codebase, start with `just setup` — it tells
+you exactly what's missing if anything. `just check` is what you
+should run before every push: if it passes, GitHub CI will pass too.
+
 ## Usage
 
 ```sh
@@ -52,6 +74,7 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 | `k` / `↑` | both | previous row |
 | `PgDn` / `PgUp` | both | jump 10 rows |
 | `r` | both | refresh now |
+| `space` | both | pause / resume the live tick |
 | `+` / `-` | both | speed up / slow down the refresh tick (50 ms..5 s) |
 | `x` | Vms | delete `state.json` for the selected halted VM |
 | `s` | Procs | cycle sort key (CPU → MEM → PID → CMD) |
@@ -62,15 +85,19 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 
 ## What it shows
 
-**Host overview (4 lines):**
+**Host overview (3 lines):**
 
-- `kvm:ok`/`kvm:MISSING` indicator, host CPU% with per-core bar glyphs,
-  memory used/total, 1-min load average
-- kernel version, CPU model, battery (`%` + `chg/dsch/full` + watts)
+- `kvm:ok`/`kvm:MISSING` indicator, host CPU%, memory used/total,
+  1-min load average, battery (`%` + `chg/dsch/full` + watts)
 - network RX/TX per interface, temperature readouts (CPU package, NVMe,
-  Wi-Fi…) colored green/yellow/red by severity
+  GPU…) colored green/yellow/red by severity, with friendly short
+  labels — no more raw `pch_cannonlake#1` strings
 - per-disk read/write rate + utilisation% for the top three physical
   devices (partitions, loop, ram, dm-, md, zram filtered out)
+
+Static info that used to live on a fourth row (kernel version, CPU
+model) is now in the `?` overlay under "System" — it doesn't change
+between ticks and didn't earn a permanent line of the header.
 
 **Fleet table:** one row per running VM — `PID PHASE MODE UPTIME CPU%
 RSS IO MMIO HLT SHDN LAST_SERIAL`.
