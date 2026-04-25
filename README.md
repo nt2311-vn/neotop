@@ -203,8 +203,8 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] NVIDIA / Intel GPU detection (driver-pending) — shipped in 0.8.0
 - [x] Memory composition bar (used / buffers / cached / free) — shipped in 0.8.0
 - [x] NVIDIA GPU metrics via `nvml-wrapper` — shipped in 0.9.0
+- [x] Per-core CPU heatmap (cores × time grid; `H` to toggle) — shipped in 0.10.0
 - [ ] Intel via `intel_gpu_top`-style perf counters
-- [ ] Per-core CPU heatmap (cores × time grid)
 - [ ] Themes / layout config
 - [ ] macOS / Windows ports
 

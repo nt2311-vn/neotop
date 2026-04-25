@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-04-25
+
+The per-core CPU heatmap. v0.8.0 shipped two "thousand words"
+charts (memory composition, GPU sparkline) and called out a
+third on the whiteboard — cores × time. v0.10.0 ships it.
+
+The picture answers questions the existing "now" strip can't:
+
+- *Did this load just appear, or has it been steady for a minute?*
+- *Is one core hot, or all of them?*
+- *Is the scheduler ping-ponging a single hot job between cores?*
+
+`htop` / `btm` / `btop` all show the live per-core %, but none
+show the **time axis**. That's the win.
+
+### Added
+
+- **Cores × time heatmap.** Toggled in the Procs view with
+  `H`. Each row = one CPU core, each cell = one 1-second
+  sample, painted with the same green/yellow/red ramp the
+  "now" strip uses. The buffer fills passively from launch, so
+  the first toggle "on" instantly shows the last 60 s of
+  per-core activity — no warm-up wait.
+- **`HostHistory.per_core: Vec<VecDeque<u64>>`** — one ring per
+  core, capped at `CPU_HISTORY_CAP` (60). Topology changes
+  (CPU hotplug, vCPU rebalance) reset the rings cleanly rather
+  than indexing OOB.
+- **Layout-aware sizing** — `percore_height()` now takes the
+  terminal height and toggle state. In heatmap mode it returns
+  one row per core, capped at `terminal_height / 3` so the
+  procs body keeps two-thirds of the screen, with a floor of 3
+  rows so a tiny terminal still gets a legible chart.
+- **`?` overlay** lists `H` alongside `s` / `t` / `/` / `K`.
+- Module-level `Controls:` doc comment in `main.rs` updated.
+
+### Tests
+
+- 87 passing (was 81). Six new tests:
+  - `heatmap_cell_color_steps` — verifies the four-stop colour
+    ramp matches the breakpoints used by `cpu_glyph_color` so
+    eyes read both charts with one mental model.
+  - `host_history_per_core_resets_on_topology_change` — proves
+    a 4→2 core transition doesn't bleed across topologies.
+  - `host_history_per_core_caps_at_history_length` — ring
+    eviction works at the same cap as every other history.
+  - `percore_height_heatmap_one_row_per_core_with_room` — happy
+    path on a tall terminal.
+  - `percore_height_heatmap_caps_at_third_of_terminal` —
+    ensures the procs body keeps two-thirds.
+  - `percore_height_heatmap_floor_at_three` — the chart never
+    collapses below 3 rows.
+
+### Out of scope (tracked for v0.11.0+)
+
+- Intel via i915 / Xe perf counters (still needs `CAP_PERFMON`).
+- Themes / TOML config.
+- macOS / Windows ports.
+- Optionally: a time-axis tick-label row at the bottom of the
+  heatmap (`-60s … now`). Skipped for now to keep the chart
+  compact.
+
 ## [0.9.0] — 2026-04-25
 
 NVIDIA support lights up. v0.8.0 detected NVIDIA cards but
@@ -564,7 +625,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/nt2311/neotop/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/nt2311/neotop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/nt2311/neotop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/nt2311/neotop/compare/v0.6.0...v0.7.0

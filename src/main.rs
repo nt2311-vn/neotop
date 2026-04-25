@@ -26,6 +26,7 @@
 //!     x             (Vms)   delete state file of the selected halted vm
 //!     s             (Procs) cycle sort key (CPU → MEM → PID → CMD)
 //!     t             (Procs) toggle tree view (parent → children)
+//!     H             (Procs) toggle per-core CPU heatmap (cores × time)
 //!     /             (Procs) enter filter mode (Esc to clear, Enter to confirm)
 //!     K             (Procs) send SIGTERM to selected pid (with confirm)
 //!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
@@ -205,6 +206,12 @@ const CPU_HISTORY_CAP: usize = 60;
 /// can compute a rolling max for the sparkline ceiling and label the
 /// actual rate. GPU is `None`-tolerant: machines without a card-with-
 /// metrics keep an empty deque and the sparkline column hides itself.
+///
+/// `per_core` carries one ring per CPU core, feeding the optional
+/// per-core heatmap (toggled with `H` in the Procs view). The Vec
+/// is lazily resized to the core count on the first push, so a
+/// machine where `cpuinfo` reports a different topology after a
+/// hotplug just resets cleanly rather than indexing OOB.
 #[derive(Debug, Default)]
 struct HostHistory {
     cpu: VecDeque<u64>,
@@ -212,6 +219,7 @@ struct HostHistory {
     net_down: VecDeque<u64>,
     net_up: VecDeque<u64>,
     gpu: VecDeque<u64>,
+    per_core: Vec<VecDeque<u64>>,
 }
 
 impl HostHistory {
@@ -232,6 +240,21 @@ impl HostHistory {
         // `draw_host_history` knows to hide the column.
         if let Some(p) = gpu_pct {
             push_pct(&mut self.gpu, p);
+        }
+    }
+
+    /// Append one sample per core. The first call (or any call where
+    /// the core count changed since last tick — CPU hotplug, vCPU
+    /// rebalance) resets the rings, which is fine: the heatmap
+    /// simply starts fresh for the new topology.
+    fn push_per_core(&mut self, samples: &[f64]) {
+        if self.per_core.len() != samples.len() {
+            self.per_core = (0..samples.len())
+                .map(|_| VecDeque::with_capacity(CPU_HISTORY_CAP))
+                .collect();
+        }
+        for (ring, &pct) in self.per_core.iter_mut().zip(samples) {
+            push_pct(ring, pct);
         }
     }
 }
@@ -549,6 +572,13 @@ struct App {
     /// instead of the sortable flat list. Sort and filter are ignored
     /// in tree mode (a future iteration may layer them back on).
     tree_mode: bool,
+    /// When true, the per-core CPU panel is replaced by a 2D
+    /// heatmap (cores × time). Toggled with `H`. Default off
+    /// because it's a power-user view that costs vertical real
+    /// estate proportional to the core count — fine on a 14-core
+    /// laptop with a tall terminal, less so on a 4-row VT in a
+    /// recovery shell.
+    per_core_heatmap: bool,
 
     // Host overview
     prev_host_cpu: host::CpuSamples,
@@ -675,6 +705,7 @@ impl App {
             procs_sort: procs::SortBy::Cpu,
             procs_filter: String::new(),
             tree_mode: false,
+            per_core_heatmap: false,
             prev_host_cpu,
             host_info,
             net_tracker,
@@ -772,7 +803,8 @@ impl App {
         let gpu_pct = gpu::aggregate_busy_pct(&self.gpus);
         self.host_history
             .push(self.host_info.cpu_pct, mem_pct, net_down, net_up, gpu_pct);
-
+        self.host_history
+            .push_per_core(&self.host_info.per_core_pct);
         self.update_self_perf(started);
 
         self.perf.perf.scan_ms = duration_ms(started.elapsed());
@@ -1239,6 +1271,16 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
+        KeyCode::Char('H') if app.view == View::Procs => {
+            // Per-core heatmap toggle. Capital H so it doesn't
+            // shadow any future vim-style left-motion key. The
+            // first toggle "on" is essentially free at frame time
+            // because `host_history.per_core` has been filling
+            // since launch — the user instantly sees the last
+            // 60 s of per-core activity without waiting for a
+            // sample window to accumulate.
+            app.per_core_heatmap = !app.per_core_heatmap;
+        }
         KeyCode::Char('/') if app.view == View::Procs => {
             app.input = InputMode::Filter;
         }
@@ -1408,6 +1450,12 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
             kb,
             dim,
         ),
+        kv_line(
+            "  H ",
+            "toggle per-core CPU heatmap (cores × time, last 60 s)",
+            kb,
+            dim,
+        ),
         kv_line("  / ", "filter by substring (Esc clears)", kb, dim),
         kv_line("  K ", "send SIGTERM to selected pid (confirm)", kb, dim),
         kv_line(
@@ -1573,7 +1621,12 @@ fn draw_vms_empty(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path) {
 
 fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = f.area();
-    let percore_h = percore_height(app.host_info.per_core_pct.len(), area.width);
+    let percore_h = percore_height(
+        app.host_info.per_core_pct.len(),
+        area.width,
+        area.height,
+        app.per_core_heatmap,
+    );
     let host_h = host_overview_rows(&app.gpus);
     // The memory composition bar needs 3 rows (top border, content,
     // bottom border). Hide it on terminals shorter than ~24 rows
@@ -1604,7 +1657,11 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.gpus,
     );
     if percore_h > 0 {
-        draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
+        if app.per_core_heatmap {
+            draw_per_core_heatmap(f, chunks[2], &app.host_history.per_core);
+        } else {
+            draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
+        }
     }
     if mem_bar_h > 0 {
         draw_mem_bar(f, chunks[3], &app.host_info);
@@ -1645,13 +1702,89 @@ fn host_overview_rows(gpus: &[gpu::Gpu]) -> u16 {
     }
 }
 
-fn percore_height(num_cores: usize, width: u16) -> u16 {
+fn percore_height(num_cores: usize, width: u16, term_h: u16, heatmap: bool) -> u16 {
     if num_cores == 0 {
         return 0;
+    }
+    if heatmap {
+        // One row per core, capped at a third of the terminal so
+        // the procs body still gets a usable list. Floor at 3 so
+        // a 4-core box on a tall window doesn't squeeze the chart
+        // into illegible nubs.
+        let cap = u16::try_from(num_cores).unwrap_or(u16::MAX);
+        let dyn_cap = (term_h / 3).max(3);
+        return cap.min(dyn_cap);
     }
     let per_row = (width / PERCORE_CELL_W).max(1) as usize;
     let rows = num_cores.div_ceil(per_row);
     u16::try_from(rows.min(PERCORE_MAX_ROWS as usize)).unwrap_or(PERCORE_MAX_ROWS)
+}
+
+/// Reserve 5 cells for the heatmap row label `" c{:<2} "` (4 visible
+/// chars plus a trailing space). Lifted out of the function body so
+/// `clippy::items_after_statements` stays happy.
+const HEATMAP_LABEL_W: u16 = 5;
+
+/// Cores × time heatmap. Each row = one core (top = `c00`); each
+/// cell = one time sample (oldest left, newest right) painted as a
+/// solid background colour from the same green/yellow/red ramp the
+/// `now` strip uses. The picture answers questions the `now` strip
+/// can't:
+///
+/// * Did this load just appear, or has it been steady for a minute?
+/// * Is one core hot, or all of them?
+/// * Is the scheduler ping-ponging a single hot job between cores?
+///
+/// htop / btm / btop all show the live per-core %, but none show
+/// the *time axis*. That's the win.
+fn draw_per_core_heatmap(f: &mut ratatui::Frame<'_>, area: Rect, rings: &[VecDeque<u64>]) {
+    if rings.is_empty() || area.height == 0 {
+        return;
+    }
+    let cells = area.width.saturating_sub(HEATMAP_LABEL_W) as usize;
+    if cells == 0 {
+        return;
+    }
+    let max_rows = area.height as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows);
+    for (i, ring) in rings.iter().take(max_rows).enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells + 1);
+        spans.push(Span::styled(
+            format!(" c{i:<2} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        // Take the most recent `cells` samples; left-pad with empty
+        // (black) cells when the buffer hasn't filled yet so a
+        // freshly-launched neotop doesn't render right-justified.
+        let start = ring.len().saturating_sub(cells);
+        let visible: Vec<u64> = ring.range(start..).copied().collect();
+        let pad = cells.saturating_sub(visible.len());
+        for _ in 0..pad {
+            spans.push(Span::raw(" "));
+        }
+        for &v in &visible {
+            spans.push(Span::styled(
+                " ",
+                Style::default().bg(heatmap_cell_color(v)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Background colour ramp for a single heatmap cell. Same
+/// breakpoints as `cpu_glyph_color` so the eye reads the heatmap
+/// and the `now` strip with one mental model. Idle is dark grey
+/// rather than black so a quiet core still shows as "there" —
+/// black against terminal background would just disappear.
+fn heatmap_cell_color(pct: u64) -> Color {
+    match pct {
+        0..=19 => Color::DarkGray,
+        20..=49 => Color::Green,
+        50..=79 => Color::Yellow,
+        _ => Color::Red,
+    }
 }
 
 fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
@@ -3206,27 +3339,95 @@ mod tests {
 
     #[test]
     fn percore_height_zero_when_no_cores() {
-        assert_eq!(percore_height(0, 200), 0);
+        assert_eq!(percore_height(0, 200, 40, false), 0);
+        // Heatmap mode also collapses to 0 with no cores.
+        assert_eq!(percore_height(0, 200, 40, true), 0);
     }
 
     #[test]
     fn percore_height_fits_in_one_row_when_wide_enough() {
         // 4 cores at 11 cols each = 44 cols → fits 1 row in 88 wide.
-        assert_eq!(percore_height(4, 88), 1);
+        assert_eq!(percore_height(4, 88, 40, false), 1);
     }
 
     #[test]
     fn percore_height_caps_at_two_rows() {
         // 32 cores in an 80-col terminal → 7 cols per row → 5 rows
         // before capping. We cap at 2 to leave the procs body room.
-        assert_eq!(percore_height(32, 80), 2);
+        assert_eq!(percore_height(32, 80, 40, false), 2);
     }
 
     #[test]
     fn percore_height_handles_narrow_terminal() {
         // 1 col-per-cell minimum; 2 cores in a 5-col terminal still
         // returns at least 1 row, never panics.
-        assert!(percore_height(2, 5) >= 1);
+        assert!(percore_height(2, 5, 40, false) >= 1);
+    }
+
+    #[test]
+    fn percore_height_heatmap_one_row_per_core_with_room() {
+        // 8 cores in a tall terminal: every core gets a row.
+        assert_eq!(percore_height(8, 200, 60, true), 8);
+    }
+
+    #[test]
+    fn percore_height_heatmap_caps_at_third_of_terminal() {
+        // 32 cores in a 24-row terminal: cap at 24/3 = 8 rows so
+        // the procs body keeps two-thirds of the screen.
+        assert_eq!(percore_height(32, 200, 24, true), 8);
+    }
+
+    #[test]
+    fn heatmap_cell_color_steps() {
+        // Same breakpoints as cpu_glyph_color so the eye keeps one
+        // mental model across the heatmap and the "now" strip.
+        assert!(matches!(heatmap_cell_color(0), Color::DarkGray));
+        assert!(matches!(heatmap_cell_color(19), Color::DarkGray));
+        assert!(matches!(heatmap_cell_color(20), Color::Green));
+        assert!(matches!(heatmap_cell_color(49), Color::Green));
+        assert!(matches!(heatmap_cell_color(50), Color::Yellow));
+        assert!(matches!(heatmap_cell_color(79), Color::Yellow));
+        assert!(matches!(heatmap_cell_color(80), Color::Red));
+        assert!(matches!(heatmap_cell_color(100), Color::Red));
+    }
+
+    #[test]
+    fn host_history_per_core_resets_on_topology_change() {
+        // First push: 4 cores. All four rings get one sample.
+        let mut h = HostHistory::default();
+        h.push_per_core(&[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(h.per_core.len(), 4);
+        assert_eq!(h.per_core[0].len(), 1);
+
+        // Topology changes (simulated CPU hotplug from 4 → 2).
+        // The Vec resets; we don't keep stale rings around that
+        // would index OOB or bleed across topologies.
+        h.push_per_core(&[50.0, 60.0]);
+        assert_eq!(h.per_core.len(), 2);
+        assert_eq!(h.per_core[0].len(), 1);
+        assert_eq!(h.per_core[0].back().copied(), Some(50));
+    }
+
+    #[test]
+    fn host_history_per_core_caps_at_history_length() {
+        let mut h = HostHistory::default();
+        // Push CPU_HISTORY_CAP + 5 samples for a single core.
+        for i in 0..(CPU_HISTORY_CAP + 5) {
+            #[allow(clippy::cast_precision_loss)]
+            let v = (i % 100) as f64;
+            h.push_per_core(&[v]);
+        }
+        // Ring buffer evicts old samples; length stays at the cap.
+        assert_eq!(h.per_core[0].len(), CPU_HISTORY_CAP);
+    }
+
+    #[test]
+    fn percore_height_heatmap_floor_at_three() {
+        // Even on a tiny 6-row terminal, we still try to give the
+        // user 3 rows of heatmap rather than collapsing it to 1
+        // — a one-row heatmap is just a sparkline you can already
+        // see in the strip below.
+        assert_eq!(percore_height(8, 200, 6, true), 3);
     }
 
     #[test]
