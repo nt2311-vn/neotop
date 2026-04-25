@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-04-25
+
+The "refined product" release. The user reported `neotop` "feels
+like a chart bitcoin or something" — too fast to read — and asked
+for more focus on meaningful metrics. Five changes pointed at
+exactly that.
+
+### Changed
+
+- **Default refresh 250 ms → 1000 ms.** 4 Hz updates were too fast
+  to track with the eye; values became stock-tickers. 1 Hz is the
+  same cadence as `htop`, `btop`, and `iotop`. The user can still
+  drop to 100 ms via `+` if they're chasing a specific spike.
+  Sparkline window grows from 15 s to 60 s — a much more useful
+  trend horizon.
+- **Slow-tick cadence, recomputed.** With the new 1 s base tick,
+  `SLOW_TICK_EVERY = 4` now means temps / batteries / disks scan
+  once every 4 seconds. Previously it was once per second.
+- **Host CPU% is now EMA-smoothed for display.** Same `α = 0.5`
+  curve used for per-pid CPU%. The line-1 number stops jumping
+  between 12% and 47% on consecutive ticks; the underlying
+  measurement is unchanged, so sustained activity still tracks
+  cleanly.
+- **Tree mode (`t`) now respects sort and filter.** Before this
+  release, toggling tree view silently disabled both — you couldn't
+  grep for a process *and* see its parent chain. The new
+  `compute_visible_tree` does a memoised post-order pass to compute
+  the "alive" set (nodes that match OR have a matching descendant),
+  then sorts siblings within each parent by the chosen `SortBy`.
+  Tree shape is preserved.
+
+### Added
+
+- **Swap usage** in the host overview. `SwapTotal` / `SwapFree`
+  from `/proc/meminfo`. Only rendered when swap is configured (no
+  noise on microVMs / cloud servers without it). Color codes the
+  percentage: yellow ≥ 10%, red ≥ 50% — swap is one of the
+  strongest "something is wrong" signals there is.
+- **5- and 15-minute load averages** alongside the 1-minute one.
+  The triplet tells you whether you're looking at a fresh fire
+  (1m high, 5m and 15m low) or a sustained one. Showing only the
+  1-minute number was hiding half the signal.
+- **`procs::ema_blend()`** is now used by `App::tick` too, not
+  just `procs::Tracker`. Both code paths share the same smoothing
+  curve so the displayed numbers stay coherent.
+- **`cmp_rows()`** factored out as a single source of truth for
+  the sort comparator across flat and tree modes.
+
+### Tests
+
+- 66 passing (was 63). New tests:
+  - `tree_filter_keeps_ancestors_when_a_descendant_matches`
+  - `tree_filter_drops_subtree_with_no_match`
+  - `tree_sort_orders_siblings_by_cpu_when_requested`
+- Existing tree tests updated to pass the new
+  `(by, filter)` arguments (`SortBy::Pid` + `""` reproduces the
+  old behaviour exactly).
+- `parse_loadavg` test split into one for the full triplet and
+  one for graceful rejection of partial inputs.
+
 ## [0.6.0] — 2026-04-25
 
 The "actually responsive" release. Three findings, three fixes.
@@ -348,7 +408,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/nt2311/neotop/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nt2311/neotop/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nt2311/neotop/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nt2311/neotop/compare/v0.3.0...v0.4.0

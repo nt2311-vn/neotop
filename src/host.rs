@@ -17,8 +17,17 @@ pub(crate) struct HostInfo {
     pub(crate) cpu_model: String,
     pub(crate) mem_total_bytes: u64,
     pub(crate) mem_avail_bytes: u64,
-    /// 1-minute load average, e.g. `0.42`.
+    /// `SwapTotal` from `/proc/meminfo`, in bytes. `0` when the
+    /// system has no swap configured (common on servers, microVMs).
+    pub(crate) swap_total_bytes: u64,
+    /// `SwapFree` from `/proc/meminfo`, in bytes.
+    pub(crate) swap_free_bytes: u64,
+    /// 1-minute load average, e.g. `0.42`. The 5- and 15-minute
+    /// figures contextualise it: `0.42 0.30 0.25` says "low load
+    /// trending down"; `5.0 0.5 0.2` says "a fresh fire".
     pub(crate) loadavg_1: f64,
+    pub(crate) loadavg_5: f64,
+    pub(crate) loadavg_15: f64,
     /// Host CPU% across all cores, computed from two `/proc/stat`
     /// samples. `None` until we have two data points.
     pub(crate) cpu_pct: Option<f64>,
@@ -151,9 +160,13 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         |kb| kb * 1024,
     );
     let mem_avail_bytes = read_meminfo_kb("MemAvailable:").map_or(0, |kb| kb * 1024);
-    let loadavg_1 = read_loadavg().unwrap_or_else(|| {
+    // Swap is optional — a missing key isn't an error, just means the
+    // system has no swap configured. We don't push to the error ring.
+    let swap_total_bytes = read_meminfo_kb("SwapTotal:").map_or(0, |kb| kb * 1024);
+    let swap_free_bytes = read_meminfo_kb("SwapFree:").map_or(0, |kb| kb * 1024);
+    let loads = read_loadavg().unwrap_or_else(|| {
         errors.push("host", "/proc/loadavg unreadable");
-        0.0
+        (0.0, 0.0, 0.0)
     });
 
     HostInfo {
@@ -162,7 +175,11 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         cpu_model,
         mem_total_bytes,
         mem_avail_bytes,
-        loadavg_1,
+        swap_total_bytes,
+        swap_free_bytes,
+        loadavg_1: loads.0,
+        loadavg_5: loads.1,
+        loadavg_15: loads.2,
         cpu_pct,
         per_core_pct,
         kvm_available: Path::new("/dev/kvm").exists(),
@@ -198,7 +215,7 @@ fn read_meminfo_kb(key: &str) -> Option<u64> {
         .and_then(|s| parse_meminfo_kb(&s, key))
 }
 
-fn read_loadavg() -> Option<f64> {
+fn read_loadavg() -> Option<(f64, f64, f64)> {
     fs::read_to_string("/proc/loadavg")
         .ok()
         .and_then(|s| parse_loadavg(&s))
@@ -248,8 +265,17 @@ pub(crate) fn parse_meminfo_kb(raw: &str, key: &str) -> Option<u64> {
     None
 }
 
-pub(crate) fn parse_loadavg(raw: &str) -> Option<f64> {
-    raw.split_whitespace().next()?.parse().ok()
+/// Parse the three load averages out of `/proc/loadavg`. The file's
+/// shape is `LOAD_1 LOAD_5 LOAD_15 RUNNING/TOTAL LATEST_PID`; we
+/// only look at the first three fields. Returns `None` if any of
+/// them is missing or unparseable — we don't pretend a partial
+/// result is meaningful.
+pub(crate) fn parse_loadavg(raw: &str) -> Option<(f64, f64, f64)> {
+    let mut it = raw.split_whitespace();
+    let one: f64 = it.next()?.parse().ok()?;
+    let five: f64 = it.next()?.parse().ok()?;
+    let fifteen: f64 = it.next()?.parse().ok()?;
+    Some((one, five, fifteen))
 }
 
 #[cfg(test)]
@@ -315,14 +341,20 @@ Buffers:           45224 kB
     }
 
     #[test]
-    fn parse_loadavg_takes_first_field() {
-        assert!((parse_loadavg("0.42 0.30 0.20 1/256 12345").unwrap() - 0.42).abs() < 1e-9);
+    fn parse_loadavg_extracts_all_three_windows() {
+        let (one, five, fifteen) = parse_loadavg("0.42 0.30 0.20 1/256 12345").unwrap();
+        assert!((one - 0.42).abs() < 1e-9);
+        assert!((five - 0.30).abs() < 1e-9);
+        assert!((fifteen - 0.20).abs() < 1e-9);
     }
 
     #[test]
     fn parse_loadavg_rejects_garbage() {
         assert_eq!(parse_loadavg(""), None);
         assert_eq!(parse_loadavg("not a number"), None);
+        // Two fields where three are required — reject rather than
+        // silently zero-fill.
+        assert_eq!(parse_loadavg("0.42 0.30"), None);
     }
 
     #[test]

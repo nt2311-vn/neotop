@@ -60,7 +60,7 @@ should run before every push: if it passes, GitHub CI will pass too.
 ```sh
 neotop                              # watch $NEOSANDBOX_STATE or ./.neosandbox
 neotop --state-dir /var/run/neo     # watch a specific directory
-neotop --refresh-ms 500             # slower poll (default 250 ms)
+neotop --refresh-ms 500             # faster poll (default 1000 ms / 1 Hz)
 ```
 
 ### Controls
@@ -87,8 +87,10 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 
 **Host overview (3 lines):**
 
-- `kvm:ok`/`kvm:MISSING` indicator, host CPU%, memory used/total,
-  1-min load average, battery (`%` + `chg/dsch/full` + watts)
+- `kvm:ok`/`kvm:MISSING` indicator, host CPU% (EMA-smoothed),
+  memory used/total, swap used/total (only when configured;
+  yellow/red when used), load 1m / 5m / 15m, battery (`%` +
+  `chg/dsch/full` + watts)
 - network RX/TX per interface, temperature readouts (CPU package, NVMe,
   GPU…) colored green/yellow/red by severity, with friendly short
   labels — no more raw `pch_cannonlake#1` strings
@@ -194,7 +196,9 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Adaptive blacklist for slow hwmon sensors (acpitz fix) — shipped in 0.6.0
 - [x] EMA-smoothed CPU% so rows don't jump around — shipped in 0.6.0
 - [x] Pause toggle (`space`) — shipped in 0.6.0
-- [ ] Sort + filter inside tree mode (currently disabled when `t` is on)
+- [x] Calmer 1 Hz default refresh (was 4 Hz, felt like a stock-ticker) — shipped in 0.7.0
+- [x] Swap + 5m / 15m load averages in host overview — shipped in 0.7.0
+- [x] Sort + filter inside tree mode — shipped in 0.7.0
 - [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
   via `intel_gpu_top`-style perf counters)
 - [ ] Themes / layout config

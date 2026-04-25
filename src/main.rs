@@ -12,7 +12,7 @@
 //! Usage:
 //!     neotop                      # watch `$NEOSANDBOX_STATE/run`
 //!     neotop --state-dir <path>   # watch <path>/run
-//!     neotop --refresh-ms 500     # slower poll (default 250 ms)
+//!     neotop --refresh-ms 500     # faster poll (default 1000 ms)
 //!
 //! Controls:
 //!     q or Ctrl-C   quit
@@ -74,7 +74,13 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self> {
         let mut state_dir: Option<PathBuf> = None;
-        let mut refresh_ms: u64 = 250;
+        // 1 Hz default — same ballpark as `htop` / `btop` / `iotop`.
+        // 250 ms updates earlier in development looked impressive but
+        // turned every value into a stock-ticker that the eye can't
+        // actually read. With EMA smoothing already in place, 1 Hz
+        // is a calm dashboard cadence; the user can still drop to
+        // 100 ms via `+` if they're chasing a specific spike.
+        let mut refresh_ms: u64 = 1000;
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -186,14 +192,14 @@ struct CpuSample {
 }
 
 /// Ring buffer of recent CPU% samples per pid, feeding the sparkline.
-/// Capacity is deliberately small — at a 250 ms scan rate, 60 samples
-/// is the last 15 seconds, which is what a human eyeball can actually
-/// parse as "what's happening right now".
+/// 60 samples × 1 s tick (default) = last minute, which is what a
+/// human eyeball can actually parse as "what's happening right now".
+/// At a tighter `+`-tuned tick the window scales accordingly.
 const CPU_HISTORY_CAP: usize = 60;
 
 /// Ring buffer for host-level CPU% / memory% / net rate histories.
-/// Same window logic as `CpuHistory`: 60 samples × 250 ms tick = last
-/// 15 s. CPU and mem are stored as `0..=100` percentages; net is
+/// Same window logic as `CpuHistory`: 60 samples × 1 s tick = last
+/// minute. CPU and mem are stored as `0..=100` percentages; net is
 /// stored as raw bytes/sec so `draw_host_history` can compute a
 /// rolling max for the sparkline ceiling and label the actual rate.
 #[derive(Debug, Default)]
@@ -555,6 +561,14 @@ struct App {
     /// working, you can scroll, sort, kill, etc. — useful for
     /// reading a busy table without rows shuffling underneath.
     paused: bool,
+    /// Running EMA of host CPU%. The instantaneous reading from
+    /// `/proc/stat` jumps wildly between consecutive 1 s windows
+    /// (one short busy-burst can shift the average by 30+ points);
+    /// smoothing with the same `procs::ema_blend` curve makes the
+    /// line-1 number readable without lying about the underlying
+    /// activity. Reset to `None` on first launch and after any pid
+    /// data clears.
+    smoothed_host_cpu: Option<f64>,
 
     // Self-profiling
     perf: PerfTracker,
@@ -570,11 +584,11 @@ const MIN_REFRESH: Duration = Duration::from_millis(50);
 const MAX_REFRESH: Duration = Duration::from_millis(5000);
 
 /// How many fast ticks pass between full slow-scanner runs. At the
-/// default 250 ms tick this means temps / batteries / disks refresh
-/// once per second, which is plenty: hwmon updates ~1 Hz, batteries
-/// drift on a multi-second timescale, and disk-rate spikes you care
-/// about live for whole seconds. Cuts ~5 ms/tick on machines with a
-/// lot of hwmon nodes.
+/// default 1 s tick this means temps / batteries / disks refresh
+/// once every 4 seconds — which is plenty: hwmon updates at ~1 Hz on
+/// real hardware, batteries drift on a multi-second timescale, and
+/// disk-rate spikes you care about live for whole seconds. Cuts the
+/// per-tick cost on machines with lots of hwmon nodes.
 const SLOW_TICK_EVERY: u32 = 4;
 
 impl App {
@@ -649,6 +663,7 @@ impl App {
             refresh,
             slow_tick_counter: 0,
             paused: false,
+            smoothed_host_cpu: None,
             perf: PerfTracker::default(),
             errors,
         }
@@ -671,14 +686,30 @@ impl App {
         self.prev_host_cpu = host::read_cpu_samples(&mut self.errors);
         self.ifaces = self.net_tracker.snapshot(&mut self.errors);
 
-        // Slow-path scanners: every `SLOW_TICK_EVERY` ticks (~1 s at
-        // the default 250 ms tick). The data they read updates at
-        // most once per second on real hardware — re-walking
-        // `/sys/class/hwmon` four times a second was a pure waste of
-        // file descriptors and event-loop time, and it showed up in
-        // the perf footer as a fat `scan_ms`. We always run them on
-        // the very first tick (counter == 0) so the UI isn't blank
-        // while the user waits a second after launch.
+        // EMA-smooth the host CPU%. Same blending curve we use for
+        // per-pid CPU% in `procs::Tracker`: keeps the displayed
+        // number from yo-yoing between e.g. 12% and 47% on
+        // consecutive ticks, while still tracking sustained changes.
+        // We overwrite `host_info.cpu_pct` so every consumer
+        // (line-1 display, sparkline feed, perf footer) sees the
+        // same calmed-down value.
+        if let Some(new) = self.host_info.cpu_pct {
+            let smoothed = match self.smoothed_host_cpu {
+                Some(prev) => procs::ema_blend(prev, new),
+                None => new,
+            };
+            self.smoothed_host_cpu = Some(smoothed);
+            self.host_info.cpu_pct = Some(smoothed);
+        }
+
+        // Slow-path scanners: every `SLOW_TICK_EVERY` ticks (~4 s at
+        // the default 1 s tick). The data they read updates at most
+        // once per second on real hardware — re-walking
+        // `/sys/class/hwmon` every tick was a pure waste of file
+        // descriptors and event-loop time, and it showed up in the
+        // perf footer as a fat `scan_ms`. We always run them on the
+        // very first tick (counter == 0) so the UI isn't blank while
+        // the user waits the first cycle after launch.
         if self.slow_tick_counter == 0 {
             self.temps = self.temp_tracker.snapshot(&mut self.errors);
             self.batteries = battery::snapshot();
@@ -740,8 +771,15 @@ impl App {
     }
 
     fn recompute_procs(&mut self) {
+        // Both flat and tree modes now respect the same `sort` and
+        // `filter`. Before 0.7.0 the tree path ignored both; that
+        // made the `t` toggle far less useful than it could be — you
+        // couldn't grep for a process and still see its parent
+        // chain. The tree's *shape* is preserved either way; sort
+        // only reorders siblings, filter only hides leaves whose
+        // entire subtree fails to match.
         self.procs_visible = if self.tree_mode {
-            compute_visible_tree(&self.procs_all)
+            compute_visible_tree(&self.procs_all, self.procs_sort, &self.procs_filter)
         } else {
             compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
         };
@@ -800,6 +838,28 @@ struct ProcRender {
     prefix: String,
 }
 
+/// Comparator used by both flat and tree paths so the two stay in
+/// lockstep. CPU / RSS sort descending (biggest at the top — what
+/// the eye expects from htop); PID / command sort ascending.
+fn cmp_rows(
+    rows: &[procs::ProcessRow],
+    a: usize,
+    b: usize,
+    by: procs::SortBy,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match by {
+        procs::SortBy::Cpu => rows[b]
+            .cpu_pct
+            .unwrap_or(0.0)
+            .partial_cmp(&rows[a].cpu_pct.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
+        procs::SortBy::Mem => rows[b].rss_bytes.cmp(&rows[a].rss_bytes),
+        procs::SortBy::Pid => rows[a].pid.cmp(&rows[b].pid),
+        procs::SortBy::Command => rows[a].command.cmp(&rows[b].command),
+    }
+}
+
 /// Flat-list path: filter then sort, return one `ProcRender` per
 /// surviving row with an empty prefix.
 fn compute_visible_flat(
@@ -813,16 +873,7 @@ fn compute_visible_flat(
         .filter(|(_, r)| procs::matches(r, filter))
         .map(|(i, _)| i)
         .collect();
-    idxs.sort_by(|&a, &b| match by {
-        procs::SortBy::Cpu => rows[b]
-            .cpu_pct
-            .unwrap_or(0.0)
-            .partial_cmp(&rows[a].cpu_pct.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal),
-        procs::SortBy::Mem => rows[b].rss_bytes.cmp(&rows[a].rss_bytes),
-        procs::SortBy::Pid => rows[a].pid.cmp(&rows[b].pid),
-        procs::SortBy::Command => rows[a].command.cmp(&rows[b].command),
-    });
+    idxs.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
     idxs.into_iter()
         .map(|idx| ProcRender {
             idx,
@@ -831,20 +882,46 @@ fn compute_visible_flat(
         .collect()
 }
 
-/// Tree-mode path: build a parent→children adjacency map from the pid /
-/// ppid columns, then DFS from the roots producing a flat render
-/// list with proper tree glyphs. Sibling order is by PID for
-/// determinism — sort/filter don't apply in tree mode (yet).
-fn compute_visible_tree(rows: &[procs::ProcessRow]) -> Vec<ProcRender> {
+/// Tree-mode path: build a parent→children adjacency map from the
+/// pid / ppid columns, then DFS from the roots producing a flat
+/// render list with the right `├─ │ └─` glyphs.
+///
+/// Filter and sort *do* apply now (they didn't in 0.6.0 and earlier):
+/// * **filter** \u2014 a node is shown iff itself OR any descendant
+///   matches `filter`. That keeps ancestor chains visible so the
+///   matched leaf has context. Computed in a memoised post-order
+///   pass before the render DFS.
+/// * **sort** \u2014 siblings within each parent are ordered by the
+///   chosen `SortBy` (CPU / mem / pid / cmd). The tree shape is
+///   preserved; only the order inside each child list moves.
+fn compute_visible_tree(
+    rows: &[procs::ProcessRow],
+    by: procs::SortBy,
+    filter: &str,
+) -> Vec<ProcRender> {
+    use std::collections::HashSet;
+
     let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
-    let mut have_pid: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut have_pid: HashSet<i32> = HashSet::new();
     for (i, r) in rows.iter().enumerate() {
         have_pid.insert(r.pid);
         children.entry(r.ppid).or_default().push(i);
     }
+    // Sort siblings by the chosen key. The tree's *shape* is fixed
+    // by ppid — only ordering inside each child list changes.
     for kids in children.values_mut() {
-        kids.sort_by_key(|&i| rows[i].pid);
+        kids.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
     }
+
+    // Compute the "alive" set: rows that match the filter or have
+    // at least one descendant that does. Memoised so even very deep
+    // trees stay O(N).
+    let mut alive: HashSet<usize> = HashSet::new();
+    let mut visiting: HashSet<usize> = HashSet::new();
+    for i in 0..rows.len() {
+        mark_alive_recursive(i, rows, &children, filter, &mut alive, &mut visiting);
+    }
+
     // Roots: ppid is 0 (kernel) or refers to a pid we don't have a
     // row for (process exited mid-scan, kernel thread etc.).
     let mut roots: Vec<usize> = rows
@@ -853,15 +930,18 @@ fn compute_visible_tree(rows: &[procs::ProcessRow]) -> Vec<ProcRender> {
         .filter(|(_, r)| r.ppid <= 0 || !have_pid.contains(&r.ppid))
         .map(|(i, _)| i)
         .collect();
-    roots.sort_by_key(|&i| rows[i].pid);
+    roots.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
+    roots.retain(|i| alive.contains(i));
 
     let mut out = Vec::with_capacity(rows.len());
     let mut ancestor_last: Vec<bool> = Vec::new();
+    let total = roots.len();
     for (n, &root_idx) in roots.iter().enumerate() {
-        let last = n + 1 == roots.len();
+        let last = n + 1 == total;
         dfs_tree(
             rows,
             &children,
+            &alive,
             root_idx,
             &mut ancestor_last,
             last,
@@ -872,9 +952,49 @@ fn compute_visible_tree(rows: &[procs::ProcessRow]) -> Vec<ProcRender> {
     out
 }
 
+/// Post-order memoised "is this node or any descendant alive under
+/// the filter?" walk. `visiting` guards against the rare case where
+/// `/proc` reports a cycle (shouldn't happen, but pid wraparound +
+/// races make it cheap insurance against a stack-overflow panic).
+fn mark_alive_recursive(
+    idx: usize,
+    rows: &[procs::ProcessRow],
+    children: &HashMap<i32, Vec<usize>>,
+    filter: &str,
+    alive: &mut std::collections::HashSet<usize>,
+    visiting: &mut std::collections::HashSet<usize>,
+) -> bool {
+    if alive.contains(&idx) {
+        return true;
+    }
+    if !visiting.insert(idx) {
+        return false; // cycle guard
+    }
+    let mut ok = procs::matches(&rows[idx], filter);
+    if let Some(kids) = children.get(&rows[idx].pid) {
+        for &k in kids {
+            if mark_alive_recursive(k, rows, children, filter, alive, visiting) {
+                ok = true;
+            }
+        }
+    }
+    visiting.remove(&idx);
+    if ok {
+        alive.insert(idx);
+    }
+    ok
+}
+
+// `clippy::too_many_arguments`: 8 args is more than the default
+// threshold but every one is necessary state for a *recursive*
+// tree walk. Bundling them into a struct would obscure the
+// recursion (we'd be threading `&mut struct` through anyway) and
+// add a layer of indirection for no win.
+#[allow(clippy::too_many_arguments)]
 fn dfs_tree(
     rows: &[procs::ProcessRow],
     children: &HashMap<i32, Vec<usize>>,
+    alive: &std::collections::HashSet<usize>,
     idx: usize,
     ancestor_last: &mut Vec<bool>,
     is_last_sibling: bool,
@@ -895,8 +1015,16 @@ fn dfs_tree(
     }
     out.push(ProcRender { idx, prefix });
 
-    let kids = children.get(&rows[idx].pid).cloned().unwrap_or_default();
-    let n = kids.len();
+    // Only walk into *alive* children. Because the alive set was
+    // computed in advance, a filtered node still hosts visible
+    // descendants if any of them passed the filter — we just don't
+    // emit the dead intermediates.
+    let alive_kids: Vec<usize> = children
+        .get(&rows[idx].pid)
+        .map(|kids| kids.iter().copied().filter(|k| alive.contains(k)).collect())
+        .unwrap_or_default();
+
+    let n = alive_kids.len();
     // Only push our own is_last_sibling onto the ancestor stack when
     // we're not the root — the root's status doesn't visually carry
     // into descendants.
@@ -904,9 +1032,18 @@ fn dfs_tree(
     if push {
         ancestor_last.push(is_last_sibling);
     }
-    for (i, k) in kids.into_iter().enumerate() {
+    for (i, k) in alive_kids.into_iter().enumerate() {
         let last = i + 1 == n;
-        dfs_tree(rows, children, k, ancestor_last, last, depth + 1, out);
+        dfs_tree(
+            rows,
+            children,
+            alive,
+            k,
+            ancestor_last,
+            last,
+            depth + 1,
+            out,
+        );
     }
     if push {
         ancestor_last.pop();
@@ -1228,7 +1365,12 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         kv_line("  s ", "cycle sort: CPU → MEM → PID → CMD", kb, dim),
-        kv_line("  t ", "toggle tree view (parent → children)", kb, dim),
+        kv_line(
+            "  t ",
+            "toggle tree view (parent → children; sort + filter still apply)",
+            kb,
+            dim,
+        ),
         kv_line("  / ", "filter by substring (Esc clears)", kb, dim),
         kv_line("  K ", "send SIGTERM to selected pid (confirm)", kb, dim),
         kv_line(
@@ -1585,7 +1727,7 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
 }
 
 /// Four side-by-side host-level sparklines — CPU%, MEM%, NET↓, NET↑.
-/// 60 samples each → last 15 s at the default 250 ms tick. CPU/MEM
+/// 60 samples each → last minute at the default 1 s tick. CPU/MEM
 /// share a 0-100 ceiling; the two net sparklines auto-scale to the
 /// rolling max in their window so a 30 KB/s burst is still visible
 /// next to a 200 MB/s spike on a different interface earlier.
@@ -1805,9 +1947,49 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
             proc::human_bytes(mem_used),
             proc::human_bytes(h.mem_total_bytes),
         )),
-        Span::styled("load", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!(" {:.2}", h.loadavg_1)),
     ];
+
+    // Swap is only worth the screen real estate when the box has
+    // some configured. Microvms and most cloud servers don't, and
+    // showing "swap 0/0 (0%)" is just noise. When swap *is*
+    // present, color the percentage red once it's non-trivial —
+    // the system swapping out memory is one of the strongest
+    // "something is wrong" signals there is.
+    if h.swap_total_bytes > 0 {
+        let swap_used = h.swap_total_bytes.saturating_sub(h.swap_free_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        let swap_pct = (swap_used as f64 / h.swap_total_bytes as f64) * 100.0;
+        let swap_color = if swap_pct >= 50.0 {
+            Color::Red
+        } else if swap_pct >= 10.0 {
+            Color::Yellow
+        } else {
+            Color::Reset
+        };
+        spans.push(Span::styled("swap", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw(format!(
+            " {}/{} (",
+            proc::human_bytes(swap_used),
+            proc::human_bytes(h.swap_total_bytes),
+        )));
+        spans.push(Span::styled(
+            format!("{swap_pct:>4.1}%"),
+            Style::default().fg(swap_color),
+        ));
+        spans.push(Span::raw(")  "));
+    }
+
+    // All three load-average windows. The triplet is what tells you
+    // whether you're looking at a fresh fire (1m high, 5m and 15m
+    // low) or a sustained one (all three high). Showing only the
+    // 1-minute number was hiding half the signal.
+    spans.extend([
+        Span::styled("load", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " {:.2} {:.2} {:.2}",
+            h.loadavg_1, h.loadavg_5, h.loadavg_15,
+        )),
+    ]);
     if !batteries.is_empty() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled("bat", Style::default().fg(Color::DarkGray)));
@@ -2621,7 +2803,7 @@ mod tests {
             p(12, 10, "rg"),
             p(21, 20, "ssh-agent"),
         ];
-        let rendered = compute_visible_tree(&rows);
+        let rendered = compute_visible_tree(&rows, procs::SortBy::Pid, "");
         let pids: Vec<i32> = rendered.iter().map(|r| rows[r.idx].pid).collect();
         assert_eq!(pids, vec![1, 10, 11, 12, 20, 21]);
 
@@ -2647,10 +2829,68 @@ mod tests {
         // Parent pid 999 doesn't exist in the row set, so child(50)
         // is treated as a root.
         let rows = vec![p(50, 999, "orphan"), p(1, 0, "init")];
-        let rendered = compute_visible_tree(&rows);
+        let rendered = compute_visible_tree(&rows, procs::SortBy::Pid, "");
         let pids: Vec<i32> = rendered.iter().map(|r| rows[r.idx].pid).collect();
         // Both are roots; sorted by pid → init first.
         assert_eq!(pids, vec![1, 50]);
+    }
+
+    #[test]
+    fn tree_filter_keeps_ancestors_when_a_descendant_matches() {
+        // init(1) -> shell(10) -> vim(11)
+        //          -> rg(12)
+        //  ssh(20) -> ssh-agent(21)
+        //
+        // Filter "vim" should keep init + shell + vim and drop the
+        // rest of the tree (rg, ssh, ssh-agent). The ancestor chain
+        // is what makes the match useful — without it the user just
+        // sees `vim` floating with no context.
+        let rows = vec![
+            p(1, 0, "init"),
+            p(10, 1, "shell"),
+            p(20, 1, "ssh"),
+            p(11, 10, "vim"),
+            p(12, 10, "rg"),
+            p(21, 20, "ssh-agent"),
+        ];
+        let v = compute_visible_tree(&rows, procs::SortBy::Pid, "vim");
+        let pids: Vec<i32> = v.iter().map(|r| rows[r.idx].pid).collect();
+        assert_eq!(pids, vec![1, 10, 11]);
+    }
+
+    #[test]
+    fn tree_filter_drops_subtree_with_no_match() {
+        // Filter "nonexistent" should produce an empty render list,
+        // not panic, not partial render.
+        let rows = vec![p(1, 0, "init"), p(10, 1, "shell"), p(11, 10, "vim")];
+        let v = compute_visible_tree(&rows, procs::SortBy::Pid, "nonexistent");
+        assert!(v.is_empty(), "got {} rows", v.len());
+    }
+
+    #[test]
+    fn tree_sort_orders_siblings_by_cpu_when_requested() {
+        // init has three children with different CPU%. Tree shape
+        // stays init -> {a,b,c}, but the order of children must be
+        // CPU-desc when SortBy::Cpu is requested.
+        let rows = vec![
+            p(1, 0, "init"),
+            procs::ProcessRow {
+                cpu_pct: Some(5.0),
+                ..p(10, 1, "low")
+            },
+            procs::ProcessRow {
+                cpu_pct: Some(80.0),
+                ..p(11, 1, "hot")
+            },
+            procs::ProcessRow {
+                cpu_pct: Some(20.0),
+                ..p(12, 1, "warm")
+            },
+        ];
+        let v = compute_visible_tree(&rows, procs::SortBy::Cpu, "");
+        let names: Vec<&str> = v.iter().map(|r| rows[r.idx].command.as_str()).collect();
+        // init first, then siblings hottest -> coolest.
+        assert_eq!(names, vec!["init", "hot", "warm", "low"]);
     }
 
     #[test]
