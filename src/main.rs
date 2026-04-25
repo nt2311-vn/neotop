@@ -570,6 +570,11 @@ struct App {
     procs_table: TableState,
     procs_sort: procs::SortBy,
     procs_filter: String,
+    /// docker / podman ps cache. Refreshed lazily on the slow tick;
+    /// drives the human-readable container names in `Group` mode
+    /// headers (e.g. `▼ docker:myapp` instead of `▼
+    /// docker:abc12345`).
+    container_names: groups::ContainerNames,
     /// How the procs body is laid out: `Flat` is the sortable
     /// htop-style list (default), `Tree` shows the parent → children
     /// hierarchy, and `Group` clusters processes by container /
@@ -710,6 +715,7 @@ impl App {
             procs_sort: procs::SortBy::Cpu,
             procs_filter: String::new(),
             list_mode: ListMode::Flat,
+            container_names: groups::ContainerNames::default(),
             per_core_spectrum: false,
             prev_host_cpu,
             host_info,
@@ -786,6 +792,13 @@ impl App {
             // a 1 Hz UI, and saves a few hundred microseconds per
             // tick on machines with multiple cards.
             self.gpus = self.gpu_tracker.snapshot();
+            // docker/podman ps poll — 5 s TTL inside the cache, but
+            // we only attempt the shell-out on slow ticks so we
+            // amortise the cost across UI frames. Silently no-ops
+            // when neither runtime is installed (the daemons we
+            // have running today vs. yesterday rarely differ
+            // mid-session).
+            self.container_names.refresh_if_stale(Instant::now());
         }
         self.slow_tick_counter = (self.slow_tick_counter + 1) % SLOW_TICK_EVERY;
 
@@ -856,9 +869,12 @@ impl App {
             ListMode::Tree => {
                 compute_visible_tree(&self.procs_all, self.procs_sort, &self.procs_filter)
             }
-            ListMode::Group => {
-                compute_visible_grouped(&self.procs_all, self.procs_sort, &self.procs_filter)
-            }
+            ListMode::Group => compute_visible_grouped(
+                &self.procs_all,
+                self.procs_sort,
+                &self.procs_filter,
+                &self.container_names,
+            ),
             ListMode::Flat => {
                 compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
             }
@@ -1190,6 +1206,7 @@ fn compute_visible_grouped(
     rows: &[procs::ProcessRow],
     by: procs::SortBy,
     filter: &str,
+    names: &groups::ContainerNames,
 ) -> Vec<ProcRender> {
     // Bucket surviving indices by group key.
     let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1236,7 +1253,11 @@ fn compute_visible_grouped(
         members.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
         let group = group_for.remove(&key).unwrap_or(groups::Group::Native);
         let header = GroupHeader {
-            label: group.label(),
+            // Prefer the human-readable name when the docker/podman
+            // ps cache has resolved it; falls back to the 12-char
+            // hash when the daemon isn't reachable or the container
+            // hasn't been polled yet.
+            label: group.label_with_names(names),
             band: group.band(),
             count: members.len(),
             total_cpu: sum_cpu(rows, &members),
@@ -1699,14 +1720,34 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     // behaviour honest — the layout reserves exactly the space the
     // paragraph will consume.
     let host_h = host_overview_rows(&app.gpus);
+    // Charts shouldn't be locked behind a Tab. CPU / MEM / NET /
+    // GPU sparklines (and the per-core CPU spectrum when `H` is
+    // toggled) are the part of neotop that justifies the project's
+    // existence; the user wants to see them whether they're
+    // tracking VMs or watching host load. We only suppress them on
+    // genuinely tiny terminals (< 28 rows total) so the fleet
+    // table still gets a usable 5-row body.
+    let history_h: u16 = if area.height >= 28 { 3 } else { 0 };
+    let percore_h = percore_height(
+        app.host_info.per_core_pct.len(),
+        area.width,
+        area.height,
+        app.per_core_spectrum,
+    );
+    // Resources pane: 16 rows is what the trend mini-charts need
+    // to breathe. Drop to 0 on terminals shorter than ~32 rows so
+    // the fleet table and the new sparkline row both fit.
+    let bottom_h: u16 = if area.height >= 32 { 16 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),      // title
-            Constraint::Length(host_h), // host overview (3 or 4 lines)
-            Constraint::Min(5),         // fleet table
-            Constraint::Length(16),     // serial + resources pane
-            Constraint::Length(1),      // help
+            Constraint::Length(1),         // title
+            Constraint::Length(host_h),    // host overview (3 or 4 lines)
+            Constraint::Length(percore_h), // per-core CPU grid / spectrum (0..)
+            Constraint::Length(history_h), // CPU + MEM + NET + GPU sparklines (0 or 3)
+            Constraint::Min(5),            // fleet table
+            Constraint::Length(bottom_h),  // serial + resources pane (0 or 16)
+            Constraint::Length(1),         // help
         ])
         .split(area);
 
@@ -1714,7 +1755,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(30), Constraint::Length(46)])
-        .split(chunks[3]);
+        .split(chunks[5]);
 
     let selected = app.vms.get(app.vms_table.selected().unwrap_or(0));
 
@@ -1729,14 +1770,31 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         &app.disks,
         &app.gpus,
     );
-    if app.vms.is_empty() {
-        draw_vms_empty(f, chunks[2], run_dir);
-    } else {
-        draw_table(f, chunks[2], &app.vms, &mut app.vms_table);
+    if percore_h > 0 {
+        if app.per_core_spectrum {
+            draw_per_core_spectrum(
+                f,
+                chunks[2],
+                &app.host_history.per_core,
+                &app.host_info.per_core_pct,
+            );
+        } else {
+            draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
+        }
     }
-    draw_serial(f, bottom[0], selected);
-    draw_resources(f, bottom[1], selected, &app.history);
-    draw_footer(f, chunks[4], app);
+    if history_h > 0 {
+        draw_host_history(f, chunks[3], &app.host_history);
+    }
+    if app.vms.is_empty() {
+        draw_vms_empty(f, chunks[4], run_dir);
+    } else {
+        draw_table(f, chunks[4], &app.vms, &mut app.vms_table);
+    }
+    if bottom_h > 0 {
+        draw_serial(f, bottom[0], selected);
+        draw_resources(f, bottom[1], selected, &app.history);
+    }
+    draw_footer(f, chunks[6], app);
 }
 
 /// Empty-state for the Vms table. Replaces the otherwise-empty
@@ -1862,7 +1920,13 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
             .split(body);
         let selected_pid = app.selected_proc().map(|r| i64::from(r.pid));
         draw_proc_table(f, split[0], app);
-        draw_proc_detail(f, split[1], selected_pid, app.selected_proc());
+        draw_proc_detail(
+            f,
+            split[1],
+            selected_pid,
+            app.selected_proc(),
+            &app.container_names,
+        );
     } else {
         draw_proc_table(f, body, app);
     }
@@ -2117,6 +2181,7 @@ fn draw_proc_detail(
     area: Rect,
     pid: Option<i64>,
     row: Option<&procs::ProcessRow>,
+    names: &groups::ContainerNames,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" detail ");
     let Some(pid) = pid else {
@@ -2143,11 +2208,17 @@ fn draw_proc_detail(
         // recover the human name; otherwise just the runtime name.
         match &r.group {
             groups::Group::Container(c) => {
-                lines.push(kv(
-                    "CONTAINER",
-                    format!("{}:{}", c.runtime.label(), c.id),
-                    label,
-                ));
+                // When `docker ps` / `podman ps` has surfaced a
+                // human-readable name, render `docker myapp
+                // (abc12345)` so the user gets both the friendly
+                // identifier and the hash they need for `docker
+                // logs <id>`. Without a resolved name, fall back to
+                // the bare hash form.
+                let value = match names.lookup(&c.id) {
+                    Some(name) => format!("{} {} ({})", c.runtime.label(), name, c.id),
+                    None => format!("{}:{}", c.runtime.label(), c.id),
+                };
+                lines.push(kv("CONTAINER", value, label));
             }
             groups::Group::Runtime(_) | groups::Group::System | groups::Group::Native => {
                 lines.push(kv("GROUP", r.group.label(), label));
@@ -3767,7 +3838,8 @@ mod tests {
             ),
             p_with_group(300, "myapp", 1.0, 100_000, groups::Group::Native),
         ];
-        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "");
+        let names = groups::ContainerNames::default();
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names);
         // Pattern: header(docker) m m header(java) m header(native) m.
         assert!(v[0].header.is_some(), "row 0 should be a header");
         let h0 = v[0].header.as_ref().unwrap();
@@ -3808,7 +3880,8 @@ mod tests {
                 groups::Group::Runtime(groups::Lang::Node),
             ),
         ];
-        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java");
+        let names = groups::ContainerNames::default();
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names);
         assert_eq!(v.len(), 2, "one header + one member");
         assert_eq!(v[0].header.as_ref().unwrap().label, "java");
         assert_eq!(rows[v[1].idx].pid, 1);

@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-04-25
+
+The "charts everywhere + readable container names" release. Two
+shipped problems from v0.12.0:
+
+1. The CPU spectrum / GPU sparkline / per-core grid only
+   rendered in the **Procs** view, but neotop opens in **Vms**
+   view by default when a `run_dir` exists. Result: charts the
+   user paid attention to designing were one keystroke away,
+   discoverable only by accident.
+2. The new group view labelled containers as `docker:abc12345`.
+   That short hash is *technically* sufficient — you can paste
+   it into `docker logs <id>` — but the user's mental model is
+   `myapp`, not the SHA-256 prefix.
+
+### Added
+
+- **`ContainerNames` cache** in `src/groups.rs` — shells out to
+  `docker ps --no-trunc --format '{{.ID}} {{.Names}}'` and the
+  equivalent `podman ps`, parses the lines, and stores a
+  `HashMap<full-sha, name>`. TTL = 5 s; refreshed lazily on the
+  slow tick (every 4 ticks, ~4 s at 1 Hz). Silent no-op when
+  neither runtime is installed — neotop doesn't grow a hard
+  runtime dependency.
+- **`Group::label_with_names(&ContainerNames)`** — preferred
+  display label that consults the cache. Container groups
+  surface the human-readable name (`docker:myapp` instead of
+  `docker:abc12345`); non-container groups fall through to
+  `label()` unchanged.
+- **`ContainerNames::lookup`** — resolves either a 12-char
+  short hash or a full SHA via prefix match. The `Container.id`
+  field carries the short form (matched out of the cgroup
+  path); the cache stores the full SHA from `--no-trunc`. The
+  prefix match bridges the two.
+- **Detail pane CONTAINER line** now reads `docker myapp
+  (abc12345)` when the name is resolved, giving the user both
+  the friendly identifier and the hash they need for `docker
+  logs <id>`. Falls back to the bare `runtime:hash` form before
+  the first `docker ps` poll completes.
+
+### Changed
+
+- **`draw_vms` layout** — added `host_history` sparklines (3
+  rows) and the per-core CPU grid / spectrum to the Vms view
+  layout. Both are gated by terminal height so the fleet table
+  still gets a usable 5-row body on small terminals: sparklines
+  appear when `area.height >= 28`, and the serial + resources
+  pane (16 rows) appears when `area.height >= 32`. Below those
+  thresholds the smaller terminal still gets a sensible layout
+  with just the title, host overview, and fleet table.
+- **`compute_visible_grouped` signature** grew a `names:
+  &ContainerNames` parameter. Threaded through from `App` so
+  group headers always see the latest cache.
+- **Slow tick** now also refreshes the container-name cache
+  alongside temps / batteries / disks / GPU. One fork+exec per
+  installed runtime every ~4 s — measured at <5 ms per tool
+  when the daemon is up, and skipped entirely when the binary
+  is missing.
+
+### Tests
+
+- 111 passing (was 107). Net +4:
+  - `parse_ps_lines_extracts_id_name_pairs` — fixture-driven
+    parse of `docker ps` output (myapp, quirky_einstein,
+    redis-cache).
+  - `parse_ps_lines_skips_blank_and_malformed` — blank lines,
+    single-token lines, and whitespace-only lines must not
+    crash the parser.
+  - `container_names_lookup_resolves_short_id_via_prefix` —
+    12-char short hash and full SHA both resolve to the
+    correct name.
+  - `group_label_with_names_prefers_resolved_name` — container
+    groups use the cached name; unresolved containers fall
+    back to id; non-container groups ignore the cache.
+
+### Fixed
+
+- `Option::is_none_or` (stable 1.82) replaced with
+  `map_or(true, ..)` — neotop's MSRV is 1.80, so the more
+  natural form would have failed CI on the older toolchain.
+
+### Out of scope (tracked for v0.14.0+)
+
+- **Go / Rust runtime detection** via ELF section scan
+  (`.gopclntab`, etc). Costs per-tick I/O.
+- **Themes / TOML config**.
+- **Intel via i915 / Xe perf counters** (needs `CAP_PERFMON`).
+- **SMT / NUMA grouping** in the spectrum view.
+- **macOS / Windows ports**.
+
 ## [0.12.0] — 2026-04-25
 
 The "process groups" release. Every process viewer the user has
@@ -827,7 +917,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/nt2311/neotop/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nt2311/neotop/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/nt2311/neotop/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/nt2311/neotop/compare/v0.9.0...v0.10.0

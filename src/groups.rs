@@ -28,7 +28,10 @@
 //! path strings, both of which are read once and cached in
 //! `procs::StaticInfo`. Steady-state CPU cost is essentially zero.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Lang {
@@ -136,6 +139,23 @@ impl Group {
             Self::Runtime(_) => GroupBand::Runtime,
             Self::System => GroupBand::System,
             Self::Native => GroupBand::Native,
+        }
+    }
+
+    /// Display label that consults the `ContainerNames` cache so
+    /// container groups surface the human-readable name (e.g.
+    /// `docker:myapp`) instead of the raw 12-char short hash. Falls
+    /// back to `label()` for non-container groups and for containers
+    /// the user hasn't named (anonymous `docker run` invocations get
+    /// auto-generated names like `quirky_einstein` either way, but
+    /// before `docker ps` has been polled the map is empty).
+    pub(crate) fn label_with_names(&self, names: &ContainerNames) -> String {
+        match self {
+            Self::Container(c) => match names.lookup(&c.id) {
+                Some(name) => format!("{}:{}", c.runtime.label(), name),
+                None => format!("{}:{}", c.runtime.label(), c.id),
+            },
+            _ => self.label(),
         }
     }
 }
@@ -381,6 +401,112 @@ fn short(id: &str) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// Container-name resolution
+// -----------------------------------------------------------------------------
+
+/// How long a `docker ps` / `podman ps` snapshot stays valid before
+/// we re-poll. 5 s is the same trade-off other tools make: containers
+/// don't churn at sub-second rates in normal use, and we'd rather
+/// pay one fork+exec every few seconds than every render frame.
+const NAME_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Maps container ID (full 64-char SHA-256 from `docker ps
+/// --no-trunc`) to the human-readable container name. Refreshed on
+/// a slow tick by shelling out to the runtime CLIs. The shell-out
+/// costs ~5 ms per tool when the daemon is up and is silent (`status
+/// != 0` swallowed) when it isn't — that way neotop doesn't grow a
+/// hard runtime dependency.
+#[derive(Debug, Default)]
+pub(crate) struct ContainerNames {
+    /// Full-length container ID → name. We store the full 64-char
+    /// hash because cgroup paths can carry either form (modern
+    /// docker uses the full sha; podman trims to short ids in some
+    /// systemd unit names) and we resolve via prefix match either
+    /// way.
+    map: HashMap<String, String>,
+    last_refresh: Option<Instant>,
+}
+
+impl ContainerNames {
+    /// Re-poll if the cache is stale (older than `NAME_CACHE_TTL`).
+    /// Cheap to call every tick; only actually shells out when the
+    /// TTL has elapsed.
+    pub(crate) fn refresh_if_stale(&mut self, now: Instant) {
+        // `Option::is_none_or` would read more naturally here but
+        // it's only stable since 1.82 and our MSRV is 1.80; the
+        // `map_or(true, ..)` shape is the equivalent on older
+        // toolchains.
+        let stale = self
+            .last_refresh
+            .map_or(true, |t| now.duration_since(t) >= NAME_CACHE_TTL);
+        if stale {
+            self.refresh_now(now);
+        }
+    }
+
+    fn refresh_now(&mut self, now: Instant) {
+        self.last_refresh = Some(now);
+        let mut map = HashMap::new();
+        for &cli in &["docker", "podman"] {
+            // `--no-trunc` gives us the full 64-char SHA so we can
+            // resolve against either short (12) or full IDs from
+            // `/proc/<pid>/cgroup`. The format string is the same
+            // for both runtimes.
+            let out = Command::new(cli)
+                .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    if let Ok(s) = std::str::from_utf8(&o.stdout) {
+                        for (id, name) in parse_ps_lines(s) {
+                            map.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        self.map = map;
+    }
+
+    /// Resolve `id` to the human-readable name. Accepts either a
+    /// 12-char short hash (the form `Container::id` carries) or a
+    /// full 64-char SHA. Returns `None` if no matching container is
+    /// known to the daemons we polled.
+    pub(crate) fn lookup(&self, id: &str) -> Option<&str> {
+        if let Some(name) = self.map.get(id) {
+            return Some(name);
+        }
+        // Treat `id` as a prefix and look for a stored full SHA
+        // that starts with it. O(n) over the map but n is "running
+        // containers", which is rarely above 50.
+        for (full, name) in &self.map {
+            if full.starts_with(id) {
+                return Some(name);
+            }
+        }
+        None
+    }
+}
+
+/// Parse the output of `docker ps --no-trunc --format '{{.ID}} {{.Names}}'`.
+/// Each non-empty line is `<id> <name>`. Both runtimes emit the same
+/// shape so we share one parser.
+fn parse_ps_lines(stdout: &str) -> Vec<(&str, &str)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            line.split_once(' ')
+                .map(|(id, name)| (id.trim(), name.trim()))
+        })
+        .filter(|(id, name)| !id.is_empty() && !name.is_empty())
+        .collect()
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -570,5 +696,83 @@ mod tests {
         assert_eq!(Group::Runtime(Lang::Node).label(), "node");
         assert_eq!(Group::System.label(), "system");
         assert_eq!(Group::Native.label(), "native");
+    }
+
+    #[test]
+    fn parse_ps_lines_extracts_id_name_pairs() {
+        // What `docker ps --no-trunc --format '{{.ID}} {{.Names}}'`
+        // looks like in practice. Two-word names are valid (Docker
+        // doesn't allow spaces in names but the parser shouldn't
+        // care — it splits on the first space only).
+        let stdout = "\
+abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd myapp
+def0987654321def0987654321def0987654321def0987654321def098765432 quirky_einstein
+
+ghi5555555555ghi5555555555ghi5555555555ghi5555555555ghi555555555 redis-cache
+";
+        let pairs = parse_ps_lines(stdout);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].1, "myapp");
+        assert_eq!(pairs[1].1, "quirky_einstein");
+        assert_eq!(pairs[2].1, "redis-cache");
+        // IDs are full SHAs (the actual character count is
+        // irrelevant to the parser — what matters is that we keep
+        // them intact for downstream prefix matching).
+        for (id, _) in &pairs {
+            assert!(id.len() >= 32, "SHA-shaped IDs only");
+        }
+    }
+
+    #[test]
+    fn parse_ps_lines_skips_blank_and_malformed() {
+        // Header lines (which `--format` strips anyway) and
+        // single-token lines must not crash the parser.
+        let stdout = "\n   \nonlyone\nabc def\n";
+        let pairs = parse_ps_lines(stdout);
+        assert_eq!(pairs, vec![("abc", "def")]);
+    }
+
+    #[test]
+    fn container_names_lookup_resolves_short_id_via_prefix() {
+        // `Container::id` carries the 12-char short hash. The
+        // cache stores the full SHA. Lookup must succeed via prefix
+        // match.
+        let mut cn = ContainerNames::default();
+        cn.map.insert(
+            "abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd".into(),
+            "myapp".into(),
+        );
+        assert_eq!(cn.lookup("abc123456789"), Some("myapp"));
+        // Full SHA also resolves.
+        assert_eq!(
+            cn.lookup("abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd"),
+            Some("myapp")
+        );
+        // Unknown ID → None (no panic).
+        assert_eq!(cn.lookup("ffffffffffff"), None);
+    }
+
+    #[test]
+    fn group_label_with_names_prefers_resolved_name() {
+        let mut cn = ContainerNames::default();
+        cn.map.insert(
+            "abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd".into(),
+            "myapp".into(),
+        );
+        let g = Group::Container(Container {
+            runtime: ContainerRuntime::Docker,
+            id: "abc123456789".into(), // 12-char short
+        });
+        assert_eq!(g.label_with_names(&cn), "docker:myapp");
+
+        // Unresolved container → falls back to id form.
+        let g2 = Group::Container(Container {
+            runtime: ContainerRuntime::Podman,
+            id: "ffffff".into(),
+        });
+        assert_eq!(g2.label_with_names(&cn), "podman:ffffff");
+
+        // Non-container groups ignore the cache.
+        assert_eq!(Group::Runtime(Lang::Java).label_with_names(&cn), "java");
     }
 }
