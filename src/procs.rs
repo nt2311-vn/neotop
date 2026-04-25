@@ -261,6 +261,16 @@ impl SortBy {
             Self::Command => "CMD",
         }
     }
+
+    /// Display direction: numeric keys (CPU%, RSS) sort *descending*
+    /// — biggest at the top, which matches `htop` and what the eye
+    /// expects. PID and command sort ascending.
+    pub(crate) fn arrow(self) -> char {
+        match self {
+            Self::Cpu | Self::Mem => '↓',
+            Self::Pid | Self::Command => '↑',
+        }
+    }
 }
 
 /// Sort `rows` in place by the requested key. Currently only used by

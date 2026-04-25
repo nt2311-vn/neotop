@@ -16,12 +16,16 @@
 //!
 //! Controls:
 //!     q or Ctrl-C   quit
+//!     ?             toggle the keybindings overlay
 //!     Tab           switch between Vms and Procs view
 //!     j / Down      next row
 //!     k / Up        prev row
+//!     PgDn / PgUp   jump 10 rows
 //!     r             refresh immediately
+//!     + / -         halve / double the refresh interval (50 ms .. 5 s)
 //!     x             (Vms)   delete state file of the selected halted vm
 //!     s             (Procs) cycle sort key (CPU → MEM → PID → CMD)
+//!     t             (Procs) toggle tree view (parent → children)
 //!     /             (Procs) enter filter mode (Esc to clear, Enter to confirm)
 //!     K             (Procs) send SIGTERM to selected pid (with confirm)
 //!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
@@ -51,7 +55,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+};
 use ratatui::Terminal;
 use serde::Deserialize;
 
@@ -114,12 +120,16 @@ fn print_help() {
          \n\
          CONTROLS:\n    \
              q            quit\n    \
+             ?            keybindings overlay\n    \
              Tab          toggle Vms / Procs view\n    \
              j / Down     next row\n    \
              k / Up       prev row\n    \
+             PgDn / PgUp  jump 10 rows\n    \
              r            refresh immediately\n    \
+             + / -        speed up / slow down refresh tick\n    \
              x  (Vms)     delete state file for selected halted vm\n    \
              s  (Procs)   cycle sort: CPU → MEM → PID → CMD\n    \
+             t  (Procs)   toggle tree view\n    \
              /  (Procs)   enter filter mode\n    \
              K  (Procs)   SIGTERM selected pid (confirmed)\n    \
              Ctrl-K       SIGKILL selected pid (confirmed)"
@@ -415,14 +425,16 @@ enum View {
     Procs,
 }
 
-/// Modal input state in the Procs view. `Normal` is the default;
-/// `Filter` captures every printable char into `App.proc_filter`;
-/// `Confirm` shows a y/N prompt for a queued kill signal.
+/// Modal input state. `Normal` is the default; `Filter` captures
+/// every printable char into `App.procs_filter`; `Confirm` shows a
+/// y/N prompt for a queued kill signal; `Help` paints the centered
+/// keybindings overlay.
 #[derive(Debug, Clone)]
 enum InputMode {
     Normal,
     Filter,
     Confirm(KillSig),
+    Help,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -493,10 +505,15 @@ struct App {
     procs_tracker: procs::Tracker,
     passwd: procs::PasswdCache,
     procs_all: Vec<procs::ProcessRow>,
-    procs_visible: Vec<usize>, // indices into procs_all after sort+filter
+    /// Rendered process rows after sort + filter (or tree expansion).
+    procs_visible: Vec<ProcRender>,
     procs_table: TableState,
     procs_sort: procs::SortBy,
     procs_filter: String,
+    /// When true, the procs table renders as a parent → children tree
+    /// instead of the sortable flat list. Sort and filter are ignored
+    /// in tree mode (a future iteration may layer them back on).
+    tree_mode: bool,
 
     // Host overview
     prev_host_cpu: host::CpuSamples,
@@ -512,6 +529,9 @@ struct App {
     // Tunables
     clk_tck: u64,
     last_scan: Instant,
+    /// Live refresh interval. Initialised from `--refresh-ms` and
+    /// then mutable at runtime via `+` / `-`.
+    refresh: Duration,
 
     // Self-profiling
     perf: PerfTracker,
@@ -520,8 +540,14 @@ struct App {
     errors: errors::ErrorRing,
 }
 
+/// Refresh-interval clamps for the `+`/`-` keys. Below ~50 ms the
+/// terminal can't keep up with the redraw; above 5 s it's no longer
+/// a "live" view.
+const MIN_REFRESH: Duration = Duration::from_millis(50);
+const MAX_REFRESH: Duration = Duration::from_millis(5000);
+
 impl App {
-    fn new(run_dir: &Path) -> Self {
+    fn new(run_dir: &Path, refresh: Duration) -> Self {
         let clk_tck = proc::clk_tck();
         let mut prev_cpu: HashMap<i64, CpuSample> = HashMap::new();
         let mut history = CpuHistory::default();
@@ -544,7 +570,7 @@ impl App {
             vms_table.select(Some(0));
         }
         let mut procs_table = TableState::default();
-        let procs_visible = compute_visible(&procs_all, procs::SortBy::Cpu, "");
+        let procs_visible = compute_visible_flat(&procs_all, procs::SortBy::Cpu, "");
         if !procs_visible.is_empty() {
             procs_table.select(Some(0));
         }
@@ -575,6 +601,7 @@ impl App {
             procs_table,
             procs_sort: procs::SortBy::Cpu,
             procs_filter: String::new(),
+            tree_mode: false,
             prev_host_cpu,
             host_info,
             net_tracker,
@@ -586,6 +613,7 @@ impl App {
             host_history: HostHistory::default(),
             clk_tck,
             last_scan: Instant::now(),
+            refresh,
             perf: PerfTracker::default(),
             errors,
         }
@@ -594,7 +622,7 @@ impl App {
     /// Re-sample everything that goes into the UI. Also updates the
     /// self-profiling counters so the perf footer always shows the
     /// most recent scan, not the previous one.
-    fn refresh(&mut self, run_dir: &Path) {
+    fn tick(&mut self, run_dir: &Path) {
         let started = Instant::now();
         if let Some(prev) = self.perf.last_scan_started {
             self.perf.perf.refresh_actual_ms = duration_ms(started.duration_since(prev));
@@ -608,8 +636,16 @@ impl App {
         self.temps = temp::snapshot(&mut self.errors);
         self.batteries = battery::snapshot();
         self.disks = self.disk_tracker.snapshot(&mut self.errors);
+
+        // Capture which PID the cursor is on *before* re-snapshotting,
+        // so we can re-anchor the row index after sort/filter changes.
+        // Without this, sorting by CPU% (the default) would slide the
+        // selection from process to process as load shifts — horrible
+        // for trying to actually watch one PID.
+        let prev_selected_pid = self.selected_proc().map(|r| r.pid);
         self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
         self.recompute_procs();
+        self.reanchor_proc_selection(prev_selected_pid);
         self.clamp_selections();
 
         // Feed the host history *after* host_info has been refreshed
@@ -653,7 +689,27 @@ impl App {
     }
 
     fn recompute_procs(&mut self) {
-        self.procs_visible = compute_visible(&self.procs_all, self.procs_sort, &self.procs_filter);
+        self.procs_visible = if self.tree_mode {
+            compute_visible_tree(&self.procs_all)
+        } else {
+            compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
+        };
+    }
+
+    /// After `procs_visible` has been recomputed, find the row index
+    /// corresponding to `pid` (if it still exists in the visible set)
+    /// and pin the cursor to it. Falls back silently when the pid is
+    /// gone (process exited) or filtered out — `clamp_selections` will
+    /// then put the cursor on whatever row 0 is now.
+    fn reanchor_proc_selection(&mut self, pid: Option<i32>) {
+        let Some(pid) = pid else { return };
+        if let Some(new_idx) = self
+            .procs_visible
+            .iter()
+            .position(|r| self.procs_all.get(r.idx).is_some_and(|row| row.pid == pid))
+        {
+            self.procs_table.select(Some(new_idx));
+        }
     }
 
     fn clamp_selections(&mut self) {
@@ -678,14 +734,28 @@ impl App {
 
     fn selected_proc(&self) -> Option<&procs::ProcessRow> {
         let i = self.procs_table.selected()?;
-        let idx = *self.procs_visible.get(i)?;
-        self.procs_all.get(idx)
+        let r = self.procs_visible.get(i)?;
+        self.procs_all.get(r.idx)
     }
 }
 
-/// Build the indirection vector that maps display-row → `procs_all` index,
-/// after applying the current sort key and filter substring.
-fn compute_visible(rows: &[procs::ProcessRow], by: procs::SortBy, filter: &str) -> Vec<usize> {
+/// One rendered row in the Procs table. `idx` indexes back into
+/// `App.procs_all`; `prefix` is the tree-glyph prefix (`""` in flat
+/// mode, e.g. `"│ ├─"` in tree mode) that will be prepended to the
+/// COMMAND cell.
+#[derive(Debug, Clone, Default)]
+struct ProcRender {
+    idx: usize,
+    prefix: String,
+}
+
+/// Flat-list path: filter then sort, return one `ProcRender` per
+/// surviving row with an empty prefix.
+fn compute_visible_flat(
+    rows: &[procs::ProcessRow],
+    by: procs::SortBy,
+    filter: &str,
+) -> Vec<ProcRender> {
     let mut idxs: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -702,7 +772,94 @@ fn compute_visible(rows: &[procs::ProcessRow], by: procs::SortBy, filter: &str) 
         procs::SortBy::Pid => rows[a].pid.cmp(&rows[b].pid),
         procs::SortBy::Command => rows[a].command.cmp(&rows[b].command),
     });
-    idxs
+    idxs.into_iter()
+        .map(|idx| ProcRender {
+            idx,
+            prefix: String::new(),
+        })
+        .collect()
+}
+
+/// Tree-mode path: build a parent→children adjacency map from the pid /
+/// ppid columns, then DFS from the roots producing a flat render
+/// list with proper tree glyphs. Sibling order is by PID for
+/// determinism — sort/filter don't apply in tree mode (yet).
+fn compute_visible_tree(rows: &[procs::ProcessRow]) -> Vec<ProcRender> {
+    let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
+    let mut have_pid: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for (i, r) in rows.iter().enumerate() {
+        have_pid.insert(r.pid);
+        children.entry(r.ppid).or_default().push(i);
+    }
+    for kids in children.values_mut() {
+        kids.sort_by_key(|&i| rows[i].pid);
+    }
+    // Roots: ppid is 0 (kernel) or refers to a pid we don't have a
+    // row for (process exited mid-scan, kernel thread etc.).
+    let mut roots: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.ppid <= 0 || !have_pid.contains(&r.ppid))
+        .map(|(i, _)| i)
+        .collect();
+    roots.sort_by_key(|&i| rows[i].pid);
+
+    let mut out = Vec::with_capacity(rows.len());
+    let mut ancestor_last: Vec<bool> = Vec::new();
+    for (n, &root_idx) in roots.iter().enumerate() {
+        let last = n + 1 == roots.len();
+        dfs_tree(
+            rows,
+            &children,
+            root_idx,
+            &mut ancestor_last,
+            last,
+            0,
+            &mut out,
+        );
+    }
+    out
+}
+
+fn dfs_tree(
+    rows: &[procs::ProcessRow],
+    children: &HashMap<i32, Vec<usize>>,
+    idx: usize,
+    ancestor_last: &mut Vec<bool>,
+    is_last_sibling: bool,
+    depth: usize,
+    out: &mut Vec<ProcRender>,
+) {
+    // Roots (depth 0) don't get a tree-branch prefix — they sit
+    // flush-left. For deeper nodes, each *non-root* ancestor
+    // contributes either '  ' (it was its parent's last child) or
+    // '│ ' (more siblings follow), then this node itself gets '├─'
+    // or '└─' depending on whether more siblings follow at its level.
+    let mut prefix = String::new();
+    if depth > 0 {
+        for &al in ancestor_last.iter() {
+            prefix.push_str(if al { "  " } else { "│ " });
+        }
+        prefix.push_str(if is_last_sibling { "└─" } else { "├─" });
+    }
+    out.push(ProcRender { idx, prefix });
+
+    let kids = children.get(&rows[idx].pid).cloned().unwrap_or_default();
+    let n = kids.len();
+    // Only push our own is_last_sibling onto the ancestor stack when
+    // we're not the root — the root's status doesn't visually carry
+    // into descendants.
+    let push = depth > 0;
+    if push {
+        ancestor_last.push(is_last_sibling);
+    }
+    for (i, k) in kids.into_iter().enumerate() {
+        let last = i + 1 == n;
+        dfs_tree(rows, children, k, ancestor_last, last, depth + 1, out);
+    }
+    if push {
+        ancestor_last.pop();
+    }
 }
 
 fn run<B: ratatui::backend::Backend>(
@@ -710,7 +867,7 @@ fn run<B: ratatui::backend::Backend>(
     run_dir: &Path,
     refresh: Duration,
 ) -> Result<()> {
-    let mut app = App::new(run_dir);
+    let mut app = App::new(run_dir, refresh);
 
     loop {
         let render_started = Instant::now();
@@ -720,28 +877,23 @@ fn run<B: ratatui::backend::Backend>(
         // Wait for either keyboard input or the refresh interval, whichever
         // comes first. This keeps CPU at ~0 when idle.
         let elapsed = app.last_scan.elapsed();
-        let wait = refresh.saturating_sub(elapsed);
+        let wait = app.refresh.saturating_sub(elapsed);
         if event::poll(wait)? {
             if let Event::Key(k) = event::read()? {
-                if handle_key(&mut app, k, refresh, run_dir) {
+                if handle_key(&mut app, k, run_dir) {
                     return Ok(());
                 }
             }
         }
 
-        if app.last_scan.elapsed() >= refresh {
-            app.refresh(run_dir);
+        if app.last_scan.elapsed() >= app.refresh {
+            app.tick(run_dir);
         }
     }
 }
 
 /// Returns `true` if the loop should exit.
-fn handle_key(
-    app: &mut App,
-    k: crossterm::event::KeyEvent,
-    refresh: Duration,
-    _run_dir: &Path,
-) -> bool {
+fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, _run_dir: &Path) -> bool {
     // Quit shortcuts apply in every mode.
     if matches!(k.code, KeyCode::Char('q')) && matches!(app.input, InputMode::Normal) {
         return true;
@@ -753,18 +905,42 @@ fn handle_key(
     match app.input.clone() {
         InputMode::Filter => handle_filter_key(app, k),
         InputMode::Confirm(sig) => handle_confirm_key(app, k, sig),
-        InputMode::Normal => handle_normal_key(app, k, refresh),
+        InputMode::Help => handle_help_key(app, k),
+        InputMode::Normal => handle_normal_key(app, k),
     }
     false
 }
 
-fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent, refresh: Duration) {
+fn handle_help_key(app: &mut App, k: crossterm::event::KeyEvent) {
+    // Any of `?` / `Esc` / `q` dismisses. Other keys are swallowed so
+    // they don't accidentally drive the table behind the popup.
+    if matches!(
+        k.code,
+        KeyCode::Esc | KeyCode::Char('?' | 'q') | KeyCode::Enter
+    ) {
+        app.input = InputMode::Normal;
+    }
+}
+
+fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
     match k.code {
         KeyCode::Tab => {
             app.view = match app.view {
                 View::Vms => View::Procs,
                 View::Procs => View::Vms,
             };
+        }
+        KeyCode::Char('?') => {
+            app.input = InputMode::Help;
+        }
+        KeyCode::Char('+' | '=') => {
+            // `=` so users on US layouts don't have to chord shift.
+            // Halve the tick (clamped) — `cur / 2`, not subtraction,
+            // because perceived speed is logarithmic.
+            app.refresh = (app.refresh / 2).max(MIN_REFRESH);
+        }
+        KeyCode::Char('-' | '_') => {
+            app.refresh = (app.refresh.saturating_mul(2)).min(MAX_REFRESH);
         }
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, 1),
         // Ctrl-k is SIGKILL in Procs view; check that *before* the bare
@@ -782,13 +958,24 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent, refresh: Dura
         KeyCode::Char('r') => {
             // Force an immediate scan on the next loop iteration.
             app.last_scan = Instant::now()
-                .checked_sub(refresh)
+                .checked_sub(app.refresh)
                 .unwrap_or_else(Instant::now);
         }
         KeyCode::Char('x') if app.view == View::Vms => delete_halted_state(app),
         KeyCode::Char('s') if app.view == View::Procs => {
+            let pinned = app.selected_proc().map(|r| r.pid);
             app.procs_sort = app.procs_sort.next();
             app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
+            app.clamp_selections();
+        }
+        KeyCode::Char('t') if app.view == View::Procs => {
+            // Tree toggle. Re-anchor by pid so the cursor stays on
+            // the same process after the row order changes.
+            let pinned = app.selected_proc().map(|r| r.pid);
+            app.tree_mode = !app.tree_mode;
+            app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
         KeyCode::Char('/') if app.view == View::Procs => {
@@ -807,17 +994,21 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent, refresh: Dura
 fn handle_filter_key(app: &mut App, k: crossterm::event::KeyEvent) {
     match k.code {
         KeyCode::Esc => {
+            let pinned = app.selected_proc().map(|r| r.pid);
             app.procs_filter.clear();
             app.input = InputMode::Normal;
             app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
         KeyCode::Enter => {
             app.input = InputMode::Normal;
         }
         KeyCode::Backspace => {
+            let pinned = app.selected_proc().map(|r| r.pid);
             app.procs_filter.pop();
             app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
         KeyCode::Char(c) => {
@@ -826,8 +1017,10 @@ fn handle_filter_key(app: &mut App, k: crossterm::event::KeyEvent) {
             if !k.modifiers.contains(KeyModifiers::CONTROL)
                 && !k.modifiers.contains(KeyModifiers::ALT)
             {
+                let pinned = app.selected_proc().map(|r| r.pid);
                 app.procs_filter.push(c);
                 app.recompute_procs();
+                app.reanchor_proc_selection(pinned);
                 app.clamp_selections();
             }
         }
@@ -889,6 +1082,102 @@ fn draw(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         View::Vms => draw_vms(f, run_dir, app),
         View::Procs => draw_procs(f, app),
     }
+    // Modal overlays are painted *after* the per-view draw so they
+    // sit on top of whichever table is current.
+    if matches!(app.input, InputMode::Help) {
+        draw_help_overlay(f);
+    }
+}
+
+/// Centered keybindings popup. Toggled by `?`; dismissed by
+/// `?` / `Esc` / `q` / `Enter`. The Clear widget blanks out the
+/// rectangle first so the popup isn't see-through.
+fn draw_help_overlay(f: &mut ratatui::Frame<'_>) {
+    let area = centered_rect(64, 22, f.area());
+    f.render_widget(Clear, area);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let kb = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Global",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        kv_line("  q / Ctrl-C", "quit", kb, dim),
+        kv_line("  Tab", "toggle Vms / Procs view", kb, dim),
+        kv_line("  ? ", "toggle this help", kb, dim),
+        kv_line("  r ", "force an immediate refresh", kb, dim),
+        kv_line("  + / -", "speed up / slow down the refresh tick", kb, dim),
+        kv_line("  j / k", "move selection (also ↓/↑)", kb, dim),
+        kv_line("  PgDn / PgUp", "jump 10 rows", kb, dim),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Vms view",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        kv_line("  x ", "delete state.json for selected halted vm", kb, dim),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Procs view",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        kv_line("  s ", "cycle sort: CPU → MEM → PID → CMD", kb, dim),
+        kv_line("  t ", "toggle tree view (parent → children)", kb, dim),
+        kv_line("  / ", "filter by substring (Esc clears)", kb, dim),
+        kv_line("  K ", "send SIGTERM to selected pid (confirm)", kb, dim),
+        kv_line(
+            "  Ctrl-K",
+            "send SIGKILL to selected pid (confirm)",
+            kb,
+            dim,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  press ? / Esc / q / Enter to close",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " neotop · keybindings ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn kv_line(key: &str, desc: &str, kb_style: Style, dim: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {key} "), kb_style),
+        Span::raw("  "),
+        Span::styled(desc.to_string(), dim),
+    ])
+}
+
+/// Compute a rect that's `pct_x` % wide and `pct_y` % tall, centered
+/// inside `area`. Standard ratatui popup pattern.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v[1])[1]
 }
 
 fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
@@ -999,7 +1288,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
             Constraint::Length(1), // title
             Constraint::Length(4), // host overview
             Constraint::Length(3), // host CPU + MEM history
-            Constraint::Min(5),    // procs table
+            Constraint::Min(5),    // procs table + detail pane (split horiz)
             Constraint::Length(1), // help / prompt
         ])
         .split(area);
@@ -1015,8 +1304,131 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.disks,
     );
     draw_host_history(f, chunks[2], &app.host_history);
-    draw_proc_table(f, chunks[3], app);
+
+    // Allocate the detail pane only when the terminal is wide enough.
+    // Below ~110 cols the table needs every column to stay readable.
+    let body = chunks[3];
+    if body.width >= 110 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(48)])
+            .split(body);
+        let selected_pid = app.selected_proc().map(|r| i64::from(r.pid));
+        draw_proc_table(f, split[0], app);
+        draw_proc_detail(f, split[1], selected_pid, app.selected_proc());
+    } else {
+        draw_proc_table(f, body, app);
+    }
     draw_footer(f, chunks[4], app);
+}
+
+/// Live detail view for the process under the cursor. Reuses
+/// `proc::snapshot(pid)` — the same code path the VM resources pane
+/// uses — so we get cgroup-v2 path + memory.current/max + rlimits
+/// for free.
+fn draw_proc_detail(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    pid: Option<i64>,
+    row: Option<&procs::ProcessRow>,
+) {
+    let block = Block::default().borders(Borders::ALL).title(" detail ");
+    let Some(pid) = pid else {
+        f.render_widget(Paragraph::new("(no process selected)").block(block), area);
+        return;
+    };
+    let label = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if let Some(r) = row {
+        let cpu = r
+            .cpu_pct
+            .map_or_else(|| "—".to_string(), |p| format!("{p:.1}%"));
+        lines.push(kv("PID", pid.to_string(), label));
+        lines.push(kv("PPID", r.ppid.to_string(), label));
+        lines.push(kv("USER", r.user.clone(), label));
+        lines.push(kv("STATE", r.state.to_string(), label));
+        lines.push(kv("CPU%", cpu, label));
+        lines.push(kv("THREADS", r.threads.to_string(), label));
+        lines.push(kv("RSS", proc::human_bytes(r.rss_bytes), label));
+    }
+
+    // Pull live cgroup + rlimits via the same snapshot used for VMs.
+    if let Some(snap) = proc::snapshot(pid) {
+        lines.push(kv("VSZ", proc::human_bytes(snap.mem.vsz_bytes), label));
+        if let Some(cg) = &snap.cgroup {
+            lines.push(section("── cgroup ──"));
+            lines.push(kv("path", ellipsize(&cg.path, 38), label));
+            lines.push(kv("mem.cur", proc::human_bytes(cg.memory_current), label));
+            let max = if cg.memory_max == u64::MAX {
+                "∞".to_string()
+            } else {
+                proc::human_bytes(cg.memory_max)
+            };
+            lines.push(kv("mem.max", max, label));
+        }
+        let want = ["Max open files", "Max processes", "Max address space"];
+        let mut header_pushed = false;
+        for w in want {
+            if let Some(l) = snap.limits.iter().find(|l| l.name == w) {
+                if !header_pushed {
+                    lines.push(section("── rlimits ──"));
+                    header_pushed = true;
+                }
+                let soft = proc::format_limit_value(&l.soft, &l.unit);
+                let hard = proc::format_limit_value(&l.hard, &l.unit);
+                let value = if soft == hard {
+                    soft
+                } else {
+                    format!("{soft} / {hard}")
+                };
+                lines.push(kv(short_limit_name(&l.name), value, label));
+            }
+        }
+    }
+
+    if let Some(r) = row {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  command",
+            label.add_modifier(Modifier::BOLD),
+        )));
+        // Wrap long command lines so the user can actually read them.
+        for chunk in wrap_chars(&r.command, area.width.saturating_sub(4) as usize) {
+            lines.push(Line::from(Span::raw(format!("  {chunk}"))));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Char-boundary-safe line wrap. We don't try to break on word
+/// boundaries — process command lines are full of paths and flags
+/// where word breaks are arbitrary anyway.
+fn wrap_chars(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut count = 0;
+    for c in s.chars() {
+        if count == width {
+            out.push(std::mem::take(&mut buf));
+            count = 0;
+        }
+        buf.push(c);
+        count += 1;
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 /// Two side-by-side host-level sparklines: CPU% on the left, mem% on
@@ -1097,8 +1509,9 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  {visible}/{total} processes · sort {}",
+            "  {visible}/{total} processes · sort {}{}",
             app.procs_sort.label(),
+            app.procs_sort.arrow(),
         )),
     ]);
     f.render_widget(Paragraph::new(title), area);
@@ -1433,7 +1846,11 @@ fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(cpu),
         Span::raw(" "),
         Span::styled("tick ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{:.0}ms", p.refresh_actual_ms)),
+        Span::raw(format!(
+            "{:.0}/{}ms",
+            p.refresh_actual_ms,
+            app.refresh.as_millis()
+        )),
     ]);
     f.render_widget(Paragraph::new(line).alignment(Alignment::Right), area);
 }
@@ -1472,6 +1889,11 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             f.render_widget(Paragraph::new(line), area);
             return;
         }
+        InputMode::Help => {
+            // Help-mode prompt has nothing useful to add to the help
+            // bar — the popup itself reminds the user how to dismiss.
+            return;
+        }
         InputMode::Confirm(sig) => {
             let target = app.selected_proc().map_or_else(
                 || "(no selection)".to_string(),
@@ -1497,6 +1919,8 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" quit  "),
+        Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::raw(" help  "),
         Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
         Span::raw(" view  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -1515,6 +1939,8 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             spans.extend([
                 Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" sort  "),
+                Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" tree  "),
                 Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" filter  "),
                 Span::styled(" K ", Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -1548,13 +1974,21 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let body: Vec<Row> = app
         .procs_visible
         .iter()
-        .filter_map(|&i| app.procs_all.get(i))
-        .map(|r| {
+        .filter_map(|pr| app.procs_all.get(pr.idx).map(|r| (pr, r)))
+        .map(|(pr, r)| {
             let cpu = r
                 .cpu_pct
                 .map_or_else(|| "—".to_string(), |p| format!("{p:.1}"));
             let cpu_style = Style::default().fg(cpu_glyph_color(r.cpu_pct.unwrap_or(0.0)));
             let state_style = proc_state_style(r.state);
+            // In tree mode the COMMAND cell is prefixed with the
+            // glyph chain ('│ ├─', '└─', etc). In flat mode `prefix`
+            // is empty and we render the same as before.
+            let cmd = if pr.prefix.is_empty() {
+                truncate_lossy(&r.command, 200)
+            } else {
+                format!("{} {}", pr.prefix, truncate_lossy(&r.command, 200))
+            };
             Row::new(vec![
                 Cell::from(r.pid.to_string()),
                 Cell::from(truncate_lossy(&r.user, 10)),
@@ -1562,7 +1996,7 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 Cell::from(Span::styled(cpu, cpu_style)),
                 Cell::from(proc::human_bytes(r.rss_bytes)),
                 Cell::from(r.threads.to_string()),
-                Cell::from(truncate_lossy(&r.command, 200)),
+                Cell::from(cmd),
             ])
         })
         .collect();
@@ -1577,15 +2011,20 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         Constraint::Min(30),
     ];
 
-    let title = format!(
-        " processes · by {}{} ",
-        app.procs_sort.label(),
-        if app.procs_filter.is_empty() {
-            String::new()
-        } else {
-            format!(" · /{}", app.procs_filter)
-        },
-    );
+    let title = if app.tree_mode {
+        " processes · tree (sort/filter disabled — t to leave) ".to_string()
+    } else {
+        format!(
+            " processes · by {}{}{} ",
+            app.procs_sort.label(),
+            app.procs_sort.arrow(),
+            if app.procs_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · /{}", app.procs_filter)
+            },
+        )
+    };
     let table = Table::new(body, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -1852,5 +2291,94 @@ fn short_limit_name(full: &str) -> &'static str {
         "Max core file size" => "core",
         "Max cpu time" => "cpu",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(self_pid: i32, parent: i32, cmd: &str) -> procs::ProcessRow {
+        procs::ProcessRow {
+            pid: self_pid,
+            ppid: parent,
+            uid: 0,
+            user: "u".into(),
+            state: 'S',
+            cpu_pct: None,
+            rss_bytes: 0,
+            threads: 1,
+            command: cmd.into(),
+        }
+    }
+
+    #[test]
+    fn tree_orders_parents_then_children_in_pid_order() {
+        // init(1) ├─ shell(10) └─ ssh(20)
+        // shell(10) ├─ vim(11)   └─ rg(12)
+        // ssh(20)   └─ ssh-agent(21)
+        let rows = vec![
+            p(1, 0, "init"),
+            p(10, 1, "shell"),
+            p(20, 1, "ssh"),
+            p(11, 10, "vim"),
+            p(12, 10, "rg"),
+            p(21, 20, "ssh-agent"),
+        ];
+        let rendered = compute_visible_tree(&rows);
+        let pids: Vec<i32> = rendered.iter().map(|r| rows[r.idx].pid).collect();
+        assert_eq!(pids, vec![1, 10, 11, 12, 20, 21]);
+
+        // Root has no prefix; children get '├─' or '└─'.
+        assert_eq!(rendered[0].prefix, "");
+        // shell(10) is the first child of init, but init's last child
+        // is ssh(20), so shell gets '├─'.
+        assert_eq!(rendered[1].prefix, "├─");
+        // vim(11) sits under shell, which is *not* the last sibling
+        // — so we expect '│ ' carried over, then '├─' for vim.
+        assert_eq!(rendered[2].prefix, "│ ├─");
+        assert_eq!(rendered[3].prefix, "│ └─");
+        // ssh(20) is the last sibling under init.
+        assert_eq!(rendered[4].prefix, "└─");
+        // ssh-agent(21) under ssh; ssh is the last sibling so the
+        // ancestor segment is two spaces, and ssh-agent itself is the
+        // only child so it gets '└─'.
+        assert_eq!(rendered[5].prefix, "  └─");
+    }
+
+    #[test]
+    fn tree_handles_orphans_as_roots() {
+        // Parent pid 999 doesn't exist in the row set, so child(50)
+        // is treated as a root.
+        let rows = vec![p(50, 999, "orphan"), p(1, 0, "init")];
+        let rendered = compute_visible_tree(&rows);
+        let pids: Vec<i32> = rendered.iter().map(|r| rows[r.idx].pid).collect();
+        // Both are roots; sorted by pid → init first.
+        assert_eq!(pids, vec![1, 50]);
+    }
+
+    #[test]
+    fn flat_visible_respects_filter_and_sort() {
+        let rows = vec![
+            procs::ProcessRow {
+                cpu_pct: Some(5.0),
+                ..p(1, 0, "alpha")
+            },
+            procs::ProcessRow {
+                cpu_pct: Some(50.0),
+                ..p(2, 0, "beta")
+            },
+            procs::ProcessRow {
+                cpu_pct: Some(15.0),
+                ..p(3, 0, "alphabet")
+            },
+        ];
+        // Filter "alpha" matches alpha + alphabet. Sort by CPU% desc.
+        let v = compute_visible_flat(&rows, procs::SortBy::Cpu, "alpha");
+        let pids: Vec<i32> = v.iter().map(|r| rows[r.idx].pid).collect();
+        assert_eq!(pids, vec![3, 1]); // alphabet (15%) then alpha (5%)
+        for r in &v {
+            assert!(r.prefix.is_empty(), "flat mode should leave prefix empty");
+        }
     }
 }
