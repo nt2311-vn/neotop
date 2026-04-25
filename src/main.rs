@@ -14,6 +14,7 @@ mod net;
 mod proc;
 mod procs;
 mod temp;
+mod vcpus;
 mod vm;
 
 use std::collections::{HashMap, VecDeque};
@@ -105,6 +106,10 @@ const CPU_HISTORY_CAP: usize = 60;
 /// Host-level history rings feeding the sparklines. `cpu`, `mem`,
 /// `gpu`, `vram` are `0..=100`; `net_*` are raw bytes/sec
 /// (auto-scaled max). Empty rings (`gpu` / `vram`) hide their column.
+/// `gpu_busy_per_card` and `disk_rate` feed the inline braille
+/// mini-charts in the host overview line; keyed by stable device
+/// identifier (`pci_addr` or PCI slot for GPU, kernel device name
+/// for disks). Devices that go away are pruned in `push_*`.
 #[derive(Debug, Default)]
 struct HostHistory {
     cpu: VecDeque<u64>,
@@ -114,6 +119,8 @@ struct HostHistory {
     gpu: VecDeque<u64>,
     vram: VecDeque<u64>,
     per_core: Vec<VecDeque<u64>>,
+    gpu_busy_per_card: HashMap<String, VecDeque<u64>>,
+    disk_rate: HashMap<String, VecDeque<u64>>,
 }
 
 impl HostHistory {
@@ -150,6 +157,100 @@ impl HostHistory {
             push_pct(ring, pct);
         }
     }
+
+    /// Append one busy% sample per discovered GPU. Cards without a
+    /// busy reading don't get a ring (so the chart stays empty
+    /// instead of misleading you with zero values). Removed cards
+    /// have their rings dropped on the next tick.
+    fn push_gpus(&mut self, gpus: &[gpu::Gpu]) {
+        let mut keep: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(gpus.len());
+        for g in gpus {
+            let Some(busy) = g.busy_pct else { continue };
+            let key = gpu_key(g);
+            keep.insert(key.clone());
+            let ring = self
+                .gpu_busy_per_card
+                .entry(key)
+                .or_insert_with(|| VecDeque::with_capacity(CPU_HISTORY_CAP));
+            push_pct(ring, busy);
+        }
+        self.gpu_busy_per_card.retain(|k, _| keep.contains(k));
+    }
+
+    /// Append one combined-rate sample per disk (read + write).
+    fn push_disks(&mut self, disks: &[disk::Disk]) {
+        let mut keep: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(disks.len());
+        for d in disks {
+            keep.insert(d.name.clone());
+            let ring = self
+                .disk_rate
+                .entry(d.name.clone())
+                .or_insert_with(|| VecDeque::with_capacity(CPU_HISTORY_CAP));
+            let r = d.read_bps.unwrap_or(0);
+            let w = d.write_bps.unwrap_or(0);
+            push_raw(ring, r.saturating_add(w));
+        }
+        self.disk_rate.retain(|k, _| keep.contains(k));
+    }
+}
+
+/// Stable identifier for a GPU history ring. Prefer the PCI
+/// address (survives reorderings) and fall back to the device name
+/// when sysfs didn't expose it.
+fn gpu_key(g: &gpu::Gpu) -> String {
+    g.pci_addr.clone().unwrap_or_else(|| g.name.clone())
+}
+
+/// 8-cell braille mini line chart (Unicode block U+2800..U+28FF).
+/// Each cell encodes 2 horizontal samples × 4 vertical levels via
+/// the 8-dot Braille pattern, so `cells` characters draw `cells*2`
+/// samples; older on the left, newest on the right. `max` defines
+/// the y-axis ceiling — caller passes 100 for percentages or
+/// `slice.iter().max()` for auto-scaled rates.
+fn braille_line(samples: &[u64], max: u64, cells: usize) -> String {
+    const DOTS_LEFT: [u8; 4] = [0x01, 0x02, 0x04, 0x40];
+    const DOTS_RIGHT: [u8; 4] = [0x08, 0x10, 0x20, 0x80];
+    if cells == 0 {
+        return String::new();
+    }
+    let want = cells * 2;
+    let start = samples.len().saturating_sub(want);
+    let tail = &samples[start..];
+    let pad = want - tail.len();
+    let level = |v: u64| -> Option<usize> {
+        if max == 0 {
+            return None;
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let row = ((v.min(max) as f64) / (max as f64) * 3.999) as usize;
+        Some(3 - row.min(3))
+    };
+    let mut out = String::with_capacity(cells * 3);
+    for c in 0..cells {
+        let li = c * 2;
+        let ri = li + 1;
+        let l = li.checked_sub(pad).and_then(|i| tail.get(i)).copied();
+        let r = ri.checked_sub(pad).and_then(|i| tail.get(i)).copied();
+        let mut bits: u32 = 0x2800;
+        if let Some(v) = l {
+            if let Some(row) = level(v) {
+                bits |= u32::from(DOTS_LEFT[row]);
+            }
+        }
+        if let Some(v) = r {
+            if let Some(row) = level(v) {
+                bits |= u32::from(DOTS_RIGHT[row]);
+            }
+        }
+        out.push(char::from_u32(bits).unwrap_or(' '));
+    }
+    out
 }
 
 fn push_pct(buf: &mut VecDeque<u64>, pct: f64) {
@@ -310,6 +411,11 @@ struct App {
     gpus: Vec<gpu::Gpu>,
     host_history: HostHistory,
 
+    // Per-vCPU tracker; only snapshot for the *selected* VM each
+    // tick so a host with 50+ guests doesn't melt /proc.
+    vcpu_tracker: vcpus::Tracker,
+    selected_vcpus: Vec<vcpus::VcpuStat>,
+
     // Tunables
     clk_tck: u64,
     last_scan: Instant,
@@ -385,6 +491,8 @@ impl App {
             gpu_tracker,
             gpus,
             host_history: HostHistory::default(),
+            vcpu_tracker: vcpus::Tracker::new(clk_tck),
+            selected_vcpus: Vec::new(),
             clk_tck,
             last_scan: Instant::now(),
             refresh,
@@ -464,6 +572,9 @@ impl App {
         );
         self.host_history
             .push_per_core(&self.host_info.per_core_pct);
+        self.host_history.push_gpus(&self.gpus);
+        self.host_history.push_disks(&self.disks);
+        self.refresh_selected_vcpus();
         self.update_self_perf(started);
 
         self.perf.perf.scan_ms = duration_ms(started.elapsed());
@@ -495,6 +606,24 @@ impl App {
         self.perf.rss_tick = self.perf.rss_tick.saturating_sub(1);
     }
 
+    /// Snapshot per-vCPU stats *only* for the currently selected
+    /// row when that row is a VM. Empty otherwise — keeps tracker
+    /// state clean and avoids `/proc/<pid>/task` walks for non-VM
+    /// selections.
+    fn refresh_selected_vcpus(&mut self) {
+        let Some(row) = self.selected_proc() else {
+            self.selected_vcpus.clear();
+            return;
+        };
+        if let groups::Group::Vm(v) = &row.group {
+            let pid = row.pid;
+            let hv = v.hypervisor;
+            self.selected_vcpus = self.vcpu_tracker.snapshot(pid, hv);
+        } else {
+            self.selected_vcpus.clear();
+        }
+    }
+
     fn recompute_procs(&mut self) {
         // Sort + filter apply in all three modes; tree mode keeps
         // the parent→child shape and only reorders siblings.
@@ -507,6 +636,14 @@ impl App {
                 self.procs_sort,
                 &self.procs_filter,
                 &self.container_names,
+                false,
+            ),
+            ListMode::GroupTree => compute_visible_grouped(
+                &self.procs_all,
+                self.procs_sort,
+                &self.procs_filter,
+                &self.container_names,
+                true,
             ),
             ListMode::Flat => {
                 compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
@@ -546,18 +683,35 @@ impl App {
     }
 }
 
-/// Layout choice for the Procs body. Mutually exclusive — pressing
-/// `t` while in `Group` switches back to `Flat`, and vice versa.
+/// Layout choice for the Procs body. `t` toggles tree, `g` toggles
+/// grouping; the two compose, so `GroupTree` is the four-way
+/// product. Group sorts by aggregate CPU/MEM; tree-within-group
+/// preserves parent→child shape inside each cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListMode {
-    /// Sortable htop-style flat list. Default.
     Flat,
-    /// Parent → children hierarchy with branch glyphs in the prefix.
     Tree,
-    /// Clustered by container / language runtime / system / native,
-    /// each cluster preceded by a synthetic header row that
-    /// aggregates count, total CPU%, and total RSS.
     Group,
+    GroupTree,
+}
+
+impl ListMode {
+    fn toggle_tree(self) -> Self {
+        match self {
+            Self::Flat => Self::Tree,
+            Self::Tree => Self::Flat,
+            Self::Group => Self::GroupTree,
+            Self::GroupTree => Self::Group,
+        }
+    }
+    fn toggle_group(self) -> Self {
+        match self {
+            Self::Flat => Self::Group,
+            Self::Group => Self::Flat,
+            Self::Tree => Self::GroupTree,
+            Self::GroupTree => Self::Tree,
+        }
+    }
 }
 
 /// One row of the rendered Procs table. `idx` indexes into
@@ -825,6 +979,7 @@ fn compute_visible_grouped(
     by: procs::SortBy,
     filter: &str,
     names: &groups::ContainerNames,
+    as_tree: bool,
 ) -> Vec<ProcRender> {
     // Bucket surviving indices by group key.
     let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
@@ -883,17 +1038,77 @@ fn compute_visible_grouped(
             prefix: String::new(),
             header: Some(header),
         });
-        // Members indented under the header so the visual grouping
-        // is unambiguous even before colour.
-        for idx in members {
-            out.push(ProcRender {
-                idx,
-                prefix: "  ".to_string(),
-                header: None,
-            });
+        if as_tree {
+            emit_group_as_tree(rows, &members, by, &mut out);
+        } else {
+            // Members indented under the header.
+            for idx in members {
+                out.push(ProcRender {
+                    idx,
+                    prefix: "  ".to_string(),
+                    header: None,
+                });
+            }
         }
     }
     out
+}
+
+/// Build a forest restricted to one group's members. Roots are
+/// pids whose parent isn't part of the same bucket — that lets a
+/// container's `nginx: master` show its `nginx: worker` children
+/// nested below it without dragging in unrelated host processes.
+/// Each row is prefixed with `"  "` so the tree sits clearly under
+/// the group header.
+fn emit_group_as_tree(
+    rows: &[procs::ProcessRow],
+    members: &[usize],
+    by: procs::SortBy,
+    out: &mut Vec<ProcRender>,
+) {
+    use std::collections::HashSet;
+
+    let pid_set: HashSet<i32> = members.iter().map(|&i| rows[i].pid).collect();
+    let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
+    for &i in members {
+        children.entry(rows[i].ppid).or_default().push(i);
+    }
+    for kids in children.values_mut() {
+        kids.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
+    }
+    let alive: HashSet<usize> = members.iter().copied().collect();
+
+    // A member is a root *within this group* when its parent isn't
+    // in the same group bucket.
+    let mut roots: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&i| !pid_set.contains(&rows[i].ppid))
+        .collect();
+    roots.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
+
+    let mut ancestor_last: Vec<bool> = Vec::new();
+    let total = roots.len();
+    let mut local: Vec<ProcRender> = Vec::with_capacity(members.len());
+    for (n, &root_idx) in roots.iter().enumerate() {
+        let last = n + 1 == total;
+        dfs_tree(
+            rows,
+            &children,
+            &alive,
+            root_idx,
+            &mut ancestor_last,
+            last,
+            0,
+            &mut local,
+        );
+    }
+    // Indent the whole sub-forest by 2 cells so the tree visually
+    // hangs off the group header.
+    for mut r in local {
+        r.prefix = format!("  {}", r.prefix);
+        out.push(r);
+    }
 }
 
 fn sum_cpu(rows: &[procs::ProcessRow], idxs: &[usize]) -> f64 {
@@ -1021,23 +1236,17 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.clamp_selections();
         }
         KeyCode::Char('t') => {
-            // Tree ↔ Flat (Group also lands on Tree if pressed there).
+            // Toggle the tree axis; preserves grouping when on.
             let pinned = app.selected_proc().map(|r| r.pid);
-            app.list_mode = match app.list_mode {
-                ListMode::Tree => ListMode::Flat,
-                _ => ListMode::Tree,
-            };
+            app.list_mode = app.list_mode.toggle_tree();
             app.recompute_procs();
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
         KeyCode::Char('g') => {
-            // Group ↔ Flat.
+            // Toggle the group axis; preserves tree when on.
             let pinned = app.selected_proc().map(|r| r.pid);
-            app.list_mode = match app.list_mode {
-                ListMode::Group => ListMode::Flat,
-                _ => ListMode::Group,
-            };
+            app.list_mode = app.list_mode.toggle_group();
             app.recompute_procs();
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
@@ -1284,6 +1493,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.batteries,
         &app.disks,
         &app.gpus,
+        &app.host_history,
     );
     if percore_h > 0 {
         if app.per_core_spectrum {
@@ -1318,6 +1528,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
             selected_pid,
             app.selected_proc(),
             &app.container_names,
+            &app.selected_vcpus,
         );
     } else {
         draw_proc_table(f, body, app);
@@ -1610,6 +1821,7 @@ fn draw_proc_detail(
     pid: Option<i64>,
     row: Option<&procs::ProcessRow>,
     names: &groups::ContainerNames,
+    vcpus: &[vcpus::VcpuStat],
 ) {
     let block = Block::default().borders(Borders::ALL).title(" detail ");
     let Some(pid) = pid else {
@@ -1691,6 +1903,10 @@ fn draw_proc_detail(
         }
     }
 
+    if !vcpus.is_empty() {
+        push_vcpu_lines(&mut lines, vcpus, label);
+    }
+
     if let Some(r) = row {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1709,6 +1925,39 @@ fn draw_proc_detail(
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// `── vcpus ──` block in the detail pane. Each row carries vCPU
+/// index, host tid, CPU% (color-ramped), and an inline 8-cell
+/// gauge that mirrors the per-core spectrum so guest hot vCPUs
+/// jump out the same way host hot cores do.
+fn push_vcpu_lines(lines: &mut Vec<Line<'static>>, vcpus: &[vcpus::VcpuStat], label: Style) {
+    lines.push(section("── vcpus ──"));
+    for v in vcpus {
+        let pct = v
+            .cpu_pct
+            .map_or_else(|| "—".to_string(), |p| format!("{p:>5.1}%"));
+        let color = v.cpu_pct.map_or(Color::DarkGray, cpu_load_color);
+        let key = format!("cpu{}", v.index);
+        let mut spans = vec![
+            Span::styled(format!("  {key:<8}"), label),
+            Span::styled(pct, Style::default().fg(color)),
+            Span::styled(format!("  tid {}", v.tid), label),
+        ];
+        if let Some(p) = v.cpu_pct {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "▕".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.extend(gauge_cells(p, 8, color));
+            spans.push(Span::styled(
+                "▏".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
 }
 
 /// Char-boundary-safe line wrap. We don't try to break on word
@@ -1776,24 +2025,17 @@ fn draw_mem_bar(f: &mut ratatui::Frame<'_>, area: Rect, h: &host::HostInfo) {
         .saturating_sub(buffers_w)
         .saturating_sub(cached_w);
 
-    // Build the bar by appending colored space-spans. Each cell is
-    // a single ASCII space painted with a background color — that
-    // gives a solid-fill block on every terminal without needing
-    // Unicode block glyphs.
+    // Each segment is a solid-fill background span. The byte count
+    // sits *inside* its own segment so the bar is self-explanatory
+    // — no readout above it. Narrow segments degrade to label-only
+    // then to bare fill; the title carries only the totals.
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
-    spans.push(seg(" used ", Color::Red, used_w, used));
-    spans.push(seg(" buf ", Color::Blue, buffers_w, buffers));
-    spans.push(seg(" cache ", Color::Cyan, cached_w, cached));
-    spans.push(seg(" free ", Color::DarkGray, free_w, free));
+    spans.push(seg("used", used, Color::Red, used_w));
+    spans.push(seg("buf", buffers, Color::Blue, buffers_w));
+    spans.push(seg("cache", cached, Color::Cyan, cached_w));
+    spans.push(seg("free", free, Color::DarkGray, free_w));
 
-    let title = format!(
-        " memory  {} used \u{2502} {} buf \u{2502} {} cache \u{2502} {} free \u{2502} {} total ",
-        proc::human_bytes(used),
-        proc::human_bytes(buffers),
-        proc::human_bytes(cached),
-        proc::human_bytes(free),
-        proc::human_bytes(total),
-    );
+    let title = format!(" memory · {} total ", proc::human_bytes(total));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
@@ -1813,27 +2055,32 @@ fn scale(n: u64, total: u64, bar_w: u64) -> u64 {
         .min(bar_w)
 }
 
-/// Build one segment of the memory bar. Each segment is a single
-/// span of `width` spaces, painted with a solid background. We
-/// inline a tiny ASCII label (e.g. `" used "`) when the segment is
-/// wide enough; very narrow segments get a single dot to avoid
-/// truncated label fragments. Bytes are passed through so the
-/// caller can compose a tooltip-style summary in the title.
-fn seg(label: &str, bg: Color, width: u64, _bytes: u64) -> Span<'static> {
+/// One segment of the memory bar. Picks the richest readout that
+/// fits: `" used 14.0 GiB "` → `" used "` → solid fill. The byte
+/// count lives *inside* the segment so the bar replaces the
+/// title-row readout entirely.
+fn seg(label: &str, bytes: u64, bg: Color, width: u64) -> Span<'static> {
     let w = usize::try_from(width).unwrap_or(0);
     if w == 0 {
         return Span::raw("");
     }
-    // Show the label only when there's room for it plus padding.
-    let content = if w >= label.len() + 2 {
-        let pad_total = w - label.len();
-        let left = pad_total / 2;
-        let right = pad_total - left;
-        format!("{}{label}{}", " ".repeat(left), " ".repeat(right))
+    let with_bytes = format!("{label} {}", proc::human_bytes(bytes));
+    let content = if w >= with_bytes.len() + 2 {
+        center(&with_bytes, w)
+    } else if w >= label.len() + 2 {
+        center(label, w)
     } else {
         " ".repeat(w)
     };
     Span::styled(content, Style::default().fg(Color::Black).bg(bg))
+}
+
+/// Pad `s` with spaces to fill `w` cells, keeping `s` centered.
+fn center(s: &str, w: usize) -> String {
+    let pad = w.saturating_sub(s.len());
+    let left = pad / 2;
+    let right = pad - left;
+    format!("{}{s}{}", " ".repeat(left), " ".repeat(right))
 }
 
 /// Side-by-side host-level sparklines: CPU%, MEM%, NET↓, NET↑, GPU%,
@@ -2001,6 +2248,7 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ListMode::Flat => " flat",
         ListMode::Tree => " tree",
         ListMode::Group => " group",
+        ListMode::GroupTree => " group+tree",
     };
     let mut title = vec![
         Span::styled(
@@ -2039,6 +2287,7 @@ fn draw_host(
     batteries: &[battery::Battery],
     disks: &[disk::Disk],
     gpus: &[gpu::Gpu],
+    history: &HostHistory,
 ) {
     // Three tight lines by default. A fourth GPU line appears only
     // when at least one card was discovered under `/sys/class/drm`,
@@ -2047,13 +2296,20 @@ fn draw_host(
     let mut lines = vec![
         host_line1(h, batteries),
         host_line_net_temp(ifaces, temps),
-        host_line4(disks),
+        host_line4(disks, history),
     ];
     if !gpus.is_empty() {
-        lines.push(host_line_gpu(gpus));
+        lines.push(host_line_gpu(gpus, history));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
+
+/// Cells reserved for the inline braille chart on the GPU and
+/// disk lines. 8 chars × 2 samples-per-char = 16 s of history at
+/// the default 1 Hz tick — narrow enough to fit on a 100-col
+/// terminal next to the numeric readout.
+const GPU_BRAILLE_CELLS: usize = 8;
+const DISK_BRAILLE_CELLS: usize = 8;
 
 /// Width of each inline GPU gauge `▕XXXXXXXX▏`. Eight cells is
 /// enough to read the fill at a glance without crowding the line —
@@ -2068,7 +2324,7 @@ const GPU_GAUGE_CELLS: usize = 8;
 /// cards are shown by name with a `(driver pending)` tag so the
 /// user knows the hardware *is* recognised — the metrics just
 /// aren't wired up in this neotop yet.
-fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
+fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
         vec![Span::styled(" gpu ", Style::default().fg(Color::DarkGray))];
     for (i, g) in gpus.iter().enumerate() {
@@ -2083,6 +2339,16 @@ fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let busy_int = busy.round() as i64;
             let busy_color = gpu_busy_color(busy);
+            // Inline braille mini-chart: last ~16 s of busy% so the
+            // panel reads as a chart, not a single instant snapshot.
+            if let Some(ring) = history.gpu_busy_per_card.get(&gpu_key(g)) {
+                let series: Vec<u64> = ring.iter().copied().collect();
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    braille_line(&series, 100, GPU_BRAILLE_CELLS),
+                    Style::default().fg(busy_color),
+                ));
+            }
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{busy_int:>3}%"),
@@ -2294,7 +2560,7 @@ fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'s
     Line::from(spans)
 }
 
-fn host_line4(disks: &[disk::Disk]) -> Line<'static> {
+fn host_line4(disks: &[disk::Disk], history: &HostHistory) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
         vec![Span::styled(" disk ", Style::default().fg(Color::DarkGray))];
     let picks = disk::highlights(disks, 3);
@@ -2310,6 +2576,24 @@ fn host_line4(disks: &[disk::Disk]) -> Line<'static> {
             d.name.clone(),
             Style::default().fg(Color::Cyan),
         ));
+        // Inline braille mini-chart of total throughput. y-axis
+        // auto-scales to this disk's own peak in the window so a
+        // quiet SSD next to a saturated HDD both show a readable
+        // chart instead of one being flatlined.
+        if let Some(ring) = history.disk_rate.get(&d.name) {
+            let series: Vec<u64> = ring.iter().copied().collect();
+            let max = series.iter().copied().max().unwrap_or(0).max(1);
+            let color = match d.util_pct {
+                Some(u) if u >= 80.0 => Color::Red,
+                Some(u) if u >= 50.0 => Color::Yellow,
+                _ => Color::Green,
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                braille_line(&series, max, DISK_BRAILLE_CELLS),
+                Style::default().fg(color),
+            ));
+        }
         spans.push(Span::raw(format!(
             " ↓{} ↑{}",
             disk::human_rate(d.read_bps),
@@ -2754,6 +3038,14 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 format!(" · /{}", app.procs_filter)
             },
         ),
+        ListMode::GroupTree => format!(
+            " processes · group+tree (g/t to peel off){} ",
+            if app.procs_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · /{}", app.procs_filter)
+            },
+        ),
         ListMode::Flat => format!(
             " processes · by {}{}{} ",
             app.procs_sort.label(),
@@ -3064,7 +3356,7 @@ mod tests {
             p_with_group(300, "myapp", 1.0, 100_000, groups::Group::Native),
         ];
         let names = groups::ContainerNames::default();
-        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names);
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
         // Pattern: header(docker) m m header(java) m header(native) m.
         assert!(v[0].header.is_some(), "row 0 should be a header");
         let h0 = v[0].header.as_ref().unwrap();
@@ -3104,14 +3396,50 @@ mod tests {
             p_with_group(20, "myapp", 80.0, 0, groups::Group::Native),
         ];
         let names = groups::ContainerNames::default();
-        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names);
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
         assert_eq!(v[0].header.as_ref().unwrap().label, "native");
         assert_eq!(v[2].header.as_ref().unwrap().label, "docker:abc12");
 
         // Sort by PID: band priority restored (docker first).
-        let v = compute_visible_grouped(&rows, procs::SortBy::Pid, "", &names);
+        let v = compute_visible_grouped(&rows, procs::SortBy::Pid, "", &names, false);
         assert_eq!(v[0].header.as_ref().unwrap().label, "docker:abc12");
         assert_eq!(v[2].header.as_ref().unwrap().label, "native");
+    }
+
+    #[test]
+    fn grouped_tree_renders_parent_child_inside_each_group() {
+        // Two java rows where pid=200 is the parent and pid=201 is
+        // its child. In group+tree mode the child should sit *under*
+        // the parent inside the java group, with a `└─` glyph.
+        let parent = procs::ProcessRow {
+            ppid: 1,
+            ..p_with_group(
+                200,
+                "java -jar app",
+                10.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Java),
+            )
+        };
+        let child = procs::ProcessRow {
+            ppid: 200,
+            ..p_with_group(
+                201,
+                "java worker",
+                40.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Java),
+            )
+        };
+        let rows = vec![parent, child];
+        let names = groups::ContainerNames::default();
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, true);
+        assert_eq!(v.len(), 3, "header + parent + child");
+        assert!(v[0].header.is_some());
+        assert_eq!(rows[v[1].idx].pid, 200);
+        assert_eq!(rows[v[2].idx].pid, 201);
+        // Child row carries a tree branch glyph in its prefix.
+        assert!(v[2].prefix.contains("─"), "child should have ─ glyph");
     }
 
     #[test]
@@ -3135,7 +3463,7 @@ mod tests {
             ),
         ];
         let names = groups::ContainerNames::default();
-        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names);
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names, false);
         assert_eq!(v.len(), 2, "one header + one member");
         assert_eq!(v[0].header.as_ref().unwrap().label, "java");
         assert_eq!(rows[v[1].idx].pid, 1);
@@ -3217,6 +3545,54 @@ mod tests {
         assert_eq!(spectrum_cores_per_row(80, 8), 2);
         assert_eq!(spectrum_cores_per_row(40, 8), 1);
         assert_eq!(spectrum_cores_per_row(200, 1), 1);
+    }
+
+    #[test]
+    fn braille_line_renders_zero_cells_as_empty() {
+        assert_eq!(braille_line(&[10, 20, 30], 100, 0), "");
+    }
+
+    #[test]
+    fn braille_line_pads_left_when_buffer_is_short() {
+        // 3 samples in a 4-cell (= 8-slot) chart: first 5 slots are
+        // blank braille (U+2800), last 3 carry the data.
+        let s = braille_line(&[50, 50, 50], 100, 4);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 4);
+        // Cell 0 = slots 0,1 (both pad) → blank pattern.
+        assert_eq!(chars[0], '\u{2800}');
+        // Cell 1 = slots 2,3 (both pad) → blank.
+        assert_eq!(chars[1], '\u{2800}');
+        // Cell 2 = slots 4 (pad) + 5 (data) → only right dot lit.
+        assert_ne!(chars[2], '\u{2800}');
+        // Cell 3 = slots 6 (data) + 7 (data) → both lit.
+        assert_ne!(chars[3], '\u{2800}');
+    }
+
+    #[test]
+    fn braille_line_max_zero_yields_blank_chart() {
+        let s = braille_line(&[1, 2, 3, 4], 0, 4);
+        for c in s.chars() {
+            assert_eq!(c, '\u{2800}');
+        }
+    }
+
+    #[test]
+    fn braille_line_high_value_uses_top_row() {
+        // Two samples at peak → both columns, top row only
+        // (left=0x01, right=0x08). Top-row dots only → 0x09.
+        let s = braille_line(&[100, 100], 100, 1);
+        let bits = u32::from(s.chars().next().unwrap()) - 0x2800;
+        assert_eq!(bits, 0x09);
+    }
+
+    #[test]
+    fn braille_line_zero_value_uses_bottom_row() {
+        // Two zero samples → both columns, bottom row only
+        // (left=0x40, right=0x80). Bottom-row dots only → 0xC0.
+        let s = braille_line(&[0, 0], 100, 1);
+        let bits = u32::from(s.chars().next().unwrap()) - 0x2800;
+        assert_eq!(bits, 0xC0);
     }
 
     #[test]

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Inline braille mini-charts for GPU and disk panels
+
+GPU and disk overview rows now carry an 8-cell Unicode braille
+(U+2800..U+28FF) mini-chart inline next to the device numbers.
+Each cell encodes 2 horizontal samples × 4 vertical levels, so
+8 chars = ~16 s of history at the default 1 Hz tick. Zero added
+vertical space — the strip reads as a continuous trend line.
+
+- New per-device history rings in `HostHistory.gpu_busy_per_card`
+  and `HostHistory.disk_rate`, keyed by stable identifier (PCI
+  addr / kernel device name). Auto-pruned when devices disappear.
+- `braille_line(samples, max, cells)` helper does the rendering.
+  GPU uses fixed `max=100` for percentage; disk auto-scales to
+  per-disk peak so a quiet SSD next to a saturated HDD both show
+  readable charts.
+- Color follows the same load ramp as the per-core spectrum
+  (DarkGray → Green → Yellow → Red).
+- 5 unit tests covering padding, blank chart, top-row, bottom-row.
+
+### VM Phase 2 — per-vCPU CPU% in the detail pane
+
+When a VM PID is selected, the detail pane now shows a
+`── vcpus ──` block with one row per guest CPU thread. New module
+`vcpus.rs`:
+
+- Walks `/proc/<pid>/task/*` for the selected VM only (cheap on
+  hosts with many guests).
+- Identifies vCPU threads by matching `comm` against per-hypervisor
+  patterns: QEMU `CPU N/KVM`, Firecracker `fc_vcpu N`, Cloud
+  Hypervisor `vcpuN`, crosvm `crosvm_vcpuN`, lkvm `kvm-vcpuN`.
+- Computes per-thread CPU% via the same delta-of-jiffies math
+  `procs::Tracker` uses for whole processes (`utime+stime` from
+  `/proc/<pid>/task/<tid>/stat`).
+- Renders index, host tid, percentage, and inline 8-cell gauge —
+  same look as the per-core CPU spectrum, so guest hot vCPUs jump
+  out exactly the way host hot cores do.
+
+6 unit tests pin the comm-pattern parser for all five hypervisors
+plus a "rejects unrelated threads" case.
+
 ## [0.14.0] — 2026-04-25
 
 ### Group view sorts by aggregate CPU / MEM
