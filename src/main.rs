@@ -595,8 +595,13 @@ struct App {
     host_info: host::HostInfo,
     net_tracker: net::Tracker,
     ifaces: Vec<net::Iface>,
-    temp_tracker: temp::Tracker,
-    temps: Vec<temp::Reading>,
+    // Temps run on a dedicated worker thread because some hwmon
+    // sensors (notably `acpitz` on certain HP/Dell laptops) take
+    // several seconds per read on the *first* hit and would
+    // otherwise freeze the UI on startup. The worker auto-parks
+    // those slow sensors after their first scan; subsequent scans
+    // are fast. The UI thread never blocks on a sysfs read.
+    temp_worker: temp::TempWorker,
     batteries: Vec<battery::Battery>,
     disk_tracker: disk::Tracker,
     disks: Vec<disk::Disk>,
@@ -668,8 +673,14 @@ impl App {
         let prev_host_cpu = host::read_cpu_samples(&mut errors);
         let host_info = host::snapshot(None, &mut errors);
         let ifaces = net_tracker.snapshot(&mut errors);
-        let mut temp_tracker = temp::Tracker::default();
-        let temps = temp_tracker.snapshot(&mut errors);
+        // Spawn the temp worker and prime the first scan. The
+        // result is collected asynchronously on subsequent ticks
+        // via `temp_worker.poll()`; the UI thread never waits for
+        // it. Empty readings render gracefully — the host
+        // overview just omits the temp column for the first
+        // frame (typically <50 ms; up to 3 s on broken firmware).
+        let mut temp_worker = temp::TempWorker::spawn();
+        temp_worker.request();
         let batteries = battery::snapshot();
         let mut disk_tracker = disk::Tracker::default();
         let disks = disk_tracker.snapshot(&mut errors);
@@ -721,8 +732,7 @@ impl App {
             host_info,
             net_tracker,
             ifaces,
-            temp_tracker,
-            temps,
+            temp_worker,
             batteries,
             disk_tracker,
             disks,
@@ -773,6 +783,17 @@ impl App {
             self.host_info.cpu_pct = Some(smoothed);
         }
 
+        // Drain whatever the temp worker has produced since the
+        // last tick. Runs every tick (fast or slow) because the
+        // worker may finish a slow first scan well after the
+        // request was made and we want to surface the result on
+        // the very next frame, not wait another `SLOW_TICK_EVERY`.
+        if let Some(errs) = self.temp_worker.poll() {
+            for (kind, msg) in errs {
+                self.errors.push(kind, msg);
+            }
+        }
+
         // Slow-path scanners: every `SLOW_TICK_EVERY` ticks (~4 s at
         // the default 1 s tick). The data they read updates at most
         // once per second on real hardware — re-walking
@@ -782,7 +803,10 @@ impl App {
         // very first tick (counter == 0) so the UI isn't blank while
         // the user waits the first cycle after launch.
         if self.slow_tick_counter == 0 {
-            self.temps = self.temp_tracker.snapshot(&mut self.errors);
+            // Temp scan dispatched to the worker thread; result
+            // arrives on a later `temp_worker.poll()`. The UI
+            // thread continues without waiting.
+            self.temp_worker.request();
             self.batteries = battery::snapshot();
             self.disks = self.disk_tracker.snapshot(&mut self.errors);
             // GPU sysfs reads are cheap (single-digit microseconds
@@ -1356,8 +1380,12 @@ fn poll_key(timeout: Duration) -> io::Result<Option<crossterm::event::KeyEvent>>
 
 /// Returns `true` if the loop should exit.
 fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, _run_dir: &Path) -> bool {
-    // Quit shortcuts apply in every mode.
-    if matches!(k.code, KeyCode::Char('q')) && matches!(app.input, InputMode::Normal) {
+    // Quit shortcuts apply in every mode *except* Filter — there
+    // the user is typing text and a literal `q` is legitimate
+    // input. In Help / Confirm the popup auto-dismisses on exit, so
+    // it's safe (and what the user expects) for `q` to quit
+    // outright instead of forcing them to press it twice.
+    if matches!(k.code, KeyCode::Char('q')) && !matches!(app.input, InputMode::Filter) {
         return true;
     }
     if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1374,12 +1402,13 @@ fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, _run_dir: &Path) -> 
 }
 
 fn handle_help_key(app: &mut App, k: crossterm::event::KeyEvent) {
-    // Any of `?` / `Esc` / `q` dismisses. Other keys are swallowed so
-    // they don't accidentally drive the table behind the popup.
-    if matches!(
-        k.code,
-        KeyCode::Esc | KeyCode::Char('?' | 'q') | KeyCode::Enter
-    ) {
+    // `?` / `Esc` / `Enter` dismisses the popup back to Normal mode.
+    // `q` is no longer handled here — the global quit guard at the
+    // top of `handle_key` catches it first and exits the app, which
+    // is what users expect from a footer that advertises `q quit`.
+    // Other keys are swallowed so they don't accidentally drive the
+    // table behind the popup.
+    if matches!(k.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
         app.input = InputMode::Normal;
     }
 }
@@ -1765,7 +1794,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         chunks[1],
         &app.host_info,
         &app.ifaces,
-        &app.temps,
+        app.temp_worker.readings(),
         &app.batteries,
         &app.disks,
         &app.gpus,
@@ -1888,7 +1917,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         chunks[1],
         &app.host_info,
         &app.ifaces,
-        &app.temps,
+        app.temp_worker.readings(),
         &app.batteries,
         &app.disks,
         &app.gpus,

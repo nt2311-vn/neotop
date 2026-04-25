@@ -27,9 +27,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
-
-use crate::errors::ErrorRing;
 
 /// Any hwmon device whose total scan exceeds this is parked. 50 ms
 /// is generous — a healthy hwmon (`coretemp`, `nvme`, `k10temp`)
@@ -52,16 +52,36 @@ pub(crate) struct Tracker {
     parked: HashSet<PathBuf>,
 }
 
+/// Outcome of a single tracker scan: temperature readings plus
+/// whatever non-fatal events the scan produced (parked-sensor
+/// notifications, missing `/sys/class/hwmon`, etc). Decoupled from
+/// `ErrorRing` so we can ship reports across thread boundaries via
+/// `mpsc::channel` — `ErrorRing::Entry` carries an `Instant` that
+/// makes no sense to pre-compute on a worker thread.
+#[derive(Debug, Default)]
+pub(crate) struct ScanReport {
+    pub(crate) readings: Vec<Reading>,
+    pub(crate) errors: Vec<(&'static str, String)>,
+}
+
 impl Tracker {
-    pub(crate) fn snapshot(&mut self, errors: &mut ErrorRing) -> Vec<Reading> {
+    /// Single hwmon walk. Returns readings plus collected errors
+    /// (parked-sensor notifications, missing `/sys/class/hwmon`,
+    /// etc) so the caller can route them however it wants —
+    /// `TempWorker` ships the `ScanReport` over a channel; the
+    /// test path just inspects it directly.
+    pub(crate) fn scan(&mut self) -> ScanReport {
         let entries = match fs::read_dir("/sys/class/hwmon") {
             Ok(e) => e,
             Err(e) => {
-                errors.push("hwmon", format!("/sys/class/hwmon: {e}"));
-                return Vec::new();
+                return ScanReport {
+                    readings: Vec::new(),
+                    errors: vec![("hwmon", format!("/sys/class/hwmon: {e}"))],
+                };
             }
         };
         let mut readings = Vec::new();
+        let mut errors: Vec<(&'static str, String)> = Vec::new();
 
         for hwmon in entries.flatten() {
             let hwmon_path = hwmon.path();
@@ -79,18 +99,107 @@ impl Tracker {
             if started.elapsed() > SLOW_THRESHOLD {
                 let name = read_trim(&hwmon_path.join("name"))
                     .unwrap_or_else(|| hwmon_path.display().to_string());
-                errors.push(
+                errors.push((
                     "hwmon",
                     format!(
                         "parked slow sensor {name} ({} ms)",
                         started.elapsed().as_millis()
                     ),
-                );
+                ));
                 self.parked.insert(hwmon_path);
             }
         }
 
-        readings
+        ScanReport { readings, errors }
+    }
+}
+
+/// Off-thread temperature scanner. Owns a `Tracker` on a dedicated
+/// worker thread and exchanges scan requests / results with the UI
+/// thread over a pair of `mpsc::channel`s. The UI thread never
+/// blocks on a sysfs read, even when `acpitz` takes 3 seconds on
+/// the very first hit.
+///
+/// Lifecycle:
+/// 1. `spawn()` starts the worker and primes the first scan.
+/// 2. Each slow tick calls `request()` (no-op while a scan is
+///    already in flight — the worker coalesces queued requests).
+/// 3. Each tick (slow *or* fast) calls `poll()` to drain any
+///    completed scan; results are folded into `readings()`.
+/// 4. The worker thread shuts itself down when the last `Sender`
+///    is dropped at app exit.
+pub(crate) struct TempWorker {
+    request_tx: mpsc::Sender<()>,
+    result_rx: mpsc::Receiver<ScanReport>,
+    in_flight: bool,
+    cached: Vec<Reading>,
+}
+
+impl TempWorker {
+    pub(crate) fn spawn() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<()>();
+        let (res_tx, res_rx) = mpsc::channel::<ScanReport>();
+        // The thread owns the Tracker, including the parked-paths
+        // HashSet, so parking decisions persist across scans
+        // exactly the same way the sync path did. We don't keep
+        // the JoinHandle — the worker terminates naturally when
+        // the request channel closes, which happens when this
+        // struct is dropped.
+        thread::Builder::new()
+            .name("neotop-temp".into())
+            .spawn(move || {
+                let mut tracker = Tracker::default();
+                while req_rx.recv().is_ok() {
+                    // Coalesce: if multiple requests piled up
+                    // while we were scanning, collapse them into
+                    // a single fresh scan. The user sees the most
+                    // recent state, never a stale backlog.
+                    while req_rx.try_recv().is_ok() {}
+                    let report = tracker.scan();
+                    if res_tx.send(report).is_err() {
+                        // UI thread gone; nothing left to report to.
+                        return;
+                    }
+                }
+            })
+            .expect("spawn temp worker");
+        Self {
+            request_tx: req_tx,
+            result_rx: res_rx,
+            in_flight: false,
+            cached: Vec::new(),
+        }
+    }
+
+    /// Ask the worker to take a fresh snapshot. No-op while a
+    /// previous request hasn't been answered yet — this is what
+    /// keeps a backlog of slow scans from accumulating while the
+    /// firmware is misbehaving.
+    pub(crate) fn request(&mut self) {
+        if !self.in_flight && self.request_tx.send(()).is_ok() {
+            self.in_flight = true;
+        }
+    }
+
+    /// Drain a pending result if one is ready. Updates the cached
+    /// readings and returns the errors so the caller can fold
+    /// them into its `ErrorRing`. Non-blocking.
+    pub(crate) fn poll(&mut self) -> Option<Vec<(&'static str, String)>> {
+        match self.result_rx.try_recv() {
+            Ok(r) => {
+                self.in_flight = false;
+                self.cached = r.readings;
+                Some(r.errors)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Most recent set of readings the worker has produced. Empty
+    /// for the brief window between app launch and the first
+    /// completed scan.
+    pub(crate) fn readings(&self) -> &[Reading] {
+        &self.cached
     }
 }
 
@@ -262,6 +371,61 @@ mod tests {
     }
 
     #[test]
+    fn temp_worker_initial_readings_are_empty_until_first_poll() {
+        // The worker starts with an empty cache. After spawn() but
+        // before any poll() returns Some, readings() must yield an
+        // empty slice — that's what allows the UI to render the
+        // first frame immediately even if the kernel takes 3 s to
+        // answer the first sysfs read.
+        let worker = TempWorker::spawn();
+        assert!(worker.readings().is_empty());
+    }
+
+    #[test]
+    fn temp_worker_poll_returns_results_after_request() {
+        // Fire a request, then poll until either the worker
+        // returns *something* or we time out. On any Linux dev
+        // box `/sys/class/hwmon` exists (even if empty), so the
+        // worker will respond promptly. We don't assert on the
+        // contents of `readings` (depends on hardware) — only
+        // that the request/response handshake works end to end.
+        let mut worker = TempWorker::spawn();
+        worker.request();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if worker.poll().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("temp worker did not respond within 5 s");
+    }
+
+    #[test]
+    fn temp_worker_request_is_idempotent_while_in_flight() {
+        // Calling request() many times before the worker has
+        // answered should not pile up a backlog of scans. The
+        // coalescing guarantee is what protects us from a
+        // 3-second-per-scan acpitz pinning a worker thread for
+        // minutes on a busy slow-tick.
+        let mut worker = TempWorker::spawn();
+        for _ in 0..20 {
+            worker.request();
+        }
+        // Drain whatever response arrives (one, at most).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut responses = 0;
+        while Instant::now() < deadline {
+            if worker.poll().is_some() {
+                responses += 1;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(responses <= 1, "expected at most one coalesced response");
+    }
+
+    #[test]
     fn tracker_skips_already_parked_paths() {
         // Synthetic test: pre-populate the tracker's parked set with
         // a path and confirm the public snapshot interface accepts a
@@ -272,10 +436,9 @@ mod tests {
         // benchmark in main.rs and by direct measurement.
         let mut t = Tracker::default();
         t.parked.insert(PathBuf::from("/sys/class/hwmon/hwmon0"));
-        let mut errors = ErrorRing::new();
         // Should run without panic; the parked path is silently
         // skipped, all other devices read normally.
-        let _ = t.snapshot(&mut errors);
+        let _ = t.scan();
         assert!(t.parked.contains(&PathBuf::from("/sys/class/hwmon/hwmon0")));
     }
 }
