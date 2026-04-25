@@ -26,6 +26,7 @@ pub(crate) fn clk_tck() -> u64 {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // full /proc/<pid>/stat snapshot; not every field is rendered today
 pub(crate) struct Stat {
     /// Human-readable process state: "R (running)", "S (sleeping)", ...
     pub(crate) state: String,
@@ -35,6 +36,7 @@ pub(crate) struct Stat {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // rss_bytes is read from /proc/<pid>/status by procs.rs
 pub(crate) struct Mem {
     pub(crate) rss_bytes: u64,
     pub(crate) vsz_bytes: u64,
@@ -67,6 +69,7 @@ pub(crate) struct Cgroup {
 /// Full process snapshot. Each call re-reads the files — they are
 /// virtual and cheap.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // stat is part of the contract; detail pane uses mem/limits/cgroup
 pub(crate) struct Snapshot {
     pub(crate) stat: Stat,
     pub(crate) mem: Mem,

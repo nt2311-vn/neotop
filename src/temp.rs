@@ -53,14 +53,20 @@ pub(crate) struct Tracker {
 }
 
 /// Outcome of a single tracker scan: temperature readings plus
-/// whatever non-fatal events the scan produced (parked-sensor
-/// notifications, missing `/sys/class/hwmon`, etc). Decoupled from
+/// whatever non-fatal events the scan produced. Decoupled from
 /// `ErrorRing` so we can ship reports across thread boundaries via
 /// `mpsc::channel` — `ErrorRing::Entry` carries an `Instant` that
 /// makes no sense to pre-compute on a worker thread.
+///
+/// `infos` and `errors` map directly onto `Severity::Info` and
+/// `Severity::Warn`. Parking a slow sensor is informational — the
+/// hardware is fine, neotop just chose not to read it again — so it
+/// rides on `infos` and doesn't inflate the footer's `(N err)`
+/// counter.
 #[derive(Debug, Default)]
 pub(crate) struct ScanReport {
     pub(crate) readings: Vec<Reading>,
+    pub(crate) infos: Vec<(&'static str, String)>,
     pub(crate) errors: Vec<(&'static str, String)>,
 }
 
@@ -74,14 +80,19 @@ impl Tracker {
         let entries = match fs::read_dir("/sys/class/hwmon") {
             Ok(e) => e,
             Err(e) => {
+                // Missing `/sys/class/hwmon` is a real failure
+                // (this is Linux — it should always exist on the
+                // path neotop targets), so it goes on `errors`.
                 return ScanReport {
                     readings: Vec::new(),
+                    infos: Vec::new(),
                     errors: vec![("hwmon", format!("/sys/class/hwmon: {e}"))],
                 };
             }
         };
         let mut readings = Vec::new();
-        let mut errors: Vec<(&'static str, String)> = Vec::new();
+        let mut infos: Vec<(&'static str, String)> = Vec::new();
+        let errors: Vec<(&'static str, String)> = Vec::new();
 
         for hwmon in entries.flatten() {
             let hwmon_path = hwmon.path();
@@ -99,7 +110,10 @@ impl Tracker {
             if started.elapsed() > SLOW_THRESHOLD {
                 let name = read_trim(&hwmon_path.join("name"))
                     .unwrap_or_else(|| hwmon_path.display().to_string());
-                errors.push((
+                // Parked-sensor notice is informational: the user
+                // should know we worked around a broken sensor,
+                // but it isn't a failure they need to act on.
+                infos.push((
                     "hwmon",
                     format!(
                         "parked slow sensor {name} ({} ms)",
@@ -110,7 +124,11 @@ impl Tracker {
             }
         }
 
-        ScanReport { readings, errors }
+        ScanReport {
+            readings,
+            infos,
+            errors,
+        }
     }
 }
 
@@ -133,6 +151,17 @@ pub(crate) struct TempWorker {
     result_rx: mpsc::Receiver<ScanReport>,
     in_flight: bool,
     cached: Vec<Reading>,
+}
+
+/// Side-effects from a single `TempWorker::poll()`. The caller is
+/// expected to route each list at the matching `ErrorRing`
+/// severity — `infos` go through `push_info`, `errors` through
+/// `push`. Pulling them out as a named struct (instead of
+/// returning a tuple) makes the intent at the call site obvious.
+#[derive(Debug, Default)]
+pub(crate) struct PollOutput {
+    pub(crate) infos: Vec<(&'static str, String)>,
+    pub(crate) errors: Vec<(&'static str, String)>,
 }
 
 impl TempWorker {
@@ -182,14 +211,18 @@ impl TempWorker {
     }
 
     /// Drain a pending result if one is ready. Updates the cached
-    /// readings and returns the errors so the caller can fold
-    /// them into its `ErrorRing`. Non-blocking.
-    pub(crate) fn poll(&mut self) -> Option<Vec<(&'static str, String)>> {
+    /// readings and returns the `(infos, errors)` so the caller
+    /// can fold each tier into its `ErrorRing` at the right
+    /// severity. Non-blocking.
+    pub(crate) fn poll(&mut self) -> Option<PollOutput> {
         match self.result_rx.try_recv() {
             Ok(r) => {
                 self.in_flight = false;
                 self.cached = r.readings;
-                Some(r.errors)
+                Some(PollOutput {
+                    infos: r.infos,
+                    errors: r.errors,
+                })
             }
             Err(_) => None,
         }
@@ -389,16 +422,21 @@ mod tests {
         // worker will respond promptly. We don't assert on the
         // contents of `readings` (depends on hardware) — only
         // that the request/response handshake works end to end.
+        // 15 s is generous because on hardware with broken ACPI
+        // firmware (the whole reason this worker exists) the
+        // first sysfs read can block for 3+ seconds, and parallel
+        // test execution can stack several such reads onto the
+        // same kernel mailbox. The success path returns instantly.
         let mut worker = TempWorker::spawn();
         worker.request();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if worker.poll().is_some() {
                 return;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("temp worker did not respond within 5 s");
+        panic!("temp worker did not respond within 15 s");
     }
 
     #[test]
@@ -412,8 +450,10 @@ mod tests {
         for _ in 0..20 {
             worker.request();
         }
-        // Drain whatever response arrives (one, at most).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Drain whatever response arrives (one, at most). Same
+        // 15 s budget as `temp_worker_poll_returns_results_after_request`
+        // for the same reason: slow firmware + parallel tests.
+        let deadline = Instant::now() + Duration::from_secs(15);
         let mut responses = 0;
         while Instant::now() < deadline {
             if worker.poll().is_some() {

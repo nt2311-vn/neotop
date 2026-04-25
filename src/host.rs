@@ -1,11 +1,10 @@
 //! host.rs — lightweight host-wide stats for the top overview bar.
 //!
-//! Everything here is parsed from `/proc` + a couple of stats on
-//! `/dev/kvm`. All pure reads; snapshot is cheap enough to call on
-//! every scan tick (sub-millisecond on a modern `NVMe`).
+//! Everything here is parsed from `/proc`. All pure reads;
+//! snapshot is cheap enough to call on every scan tick
+//! (sub-millisecond on a modern `NVMe`).
 
 use std::fs;
-use std::path::Path;
 
 use crate::errors::ErrorRing;
 
@@ -32,7 +31,7 @@ pub(crate) struct HostInfo {
     /// anything needs it.
     pub(crate) mem_cached_bytes: u64,
     /// `SwapTotal` from `/proc/meminfo`, in bytes. `0` when the
-    /// system has no swap configured (common on servers, microVMs).
+    /// system has no swap configured (common on cloud servers).
     pub(crate) swap_total_bytes: u64,
     /// `SwapFree` from `/proc/meminfo`, in bytes.
     pub(crate) swap_free_bytes: u64,
@@ -48,9 +47,6 @@ pub(crate) struct HostInfo {
     /// Per-core CPU% in physical core order. Same `None` semantics as
     /// `cpu_pct`. Length may be empty on first call.
     pub(crate) per_core_pct: Vec<f64>,
-    /// Is `/dev/kvm` present and accessible? This drives a red/green
-    /// indicator — if it's gone, nothing in neosandbox works.
-    pub(crate) kvm_available: bool,
 }
 
 /// Monotonically accumulating CPU time, read from a `cpu`/`cpuN` line
@@ -205,7 +201,6 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         loadavg_15: loads.2,
         cpu_pct,
         per_core_pct,
-        kvm_available: Path::new("/dev/kvm").exists(),
     }
 }
 

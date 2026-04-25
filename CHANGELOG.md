@@ -7,6 +7,232 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-04-25
+
+### Group view sorts by aggregate CPU / MEM
+
+In `g`-mode (group), groups are now ordered by their **aggregate
+CPU% (or RSS)** when sorted by CPU / MEM, regardless of band. A
+native binary pegging 80% floats above a Docker group at 5% — much
+more useful than the old "containers always first" rule when you're
+hunting the actual hot path. PID / Command sorts still respect band
+priority (`container > vm > runtime > system > native`) since
+aggregates aren't a stable key for those.
+
+### Dashboard upgrades
+
+- **CPU spectrum: 2-column layout.** Wide terminals now split the
+  per-core spectrum into two columns side-by-side; an N-core box uses
+  ⌈N/2⌉ rows instead of N. Auto-falls back to 1 column on narrow
+  terminals (`spectrum_cores_per_row` decides at render time). Tests
+  cover both shapes plus the term-height cap.
+- **GPU: VRAM% sparkline + watts in title.** When a card reports
+  VRAM, a 6th sparkline cell appears next to GPU%. Power draw shows
+  in the GPU title (` GPU 17% 42W `). New
+  `gpu::aggregate_vram_pct` / `aggregate_power_watts` helpers
+  aggregate across multi-card setups.
+- **NET: top-iface label.** The NET↓ / NET↑ titles now carry the
+  name of the busiest interface (` NET↓ 18.5 MB/s wlp4s0 `) so
+  you see which link is doing the talking. The summed total is
+  unchanged — the math has always been right; this just attributes
+  it.
+
+### Phase 1 of VM support landed
+
+- **New `vm.rs` module.** Pure parser over the joined cmdline:
+  detects QEMU/KVM (`qemu-system-*`, `qemu-kvm`), Firecracker,
+  Cloud Hypervisor, crosvm, lkvm. Pulls VM name (`-name guest=…`,
+  `--id`, fallback to `-drive file=…` or `--api-sock`), vCPU count
+  (`-smp N` / `-smp cpus=N` / `--cpus boot=N`), memory cap (`-m 8G`
+  / `-m size=…` / `--memory size=…`). 10 unit tests cover real-world
+  argv shapes including libvirt-style multi-field `-name` values.
+- **`Group::Vm(VmInfo)`.** New band slotted between Container and
+  Runtime in the priority order (`container > vm > runtime > system
+  > native`). Headers render as `qemu/myapp-prod (4 vCPU, 8.0 GiB)`
+  in `LightBlue`. `g`-mode (group) view auto-clusters VMs.
+- **Detail pane shows VM info** when a VM PID is selected: `VM
+  qemu/myapp-prod (4 vCPU, 8.0 GiB)`.
+
+This is the *standout* feature — every other host TUI lumps a
+`qemu-system-x86_64` PID with the rest of the process noise. neotop
+now shows it as a first-class VM with the headline config you want
+at a glance. Phases 2-5 (per-vCPU CPU%, KVM exit counters, vhost-net
+queue depth, VFIO passthrough) are still pending; see `VMPLAN.md`.
+
+### Critical fix: container-name resolution no longer freezes the UI
+
+`ContainerNames::refresh_if_stale` was shelling out to `docker ps`
+and `podman ps` synchronously on the slow tick. When either daemon
+was unhealthy (which the user reproducibly hit) the UI thread
+blocked indefinitely — `q` couldn't quit, no charts rendered,
+ctrl-C was the only way out. Same root cause as the v0.13.0 hwmon
+freeze, just a different blocking syscall.
+
+- **`groups::ContainerNames`** is now a worker-thread + channel
+  pair, mirroring `temp::TempWorker`. Calls into
+  `refresh_if_stale` queue a request and return immediately;
+  results flow back via `try_recv` on the next tick.
+- **1-second hard timeout** per `docker ps` / `podman ps`
+  invocation via `Command::spawn` + `try_wait` polling. A wedged
+  daemon now caps at 1 s of worker-thread idle, never the UI thread.
+- The TTL-based coalescing of v0.13.0 is preserved (the worker
+  swallows pending requests if multiple piled up while it was
+  scanning).
+
+### Comment cleanup
+
+Many narrative-style comments compressed to one-liners; module-level
+doc, struct field docs in `App`, and verbose explanatory blocks in
+`tick()` / `run()` / `handle_normal_key()` / `draw_main()` shrunk.
+Net ~120 lines removed from `main.rs`. Genuinely non-obvious notes
+(MSRV constraints, ordering requirements, race windows) preserved.
+
+### VMPLAN.md
+
+New design doc for the next phase: per-VM grouping (`v` toggle),
+per-vCPU CPU%, KVM exit-counter readout from
+`/sys/kernel/debug/kvm/`, vhost-net queue depth, VFIO passthrough
+detection. Breaks down into 5 phases. The standout pitch: one TUI
+that gives you `htop`'s process view + `btop`'s charts + libvirt-grade
+VM panel, no daemons, no config, public kernel surfaces only.
+
+### Project decoupled from neosandbox
+
+neotop is now a standalone Linux TUI in the lineage of `htop` /
+`btop` / `btm`, no longer tied to the neosandbox microVM project
+that birthed it. Dropped:
+
+- **Vms view**: `VmRow`, `Exits`, `StateFile`, `scan()` (which
+  walked `$NEOSANDBOX_STATE/run/*/state.json`), `draw_vms`,
+  `draw_vms_empty`, `draw_serial`, `draw_resources`,
+  `draw_resources_text`, `draw_cpu_sparkline`, `draw_table`,
+  `draw_title`, `phase_style`, `one_line`, `format_uptime`,
+  `now_ns`, `delete_halted_state`. The `View` enum and the
+  `Tab` view-cycle key are gone — there's only one view.
+- **CLI**: `--state-dir` flag and `NEOSANDBOX_STATE` env var.
+  `Args` is now just `--refresh-ms`.
+- **Key handlers**: `Tab` (was view cycle) and `x` (was delete
+  halted-VM state file). All `if app.view == View::Procs`
+  guards on `s` / `t` / `g` / `/` / `K` are dropped — those
+  keys now apply unconditionally.
+- **Deps**: `serde` and `serde_json` (only used to parse the VM
+  `state.json` schema). `Cargo.lock` re-resolved.
+- **`kvm_available`**: the `/dev/kvm` presence indicator is
+  gone from `host::HostInfo` and the host overview line. Not
+  relevant to a generic process / host monitor.
+- **`CpuSample` + `CpuHistory`**: per-VM-PID CPU history rings
+  fed the now-removed `draw_cpu_sparkline`. Host-wide
+  `HostHistory` (CPU / MEM / NET / GPU + per-core) stays — that
+  drives the always-visible sparklines and spectrum view.
+- **PLAN.md**: deleted. Historical implementation plan from the
+  neosandbox-targeted era; CHANGELOG carries the project record now.
+- **README.md**: rewritten from scratch as a generic Linux TUI
+  description. No more "neosandbox", "fleet", "vmmd", microVM
+  references.
+- **Cargo.toml**: `description` and `keywords` updated. Dropped
+  `kvm`, `microvm` keywords; added `process`, `system`, `gpu`.
+
+### Tests
+
+- 117 passing — same coverage as before the decoupling, since
+  every removed function had no unit tests (they were view-layer
+  rendering code) and the underlying parsers / data sources are
+  unchanged.
+
+### "Responsive on broken firmware" pass
+
+Two reports from the real machine after v0.13.0 landed:
+
+1. `q` didn't quit reliably. The footer advertises `q quit` but
+   the global guard only fired in `Normal` mode, so any
+   accidental `?` (Help) or `Ctrl+K` (kill prompt) consumed the
+   first `q` as a popup-dismiss.
+2. `acpitz` on the user's HP / Dell-class laptop took 3025 ms on
+   the first sysfs read and the entire UI froze for 3 seconds at
+   startup. To make matters worse, the parked-sensor message
+   showed up as `⚠ (1 err)` in the footer for the rest of the
+   session — exactly the alarm-style rendering reserved for real
+   `/proc` failures.
+
+### Added
+
+- **`temp::TempWorker`** — dedicated worker thread that owns the
+  hwmon `Tracker` and exchanges scan requests / results with the
+  UI thread over a pair of `mpsc::channel`s. The UI thread never
+  blocks on a sysfs read, even when the kernel's ACPI thermal
+  mailbox takes 3 s to answer. Coalesces queued requests so a
+  busy slow-tick can't pile up a backlog of scans.
+- **`errors::Severity { Info, Warn }`** — two-tier classification
+  for non-fatal events. `Warn` keeps the loud red `⚠ (N err)`
+  treatment; `Info` renders as a quieter yellow `ℹ` and does NOT
+  count toward the lifetime error total. Honest signal, no
+  panic-by-styling.
+- **`ErrorRing::push_info`** sibling to `push`. The 30-odd
+  existing call sites that meant "this is a real warning" stay
+  on `push` and get the same red treatment they always had.
+- **`temp::PollOutput { infos, errors }`** — explicit named
+  struct instead of returning a bare tuple, so the call site in
+  `App::tick` reads `for (k, m) in out.infos { push_info(...) }
+  for (k, m) in out.errors { push(...) }` and the routing is
+  obvious.
+
+### Changed
+
+- **`q` now quits from any non-`Filter` mode.** Previously the
+  global guard required `InputMode::Normal`; now Help / Confirm
+  also exit on `q`. Only the filter prompt still treats `q` as
+  literal text (because that's what the user is typing). Aligns
+  with what the footer advertises.
+- **Slow temp scan moved off the UI thread.** `App::new` spawns
+  `TempWorker` and primes the first scan; `App::tick` polls
+  results on every tick and routes them to the right severity.
+  The `Tracker::snapshot` adapter (the old single-tier sync API)
+  is gone — only the channel-friendly `scan` remains.
+- **Footer `(N err)` counts only `Warn` events.** Parked sensors,
+  throttled scanners, and other self-protection notices still
+  appear in the badge area but no longer poison the cumulative
+  count.
+- **`Tracker::snapshot` removed.** Direct callers were already
+  zero in production code; the only caller (a unit test) now
+  uses `scan()` directly. `ErrorRing` import dropped from
+  `temp.rs`.
+
+### Tests
+
+- 117 passing (was 111, +6):
+  - `temp_worker_initial_readings_are_empty_until_first_poll`
+  - `temp_worker_poll_returns_results_after_request`
+  - `temp_worker_request_is_idempotent_while_in_flight`
+  - `push_uses_warn_severity_by_default`
+  - `push_info_does_not_count_toward_error_total`
+  - `push_warn_and_info_count_separately`
+
+### Fixed
+
+- `q` not quitting from Help / Confirm modes.
+- 3-second UI freeze on startup when `acpitz` (or any other slow
+  hwmon sensor) was present.
+- `⚠ (1 err)` badge persisting after a parked-sensor info event,
+  misrepresenting a successful self-heal as an ongoing failure.
+- **"Where are the CPU / GPU charts?"** — the per-core spectrum
+  (sparkline + live % + gauge per core) was off by default and
+  the `H` toggle was gated to Procs view, so a user defaulting
+  into Vms had no path to see the impressive layout. Now
+  spectrum is **on** by default, `H` works from any view, and
+  the toggle is advertised in the help bar with a state-aware
+  label (`H spectrum` / `H grid`).
+- **Vms history-strip threshold** lowered from 28 → 22 rows so
+  the CPU / MEM / NET / GPU sparklines render on typical 24-row
+  SSH sessions instead of being silently suppressed.
+
+### Repository hygiene
+
+- **README CI badge** removed — the repo is private, so GitHub's
+  badge endpoint always returns 404 to anonymous viewers. Re-add
+  the line when / if the repo is flipped public.
+- **GitHub slug typo** fixed across `README.md`, `Cargo.toml`,
+  `CHANGELOG.md`, and `PLAN.md`: `nt2311` → `nt2311-vn`.
+
 ## [0.13.0] — 2026-04-25
 
 The "charts everywhere + readable container names" release. Two
@@ -917,17 +1143,17 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.13.0...HEAD
-[0.13.0]: https://github.com/nt2311/neotop/compare/v0.12.0...v0.13.0
-[0.12.0]: https://github.com/nt2311/neotop/compare/v0.11.0...v0.12.0
-[0.11.0]: https://github.com/nt2311/neotop/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/nt2311/neotop/compare/v0.9.0...v0.10.0
-[0.9.0]: https://github.com/nt2311/neotop/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/nt2311/neotop/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/nt2311/neotop/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/nt2311/neotop/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/nt2311/neotop/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/nt2311/neotop/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/nt2311/neotop/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/nt2311/neotop/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/nt2311/neotop/releases/tag/v0.1.0
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/nt2311-vn/neotop/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/nt2311-vn/neotop/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/nt2311-vn/neotop/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/nt2311-vn/neotop/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/nt2311-vn/neotop/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/nt2311-vn/neotop/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/nt2311-vn/neotop/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/nt2311-vn/neotop/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/nt2311-vn/neotop/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/nt2311-vn/neotop/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/nt2311-vn/neotop/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/nt2311-vn/neotop/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/nt2311-vn/neotop/releases/tag/v0.1.0

@@ -1,5 +1,8 @@
 /target
-Cargo.lock
+# Cargo.lock IS committed: neotop is a binary crate, so locking
+# the exact dependency set is what guarantees reproducible CI
+# builds (`cargo --locked`) and bisects. The Cargo book recommends
+# tracking it for binaries and excluding it only for libraries.
 .DS_Store
 *.swp
 *.swo

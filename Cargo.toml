@@ -1,13 +1,13 @@
 [package]
 name = "neotop"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/nt2311/neotop"
-description = "Live terminal observer for neosandbox microVMs and the host running them"
+repository = "https://github.com/nt2311-vn/neotop"
+description = "Linux TUI for host metrics, processes, and GPU activity (CPU spectrum, NVIDIA + AMD GPU, container groups)"
 authors = ["nt2311"]
-keywords = ["tui", "monitor", "kvm", "microvm"]
+keywords = ["tui", "monitor", "process", "system", "gpu"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 
@@ -18,8 +18,6 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 anyhow = "1"
 rustix = { version = "0.38", features = ["param", "process"] }
 # Optional: NVIDIA management library bindings. The crate dlopens

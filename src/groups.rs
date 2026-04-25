@@ -31,6 +31,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,54 +103,45 @@ pub(crate) struct Container {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Group {
     Container(Container),
+    Vm(crate::vm::VmInfo),
     Runtime(Lang),
     System,
     Native,
 }
 
 impl Group {
-    /// Compact label for the group header row. Distinct prefix per
-    /// kind so the eye instantly separates `docker:abc12` from
-    /// `java` from `system`.
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Container(c) => format!("{}:{}", c.runtime.label(), c.id),
+            Self::Vm(v) => v.label(),
             Self::Runtime(l) => l.label().to_string(),
             Self::System => "system".into(),
             Self::Native => "native".into(),
         }
     }
 
-    /// Stable ordering key. Containers first (most actionable for
-    /// developers), then language runtimes, then system, then native.
-    /// Within each band, the label provides a deterministic sub-order.
+    /// Stable order: container > vm > runtime > system > native.
     pub(crate) fn sort_key(&self) -> String {
         match self {
             Self::Container(c) => format!("0_{}_{}", c.runtime.label(), c.id),
-            Self::Runtime(l) => format!("1_{}", l.label()),
-            Self::System => "2_system".into(),
-            Self::Native => "3_native".into(),
+            Self::Vm(v) => format!("1_{}_{}", v.hypervisor.label(), v.name),
+            Self::Runtime(l) => format!("2_{}", l.label()),
+            Self::System => "3_system".into(),
+            Self::Native => "4_native".into(),
         }
     }
 
-    /// Quick band check — used by the renderer to colour container
-    /// headers (cyan) differently from runtime headers (yellow) etc.
     pub(crate) fn band(&self) -> GroupBand {
         match self {
             Self::Container(_) => GroupBand::Container,
+            Self::Vm(_) => GroupBand::Vm,
             Self::Runtime(_) => GroupBand::Runtime,
             Self::System => GroupBand::System,
             Self::Native => GroupBand::Native,
         }
     }
 
-    /// Display label that consults the `ContainerNames` cache so
-    /// container groups surface the human-readable name (e.g.
-    /// `docker:myapp`) instead of the raw 12-char short hash. Falls
-    /// back to `label()` for non-container groups and for containers
-    /// the user hasn't named (anonymous `docker run` invocations get
-    /// auto-generated names like `quirky_einstein` either way, but
-    /// before `docker ps` has been polled the map is empty).
+    /// Same as `label()`, but resolves container short-IDs to names.
     pub(crate) fn label_with_names(&self, names: &ContainerNames) -> String {
         match self {
             Self::Container(c) => match names.lookup(&c.id) {
@@ -160,23 +153,23 @@ impl Group {
     }
 }
 
-/// Coarser bucket for header colouring. Pulled out so the renderer
-/// doesn't have to match on the inner `Container` / `Lang` to choose
-/// a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum GroupBand {
     Container,
+    Vm,
     Runtime,
     System,
     #[default]
     Native,
 }
 
-/// Top-level classifier: container > runtime > system > native, in
-/// that priority order.
+/// Top-level classifier: container > vm > runtime > system > native.
 pub(crate) fn classify_process(cmdline: &str, cgroup: Option<&str>) -> Group {
     if let Some(c) = cgroup.and_then(parse_container_cgroup) {
         return Group::Container(c);
+    }
+    if let Some(vm) = crate::vm::detect(cmdline) {
+        return Group::Vm(vm);
     }
     if let Some(lang) = classify_lang(cmdline) {
         return Group::Runtime(lang);
@@ -404,87 +397,142 @@ fn short(id: &str) -> String {
 // Container-name resolution
 // -----------------------------------------------------------------------------
 
-/// How long a `docker ps` / `podman ps` snapshot stays valid before
-/// we re-poll. 5 s is the same trade-off other tools make: containers
-/// don't churn at sub-second rates in normal use, and we'd rather
-/// pay one fork+exec every few seconds than every render frame.
+/// TTL for a `docker ps` / `podman ps` snapshot.
 const NAME_CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// Maps container ID (full 64-char SHA-256 from `docker ps
-/// --no-trunc`) to the human-readable container name. Refreshed on
-/// a slow tick by shelling out to the runtime CLIs. The shell-out
-/// costs ~5 ms per tool when the daemon is up and is silent (`status
-/// != 0` swallowed) when it isn't — that way neotop doesn't grow a
-/// hard runtime dependency.
-#[derive(Debug, Default)]
+/// Off-thread cache of container ID → name. The runtime CLIs
+/// (`docker ps`, `podman ps`) can block for seconds when their
+/// daemon is unhealthy; doing that on the UI thread froze the whole
+/// app. The worker isolates the shell-out and a 1-second per-call
+/// hard timeout caps the worst case even when the daemon is wedged.
 pub(crate) struct ContainerNames {
-    /// Full-length container ID → name. We store the full 64-char
-    /// hash because cgroup paths can carry either form (modern
-    /// docker uses the full sha; podman trims to short ids in some
-    /// systemd unit names) and we resolve via prefix match either
-    /// way.
+    request_tx: mpsc::Sender<()>,
+    result_rx: mpsc::Receiver<HashMap<String, String>>,
+    in_flight: bool,
+    last_request: Option<Instant>,
     map: HashMap<String, String>,
-    last_refresh: Option<Instant>,
+}
+
+impl Default for ContainerNames {
+    fn default() -> Self {
+        Self::spawn()
+    }
 }
 
 impl ContainerNames {
-    /// Re-poll if the cache is stale (older than `NAME_CACHE_TTL`).
-    /// Cheap to call every tick; only actually shells out when the
-    /// TTL has elapsed.
-    pub(crate) fn refresh_if_stale(&mut self, now: Instant) {
-        // `Option::is_none_or` would read more naturally here but
-        // it's only stable since 1.82 and our MSRV is 1.80; the
-        // `map_or(true, ..)` shape is the equivalent on older
-        // toolchains.
-        let stale = self
-            .last_refresh
-            .map_or(true, |t| now.duration_since(t) >= NAME_CACHE_TTL);
-        if stale {
-            self.refresh_now(now);
-        }
-    }
-
-    fn refresh_now(&mut self, now: Instant) {
-        self.last_refresh = Some(now);
-        let mut map = HashMap::new();
-        for &cli in &["docker", "podman"] {
-            // `--no-trunc` gives us the full 64-char SHA so we can
-            // resolve against either short (12) or full IDs from
-            // `/proc/<pid>/cgroup`. The format string is the same
-            // for both runtimes.
-            let out = Command::new(cli)
-                .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    if let Ok(s) = std::str::from_utf8(&o.stdout) {
-                        for (id, name) in parse_ps_lines(s) {
-                            map.insert(id.to_string(), name.to_string());
-                        }
+    pub(crate) fn spawn() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<()>();
+        let (res_tx, res_rx) = mpsc::channel::<HashMap<String, String>>();
+        thread::Builder::new()
+            .name("neotop-ctnames".into())
+            .spawn(move || {
+                while req_rx.recv().is_ok() {
+                    while req_rx.try_recv().is_ok() {}
+                    let map = poll_runtimes();
+                    if res_tx.send(map).is_err() {
+                        return;
                     }
                 }
-            }
+            })
+            .expect("spawn container-names worker");
+        Self {
+            request_tx: req_tx,
+            result_rx: res_rx,
+            in_flight: false,
+            last_request: None,
+            map: HashMap::new(),
         }
-        self.map = map;
     }
 
-    /// Resolve `id` to the human-readable name. Accepts either a
-    /// 12-char short hash (the form `Container::id` carries) or a
-    /// full 64-char SHA. Returns `None` if no matching container is
-    /// known to the daemons we polled.
+    /// Queue a refresh if the TTL has elapsed and no request is in
+    /// flight. Always non-blocking — the worker thread does the
+    /// shell-out.
+    pub(crate) fn refresh_if_stale(&mut self, now: Instant) {
+        let stale = self
+            .last_request
+            .map_or(true, |t| now.duration_since(t) >= NAME_CACHE_TTL);
+        if stale && !self.in_flight && self.request_tx.send(()).is_ok() {
+            self.in_flight = true;
+            self.last_request = Some(now);
+        }
+        if let Ok(m) = self.result_rx.try_recv() {
+            self.map = m;
+            self.in_flight = false;
+        }
+    }
+
+    /// Resolve a 12-char short hash or full SHA to the human-readable
+    /// name. Returns `None` if no daemon polled has reported it.
     pub(crate) fn lookup(&self, id: &str) -> Option<&str> {
         if let Some(name) = self.map.get(id) {
-            return Some(name);
+            return Some(name.as_str());
         }
-        // Treat `id` as a prefix and look for a stored full SHA
-        // that starts with it. O(n) over the map but n is "running
-        // containers", which is rarely above 50.
         for (full, name) in &self.map {
             if full.starts_with(id) {
-                return Some(name);
+                return Some(name.as_str());
             }
         }
         None
+    }
+}
+
+// mpsc Sender / Receiver aren't Debug, so we surface only the
+// fields a human cares about (cache size + in-flight flag).
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for ContainerNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerNames")
+            .field("entries", &self.map.len())
+            .field("in_flight", &self.in_flight)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Worker-thread body: shell out to docker / podman with a hard
+/// timeout each, parse, return a merged map.
+fn poll_runtimes() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for cli in ["docker", "podman"] {
+        if let Some(stdout) = run_with_timeout(cli, Duration::from_secs(1)) {
+            for (id, name) in parse_ps_lines(&stdout) {
+                map.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Run `<cli> ps --no-trunc --format '{{.ID}} {{.Names}}'` with a
+/// hard wall-clock cap. Spawning + polling `try_wait` keeps a wedged
+/// daemon from pinning the worker thread for minutes.
+fn run_with_timeout(cli: &str, timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(cli)
+        .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut buf = String::new();
+                child.stdout.take()?.read_to_string(&mut buf).ok()?;
+                return Some(buf);
+            }
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 }
 

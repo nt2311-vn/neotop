@@ -428,12 +428,8 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// Average busy % across every GPU that reports a real number.
-/// Used by the host-history feeder so the GPU sparkline tracks
-/// aggregate pressure on multi-card boxes (rare on laptops, common
-/// on workstations). NVIDIA / Intel cards we don't have real
-/// metrics for are excluded from the average rather than zero-
-/// filled — zero would lie about the workstation's true load.
+/// Average busy % across GPUs that report a number. Cards without
+/// metrics are excluded, not zero-filled.
 pub(crate) fn aggregate_busy_pct(gpus: &[Gpu]) -> Option<f64> {
     let with_data: Vec<f64> = gpus.iter().filter_map(|g| g.busy_pct).collect();
     if with_data.is_empty() {
@@ -441,6 +437,28 @@ pub(crate) fn aggregate_busy_pct(gpus: &[Gpu]) -> Option<f64> {
     }
     #[allow(clippy::cast_precision_loss)]
     Some(with_data.iter().sum::<f64>() / with_data.len() as f64)
+}
+
+/// Aggregate VRAM utilisation: sum(used) / sum(total) × 100. `None`
+/// when no card reports a non-zero total.
+pub(crate) fn aggregate_vram_pct(gpus: &[Gpu]) -> Option<f64> {
+    let (used, total) = gpus.iter().fold((0u64, 0u64), |(u, t), g| {
+        (u + g.vram_used, t + g.vram_total)
+    });
+    if total == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some((used as f64 / total as f64) * 100.0)
+}
+
+/// Sum power draw across cards reporting watts. `None` when none do.
+pub(crate) fn aggregate_power_watts(gpus: &[Gpu]) -> Option<f64> {
+    let watts: Vec<f64> = gpus.iter().filter_map(|g| g.power_watts).collect();
+    if watts.is_empty() {
+        return None;
+    }
+    Some(watts.iter().sum())
 }
 
 /// Build the synthetic Gpu we'd produce for a given AMD card given
