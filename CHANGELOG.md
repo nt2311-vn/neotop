@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-04-25
+
+NVIDIA support lights up. v0.8.0 detected NVIDIA cards but
+displayed `(driver pending)`; v0.9.0 actually reads them via
+NVML (NVIDIA Management Library), so a hybrid laptop with a
+T1000 dGPU now shows real busy %, VRAM, and (where supported)
+power draw, all 1 Hz alongside the rest.
+
+### Added
+
+- **`nvml-wrapper` dependency** (gated behind a default-on `nvml`
+  feature). The crate dlopens `libnvidia-ml.so` at runtime, so
+  the binary still builds and runs on machines without the
+  NVIDIA driver — init failure just leaves NVIDIA cards in
+  detect-only mode. `cargo build --no-default-features` produces
+  a smaller binary on AMD-only / Intel-only systems.
+- **Lazy NVML initialisation** in `gpu::Tracker`. The 50-100 ms
+  `Nvml::init()` cost is paid once on the first slow tick that
+  finds an NVIDIA card; the handle is then reused for the
+  lifetime of the process. AMD-only and Intel-only boxes never
+  pay it at all (the merge step early-exits when no NVIDIA
+  vendor is in the sysfs scan).
+- **PCI bus matching.** sysfs's `device` symlink resolves to a
+  4-hex-domain PCI address (`0000:01:00.0`); NVML returns the
+  8-hex-domain form (`00000000:01:00.0`). New `normalize_pci_addr`
+  helper canonicalises both to the 8-hex form so the lookup
+  `HashMap` matches reliably. Tested for short-domain padding,
+  long-domain pass-through, case + whitespace tolerance, and
+  garbage-input safety (corrupted symlinks return-as-is and
+  simply miss the lookup rather than crash).
+- **Per-device telemetry** for NVIDIA via NVML:
+  - `Device::utilization_rates().gpu` → `busy_pct`
+  - `Device::memory_info()` → `vram_used` / `vram_total`
+  - `Device::power_usage()` → `power_watts` (milliwatts → W)
+  - `Device::name()` → friendly label (`"NVIDIA T1000"` etc.)
+- **`Gpu.pci_addr` field** carries the canonical PCI address so
+  the merge step doesn't have to re-resolve symlinks. `#[allow(dead_code)]`
+  on the field's UI exposure since it's used only internally.
+
+### Changed
+
+- `gpu::Tracker` is now genuinely stateful (holds the lazy NVML
+  handle in an enum: `Uninit` / `Failed` / `Ready(Box<Nvml>)`).
+  `Box` keeps the variant compact for `clippy::large_enum_variant`.
+- `Gpu` instances representing NVIDIA cards no longer say
+  `(driver pending)` once NVML resolves them — the line shows
+  the real card name and live numbers.
+
+### Tests
+
+- 81 passing (was 77). Four new tests around PCI normalisation:
+  `normalize_pci_addr_pads_short_domain`,
+  `normalize_pci_addr_passes_through_long_domain`,
+  `normalize_pci_addr_lowercases_and_trims`,
+  `normalize_pci_addr_handles_garbage_input`.
+- New `#[ignore]`'d `gpu_live_snapshot` test prints the live
+  tracker output on demand
+  (`cargo test --release -- --ignored gpu_live_snapshot --nocapture`),
+  for verifying NVML matching on novel hardware. Doesn't run in
+  CI because nothing generic to assert.
+- Verified live on the development box: T1000 dGPU populated
+  with 25% busy, 779/4096 MiB VRAM (matching `nvidia-smi`'s
+  view), `power_watts: None` because the T1000 firmware doesn't
+  expose `power_usage()` — surfaced as `None` rather than `0 W`
+  so we never lie about draw.
+
+### Build
+
+- Both feature combinations (`nvml` and `--no-default-features`)
+  are clippy-clean and tested. Release binary 1.07 → 1.18 MiB
+  (+11%, ~120 KB of NVML bindings).
+- Verifying both feature combinations on every CI run is
+  worthwhile; consider adding a `just check-no-default` recipe
+  in v0.10.0+ if it's needed regularly.
+
+### Out of scope (tracked for v0.10.0+)
+
+- Intel via i915 / Xe perf counters (still needs `CAP_PERFMON`).
+- Per-core CPU heatmap (cores × time grid) — the other "thousand
+  words" chart left on the whiteboard since v0.8.0.
+- Themes / TOML config.
+- macOS / Windows ports.
+
 ## [0.8.0] — 2026-04-25
 
 The "charts worth a thousand words" release. The user asked for
@@ -481,7 +564,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/nt2311/neotop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/nt2311/neotop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/nt2311/neotop/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nt2311/neotop/compare/v0.5.0...v0.6.0

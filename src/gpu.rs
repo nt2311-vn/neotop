@@ -1,25 +1,35 @@
-//! gpu.rs — discrete + integrated GPU stats from `/sys/class/drm`.
+//! gpu.rs — discrete + integrated GPU stats.
 //!
-//! Probes every `/sys/class/drm/card*` node, reads its PCI vendor
-//! ID, and dispatches to a per-vendor reader. Today AMD has a real
-//! backend (sysfs is generous: `gpu_busy_percent`, `mem_info_vram_*`,
-//! plus `power1_average` under hwmon). NVIDIA and Intel are
-//! *detected* — we record the card and a friendly label — but their
-//! metrics path is gated behind future work:
+//! Two parallel data sources:
 //!
-//! * **NVIDIA** needs the NVML library via the `nvml-wrapper` crate.
-//!   That's a non-trivial dependency and a separate v0.9.0 release.
-//! * **Intel** Xe / i915 only exposes utilisation through perf
-//!   counters that require root or a dedicated `intel_gpu_top`-style
-//!   Linux capability. Same v0.9.0+ track.
+//! * **sysfs** (`/sys/class/drm/card*`) — universal vendor probe and
+//!   the AMD metrics backend. Free, no extra deps, no privileges.
+//! * **NVML** (NVIDIA Management Library, via the `nvml-wrapper`
+//!   crate, gated behind the default-on `nvml` feature) — real
+//!   metrics for NVIDIA cards. The crate dlopens
+//!   `libnvidia-ml.so` at runtime, so the binary builds and runs
+//!   on machines without the NVIDIA driver; init failure just
+//!   leaves NVIDIA cards in detect-only mode.
 //!
-//! Detecting them here means the user can see "your card is
-//! recognised" instead of silently nothing — a small but real
-//! ergonomic win on hybrid laptops.
+//! Snapshot algorithm:
+//!   1. Walk sysfs, produce a `Gpu` for every `cardN`. AMD cards
+//!      get full metrics; NVIDIA / Intel start as "pending".
+//!   2. If NVML is initialised, build a PCI-bus → device-index
+//!      map from NVML's view, then for every sysfs NVIDIA card
+//!      look up its PCI address and replace the entry with the
+//!      NVML record (real busy %, VRAM, watts).
+//!   3. NVIDIA cards present in sysfs but missing from NVML
+//!      (proprietary driver loaded but the card was hot-disabled,
+//!      runtime PM suspended) stay as detect-only.
 //!
-//! All sysfs reads are best-effort: a card that disappears mid-scan
+//! Intel still has no real backend; its Xe / i915 perf counters
+//! need `CAP_PERFMON` or root and are deferred to a later release.
+//!
+//! All probes are best-effort: a card that disappears mid-scan
 //! (eGPU unplug, runtime PM) is silently skipped, never panics.
 
+#[cfg(feature = "nvml")]
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -78,6 +88,13 @@ pub(crate) struct Gpu {
     /// Instantaneous draw in watts. `None` when no `power1_average`
     /// hwmon node was found under the card.
     pub(crate) power_watts: Option<f64>,
+    /// Canonical PCI bus address (`00000000:01:00.0`). Used to
+    /// match sysfs-discovered NVIDIA cards against the NVML
+    /// `Device` list. `None` when sysfs's `device` symlink wasn't
+    /// resolvable — rare; the merge step falls back to detect-only
+    /// behaviour for those.
+    #[allow(dead_code)]
+    pub(crate) pci_addr: Option<String>,
 }
 
 impl Gpu {
@@ -99,41 +116,142 @@ impl Gpu {
     }
 }
 
-/// Stateful tracker. Today there's nothing to cache between scans
-/// (no slow probes like the temp module's blacklist), but using a
-/// tracker shape from day one means adding NVML / per-engine
-/// caching later doesn't change every call site.
+/// State of the lazy NVML init. We try once on the first
+/// `snapshot()` that finds an NVIDIA card; on success we keep the
+/// handle for the lifetime of the process; on failure we remember
+/// it failed and never retry. Re-initialising NVML costs ~50-100 ms
+/// per call, so caching matters even at the slow tick.
+#[cfg(feature = "nvml")]
+#[derive(Default)]
+enum NvmlState {
+    #[default]
+    Uninit,
+    Failed,
+    // Boxed so the enum stays compact even though `Nvml` itself is
+    // a few hundred bytes of NVML symbol pointers. This is the
+    // `clippy::large_enum_variant` story: without the box the enum
+    // is sized to the largest variant on every `Tracker`.
+    Ready(Box<nvml_wrapper::Nvml>),
+}
+
+// `nvml_wrapper::Nvml` doesn't impl Debug, so derive a manual one
+// that just prints the variant name. The other paths through
+// `Tracker::Debug` print "Tracker { nvml: <state> }" which is
+// fine for our `--diag` output.
+#[cfg(feature = "nvml")]
+impl std::fmt::Debug for NvmlState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Uninit => "Uninit",
+            Self::Failed => "Failed",
+            Self::Ready(_) => "Ready",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Stateful tracker. Holds the (lazily-initialised) NVML handle so
+/// repeated snapshots reuse the same library context — `Nvml::init`
+/// is itself a 50-100 ms call we don't want on the hot path. AMD's
+/// sysfs reads are stateless and don't need caching.
 #[derive(Debug, Default)]
-pub(crate) struct Tracker {}
+pub(crate) struct Tracker {
+    #[cfg(feature = "nvml")]
+    nvml: NvmlState,
+}
 
 impl Tracker {
-    // `clippy::unused_self`: the empty `&mut self` here is
-    // deliberate — future backends (NVML handle reuse, slow-sensor
-    // blacklisting like `temp::Tracker`) will need it. Forcing the
-    // call site to migrate later is the larger evil.
-    #[allow(clippy::unused_self)]
+    // `clippy::unused_self`: when the `nvml` feature is off, this
+    // method genuinely doesn't read `self` — but with the default
+    // feature on it does. Using `&mut self` unconditionally keeps
+    // the call site stable across feature combinations.
+    #[cfg_attr(not(feature = "nvml"), allow(clippy::unused_self))]
     pub(crate) fn snapshot(&mut self) -> Vec<Gpu> {
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir("/sys/class/drm") else {
-            return out;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let Some(name) = name.to_str() else { continue };
-            // Only `cardN` nodes — skip connector subdirs like
-            // `card1-DP-1` (those have `-` in them) and the
-            // `renderD128` dri-render device which doesn't carry
-            // GPU stats.
-            if !is_real_card_node(name) {
-                continue;
-            }
-            let dev = e.path().join("device");
-            if let Some(g) = read_one(&dev) {
-                out.push(g);
-            }
-        }
+        // The `mut` is used by the `nvml` cfg branch below.
+        #[allow(unused_mut)]
+        let mut out = scan_sysfs_cards();
+        #[cfg(feature = "nvml")]
+        self.merge_nvml(&mut out);
         out
     }
+
+    /// For each NVIDIA card we found via sysfs, replace the
+    /// detect-only entry with a real NVML reading when possible.
+    /// Cards that are in sysfs but not in NVML's view (driver
+    /// suspended, hot-disabled) are left as-is so the host
+    /// overview still shows "the card exists".
+    #[cfg(feature = "nvml")]
+    fn merge_nvml(&mut self, gpus: &mut [Gpu]) {
+        // Skip entirely when there are no NVIDIA cards — saves the
+        // 50-100 ms NVML init cost on AMD-only / Intel-only boxes.
+        if !gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
+            return;
+        }
+        let Some(nvml) = self.ensure_nvml() else {
+            return;
+        };
+        let pci_to_idx = build_nvml_pci_map(nvml);
+        if pci_to_idx.is_empty() {
+            return;
+        }
+        for g in gpus.iter_mut() {
+            if g.vendor != GpuVendor::Nvidia {
+                continue;
+            }
+            // We stored the canonical PCI addr alongside the card
+            // when we walked sysfs. If we didn't manage to read it
+            // (rare; would need a permission error on the symlink),
+            // we just leave the card as detect-only.
+            let Some(addr) = &g.pci_addr else { continue };
+            let Some(&idx) = pci_to_idx.get(addr) else {
+                continue;
+            };
+            let Ok(dev) = nvml.device_by_index(idx) else {
+                continue;
+            };
+            *g = read_nvml_device(&dev, g.pci_addr.clone());
+        }
+    }
+
+    #[cfg(feature = "nvml")]
+    fn ensure_nvml(&mut self) -> Option<&nvml_wrapper::Nvml> {
+        if matches!(self.nvml, NvmlState::Uninit) {
+            self.nvml = match nvml_wrapper::Nvml::init() {
+                Ok(n) => NvmlState::Ready(Box::new(n)),
+                Err(_) => NvmlState::Failed,
+            };
+        }
+        match &self.nvml {
+            NvmlState::Ready(n) => Some(n.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+/// Walk `/sys/class/drm` once and produce the baseline `Gpu` list.
+/// Every detected card is in here; NVIDIA / Intel start as detect-
+/// only and may be promoted by the NVML merge pass.
+fn scan_sysfs_cards() -> Vec<Gpu> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only `cardN` nodes — skip connector subdirs like
+        // `card1-DP-1` (those have `-` in them) and the
+        // `renderD128` dri-render device which doesn't carry
+        // GPU stats.
+        if !is_real_card_node(name) {
+            continue;
+        }
+        let dev = e.path().join("device");
+        if let Some(g) = read_one(&dev) {
+            out.push(g);
+        }
+    }
+    out
 }
 
 fn is_real_card_node(name: &str) -> bool {
@@ -144,9 +262,10 @@ fn read_one(dev: &Path) -> Option<Gpu> {
     let vendor_raw = fs::read_to_string(dev.join("vendor")).ok()?;
     let vendor = GpuVendor::from_pci_id(&vendor_raw);
     let name = device_label(dev, vendor);
+    let pci_addr = sysfs_pci_addr(dev);
 
     match vendor {
-        GpuVendor::Amd => Some(read_amd(dev, name)),
+        GpuVendor::Amd => Some(read_amd(dev, name, pci_addr)),
         GpuVendor::Nvidia | GpuVendor::Intel | GpuVendor::Other => Some(Gpu {
             vendor,
             name,
@@ -154,8 +273,83 @@ fn read_one(dev: &Path) -> Option<Gpu> {
             vram_used: 0,
             vram_total: 0,
             power_watts: None,
+            pci_addr,
         }),
     }
+}
+
+/// Resolve the sysfs `device` symlink to its PCI bus address.
+/// `/sys/class/drm/card2/device` → `…/0000:01:00.0`. We strip
+/// everything but the final segment and normalise to the 8-hex-
+/// digit-domain form so it can be compared against NVML directly.
+fn sysfs_pci_addr(dev: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(dev).ok()?;
+    let last = canonical.file_name()?.to_str()?;
+    Some(normalize_pci_addr(last))
+}
+
+/// Build a lookup from canonical PCI bus address to NVML device
+/// index. Cheap to rebuild every snapshot (handful of devices,
+/// each `pci_info()` call is microseconds).
+#[cfg(feature = "nvml")]
+fn build_nvml_pci_map(nvml: &nvml_wrapper::Nvml) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    let count = nvml.device_count().unwrap_or(0);
+    for i in 0..count {
+        let Ok(dev) = nvml.device_by_index(i) else {
+            continue;
+        };
+        let Ok(pci) = dev.pci_info() else { continue };
+        map.insert(normalize_pci_addr(&pci.bus_id), i);
+    }
+    map
+}
+
+/// Read every metric NVML exposes for a device, with each call
+/// independently optional — NVIDIA's smaller cards (T1000, MX-class)
+/// don't implement `power_usage()` and return `NotSupported` rather
+/// than zero, so we surface that as `power_watts: None` rather than
+/// claiming the card draws 0 W.
+#[cfg(feature = "nvml")]
+fn read_nvml_device(dev: &nvml_wrapper::Device<'_>, pci_addr: Option<String>) -> Gpu {
+    // `name()` returns e.g. "NVIDIA T1000". Cap to the same 32 chars
+    // every other vendor's name goes through.
+    let name = dev.name().ok().map_or_else(
+        || GpuVendor::Nvidia.label().to_string(),
+        |s| truncate(&s, 32),
+    );
+    let busy_pct = dev.utilization_rates().ok().map(|u| f64::from(u.gpu));
+    let mem = dev.memory_info().ok();
+    let vram_used = mem.as_ref().map_or(0, |m| m.used);
+    let vram_total = mem.as_ref().map_or(0, |m| m.total);
+    let power_watts = dev.power_usage().ok().map(|mw| f64::from(mw) / 1000.0);
+    Gpu {
+        vendor: GpuVendor::Nvidia,
+        name,
+        busy_pct,
+        vram_used,
+        vram_total,
+        power_watts,
+        pci_addr,
+    }
+}
+
+/// Normalise a PCI bus identifier to the lowercase
+/// `domain:bus:device.function` form with an 8-hex-digit domain.
+///
+/// NVML returns the 8-hex form (`00000000:01:00.0`); sysfs
+/// `realpath` returns the 4-hex form (`0000:01:00.0`). Picking the
+/// 8-hex form as canonical means we can `Eq`-compare them in a
+/// `HashMap` without further string surgery.
+fn normalize_pci_addr(raw: &str) -> String {
+    let s = raw.trim().to_lowercase();
+    let Some((domain, rest)) = s.split_once(':') else {
+        return s;
+    };
+    // Pad to 8 hex chars without truncating an already-8-char
+    // domain. `format!("{:0>8}", domain)` does exactly this.
+    let padded = format!("{domain:0>8}");
+    format!("{padded}:{rest}")
 }
 
 /// Best-effort device name. We try, in order:
@@ -181,7 +375,7 @@ fn device_label(dev: &Path, vendor: GpuVendor) -> String {
 /// AMD-specific reader. Every node here is amdgpu-driver-private but
 /// stable across kernels going back to 5.x. Each is independently
 /// optional; we surface whatever we got.
-fn read_amd(dev: &Path, name: String) -> Gpu {
+fn read_amd(dev: &Path, name: String, pci_addr: Option<String>) -> Gpu {
     let busy_pct = read_trim(&dev.join("gpu_busy_percent"))
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|p| (0.0..=100.0).contains(p));
@@ -199,6 +393,7 @@ fn read_amd(dev: &Path, name: String) -> Gpu {
         vram_used,
         vram_total,
         power_watts,
+        pci_addr,
     }
 }
 
@@ -279,6 +474,7 @@ fn parse_amd_for_test(
         vram_used,
         vram_total,
         power_watts,
+        pci_addr: None,
     }
 }
 
@@ -368,6 +564,7 @@ mod tests {
                 vram_used: 0,
                 vram_total: 0,
                 power_watts: None,
+                pci_addr: None,
             },
             // No backend — no busy data — must not skew the average.
             Gpu {
@@ -377,6 +574,7 @@ mod tests {
                 vram_used: 0,
                 vram_total: 0,
                 power_watts: None,
+                pci_addr: None,
             },
             Gpu {
                 vendor: GpuVendor::Amd,
@@ -385,6 +583,7 @@ mod tests {
                 vram_used: 0,
                 vram_total: 0,
                 power_watts: None,
+                pci_addr: None,
             },
         ];
         // Average over the two AMD cards = 45%.
@@ -400,7 +599,56 @@ mod tests {
             vram_used: 0,
             vram_total: 0,
             power_watts: None,
+            pci_addr: None,
         }];
         assert_eq!(aggregate_busy_pct(&gpus), None);
+    }
+
+    #[test]
+    fn normalize_pci_addr_pads_short_domain() {
+        // Sysfs's `realpath /sys/.../device` form: 4-hex domain.
+        assert_eq!(normalize_pci_addr("0000:01:00.0"), "00000000:01:00.0");
+    }
+
+    #[test]
+    fn normalize_pci_addr_passes_through_long_domain() {
+        // NVML's `pci_info().bus_id` form: already 8-hex domain.
+        assert_eq!(normalize_pci_addr("00000000:01:00.0"), "00000000:01:00.0");
+    }
+
+    #[test]
+    fn normalize_pci_addr_lowercases_and_trims() {
+        // Some sources uppercase the hex; whitespace can sneak in
+        // from sysfs file reads. Both must collapse to the same
+        // canonical form so the HashMap lookup hits.
+        assert_eq!(normalize_pci_addr(" 0000:01:00.0 \n"), "00000000:01:00.0");
+        assert_eq!(normalize_pci_addr("0000:01:00.A"), "00000000:01:00.a");
+    }
+
+    #[test]
+    fn normalize_pci_addr_handles_garbage_input() {
+        // Anything without a colon at all gets returned untouched
+        // (lowercased + trimmed). Means a corrupted sysfs symlink
+        // can't crash us, just won't match anything in the NVML map.
+        assert_eq!(normalize_pci_addr("not-a-pci-addr"), "not-a-pci-addr");
+    }
+
+    /// Live smoke: prints the tracker's view of the host's GPUs.
+    /// Ignored by default because the result is hardware-specific
+    /// — nothing to assert generically. Run on demand with
+    /// `cargo test --features nvml -- --ignored gpu_live_snapshot
+    /// --nocapture`.
+    #[test]
+    #[ignore = "live: prints actual hardware state"]
+    fn gpu_live_snapshot() {
+        let mut t = Tracker::default();
+        let gpus = t.snapshot();
+        println!("--- live GPUs ({}) ---", gpus.len());
+        for g in &gpus {
+            println!(
+                "{:?}  name={:?}  busy={:?}  vram={}/{}  power={:?}  pci={:?}",
+                g.vendor, g.name, g.busy_pct, g.vram_used, g.vram_total, g.power_watts, g.pci_addr,
+            );
+        }
     }
 }

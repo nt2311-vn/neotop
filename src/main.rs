@@ -3241,6 +3241,7 @@ mod tests {
             vram_used: 0,
             vram_total: 0,
             power_watts: None,
+            pci_addr: None,
         }];
         assert_eq!(host_overview_rows(&one_gpu), 4);
     }
