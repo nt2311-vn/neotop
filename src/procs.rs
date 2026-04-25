@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
+use crate::groups::{self, Group};
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessRow {
     pub(crate) pid: i32,
@@ -54,6 +56,11 @@ pub(crate) struct ProcessRow {
     /// Full command line if readable, else the kernel `comm` (15-char
     /// name). We skip kernel threads (cmdline empty + parent 2).
     pub(crate) command: String,
+    /// Developer-meaningful group: container > language runtime >
+    /// system > native. Computed once per pid (cmdline and cgroup
+    /// don't change across exec) and cached alongside the rest of
+    /// `StaticInfo`.
+    pub(crate) group: Group,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,12 +100,16 @@ pub(crate) fn ema_blend(prev: f64, new: f64) -> f64 {
 
 /// Stable per-pid data that doesn't change after exec. Cached across
 /// ticks so steady-state we only read `/proc/<pid>/stat`, not
-/// `cmdline` or `status`.
+/// `cmdline`, `status`, or `cgroup`.
 #[derive(Debug, Clone)]
 struct StaticInfo {
     uid: u32,
     user: String,
     command: String,
+    /// Developer-meaningful classification — container, language
+    /// runtime, system, or native. Derived once from the cmdline +
+    /// `/proc/<pid>/cgroup` and reused for the lifetime of the pid.
+    group: Group,
 }
 
 #[derive(Debug)]
@@ -219,12 +230,19 @@ impl Tracker {
                     .trim()
                     .to_string()
             };
+            // Read /proc/<pid>/cgroup once per pid for container
+            // classification. Empty / missing on hosts that don't run
+            // a cgroup-enabled init or for kernel threads — in either
+            // case the classifier falls through to System / Native.
+            let cgroup_raw = fs::read_to_string(format!("{base}/cgroup")).ok();
+            let group = groups::classify_process(&command, cgroup_raw.as_deref());
             self.cache.insert(
                 pid,
                 StaticInfo {
                     uid,
                     user: passwd.lookup(uid),
                     command: truncate(&command, 200),
+                    group,
                 },
             );
             &self.cache[&pid]
@@ -269,6 +287,7 @@ impl Tracker {
                 rss_bytes,
                 threads,
                 command: info.command.clone(),
+                group: info.group.clone(),
             },
             jiffies,
         ))
@@ -497,6 +516,7 @@ mod tests {
             rss_bytes: 0,
             threads: 1,
             command: "/usr/bin/BASH".into(),
+            group: Group::Native,
         };
         assert!(matches(&row, "bash"));
         assert!(matches(&row, "ALICE"));
@@ -575,6 +595,7 @@ mod tests {
             rss_bytes: 0,
             threads: 1,
             command: "café-server".into(),
+            group: Group::Native,
         };
         assert!(matches(&row, "café"));
         assert!(matches(&row, "CAF")); // ascii prefix still matches
@@ -609,6 +630,7 @@ alice:x:1000:1000::/home/alice:/bin/zsh
             rss_bytes: rss_kb * 1024,
             threads: 1,
             command: format!("cmd{pid}"),
+            group: Group::Native,
         }
     }
 }

@@ -207,6 +207,9 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Per-core CPU **spectrum view** (sparkline + % + gauge per core) — shipped in 0.11.0
 - [x] GPU gauges (busy + VRAM, inline with the host overview) — shipped in 0.11.0
 - [x] Time-axis tick label on the spectrum (`-Ns ── now`) — shipped in 0.11.0
+- [x] **Process groups** (`g` to toggle): cluster by container / language runtime / system / native, with totals — shipped in 0.12.0
+- [ ] Container-name resolution (`docker ps` / `podman ps` integration)
+- [ ] Go / Rust runtime detection via ELF section scan
 - [ ] Intel via `intel_gpu_top`-style perf counters
 - [ ] Themes / layout config (TOML)
 - [ ] SMT / NUMA grouping in the spectrum view

@@ -26,6 +26,7 @@
 //!     x             (Vms)   delete state file of the selected halted vm
 //!     s             (Procs) cycle sort key (CPU → MEM → PID → CMD)
 //!     t             (Procs) toggle tree view (parent → children)
+//!     g             (Procs) toggle group view (cluster by container / language / system / native)
 //!     H             (Procs) toggle per-core CPU spectrum (sparkline + % + gauge per core)
 //!     /             (Procs) enter filter mode (Esc to clear, Enter to confirm)
 //!     K             (Procs) send SIGTERM to selected pid (with confirm)
@@ -35,6 +36,7 @@ mod battery;
 mod disk;
 mod errors;
 mod gpu;
+mod groups;
 mod host;
 mod net;
 mod proc;
@@ -568,10 +570,12 @@ struct App {
     procs_table: TableState,
     procs_sort: procs::SortBy,
     procs_filter: String,
-    /// When true, the procs table renders as a parent → children tree
-    /// instead of the sortable flat list. Sort and filter are ignored
-    /// in tree mode (a future iteration may layer them back on).
-    tree_mode: bool,
+    /// How the procs body is laid out: `Flat` is the sortable
+    /// htop-style list (default), `Tree` shows the parent → children
+    /// hierarchy, and `Group` clusters processes by container /
+    /// language runtime / system / native with aggregated header
+    /// rows. Toggled with `t` (Tree ↔ Flat) and `g` (Group ↔ Flat).
+    list_mode: ListMode,
     /// When true, the per-core CPU panel is replaced by the
     /// "spectrum" view — one row per core combining a 60-second
     /// sparkline, the live %, and a proportional gauge. Toggled
@@ -705,7 +709,7 @@ impl App {
             procs_table,
             procs_sort: procs::SortBy::Cpu,
             procs_filter: String::new(),
-            tree_mode: false,
+            list_mode: ListMode::Flat,
             per_core_spectrum: false,
             prev_host_cpu,
             host_info,
@@ -848,10 +852,16 @@ impl App {
         // chain. The tree's *shape* is preserved either way; sort
         // only reorders siblings, filter only hides leaves whose
         // entire subtree fails to match.
-        self.procs_visible = if self.tree_mode {
-            compute_visible_tree(&self.procs_all, self.procs_sort, &self.procs_filter)
-        } else {
-            compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
+        self.procs_visible = match self.list_mode {
+            ListMode::Tree => {
+                compute_visible_tree(&self.procs_all, self.procs_sort, &self.procs_filter)
+            }
+            ListMode::Group => {
+                compute_visible_grouped(&self.procs_all, self.procs_sort, &self.procs_filter)
+            }
+            ListMode::Flat => {
+                compute_visible_flat(&self.procs_all, self.procs_sort, &self.procs_filter)
+            }
         };
     }
 
@@ -862,11 +872,9 @@ impl App {
     /// then put the cursor on whatever row 0 is now.
     fn reanchor_proc_selection(&mut self, pid: Option<i32>) {
         let Some(pid) = pid else { return };
-        if let Some(new_idx) = self
-            .procs_visible
-            .iter()
-            .position(|r| self.procs_all.get(r.idx).is_some_and(|row| row.pid == pid))
-        {
+        if let Some(new_idx) = self.procs_visible.iter().position(|r| {
+            r.header.is_none() && self.procs_all.get(r.idx).is_some_and(|row| row.pid == pid)
+        }) {
             self.procs_table.select(Some(new_idx));
         }
     }
@@ -894,18 +902,58 @@ impl App {
     fn selected_proc(&self) -> Option<&procs::ProcessRow> {
         let i = self.procs_table.selected()?;
         let r = self.procs_visible.get(i)?;
+        // Group mode emits synthetic header rows that don't map to a
+        // real PID. Kill / detail-pane callers must see `None` for
+        // those so we don't try to SIGTERM a non-process.
+        if r.header.is_some() {
+            return None;
+        }
         self.procs_all.get(r.idx)
     }
 }
 
-/// One rendered row in the Procs table. `idx` indexes back into
-/// `App.procs_all`; `prefix` is the tree-glyph prefix (`""` in flat
-/// mode, e.g. `"│ ├─"` in tree mode) that will be prepended to the
-/// COMMAND cell.
+/// Layout choice for the Procs body. Mutually exclusive — pressing
+/// `t` while in `Group` switches back to `Flat`, and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListMode {
+    /// Sortable htop-style flat list. Default.
+    Flat,
+    /// Parent → children hierarchy with branch glyphs in the prefix.
+    Tree,
+    /// Clustered by container / language runtime / system / native,
+    /// each cluster preceded by a synthetic header row that
+    /// aggregates count, total CPU%, and total RSS.
+    Group,
+}
+
+/// One row of the rendered Procs table. `idx` indexes into
+/// `procs_all`; `prefix` is whatever decoration the layout mode
+/// wants (e.g. `"│ ├─"` in tree mode). When `header` is `Some`,
+/// this is a *synthetic* group-header row — `idx` is meaningless
+/// and the renderer paints the header info instead.
 #[derive(Debug, Clone, Default)]
 struct ProcRender {
     idx: usize,
     prefix: String,
+    /// `Some` → synthetic group header (skipped by selection /
+    /// kill keys); `None` → a real process row.
+    header: Option<GroupHeader>,
+}
+
+/// Aggregated info painted on a `Group` mode header row.
+#[derive(Debug, Clone, Default)]
+struct GroupHeader {
+    /// e.g. `docker:abc12`, `java`, `system`, `native`.
+    label: String,
+    /// `Container`, `Runtime`, `System`, or `Native` — chosen by
+    /// the renderer to colour the header consistently.
+    band: groups::GroupBand,
+    /// Number of member processes in this group.
+    count: usize,
+    /// Sum of `cpu_pct` across members (0..N·100).
+    total_cpu: f64,
+    /// Sum of `rss_bytes` across members.
+    total_rss: u64,
 }
 
 /// Comparator used by both flat and tree paths so the two stay in
@@ -948,6 +996,7 @@ fn compute_visible_flat(
         .map(|idx| ProcRender {
             idx,
             prefix: String::new(),
+            header: None,
         })
         .collect()
 }
@@ -1083,7 +1132,11 @@ fn dfs_tree(
         }
         prefix.push_str(if is_last_sibling { "└─" } else { "├─" });
     }
-    out.push(ProcRender { idx, prefix });
+    out.push(ProcRender {
+        idx,
+        prefix,
+        header: None,
+    });
 
     // Only walk into *alive* children. Because the alive set was
     // computed in advance, a filtered node still hosts visible
@@ -1118,6 +1171,106 @@ fn dfs_tree(
     if push {
         ancestor_last.pop();
     }
+}
+
+/// Group-mode path: cluster surviving rows by `Group` (container >
+/// runtime > system > native), emit a synthetic header row for
+/// each cluster, then the cluster's members. Sort and filter both
+/// apply: filter prunes rows before grouping, and the chosen
+/// `SortBy` orders members within each group **and** orders the
+/// groups themselves (groups with the highest aggregate of the
+/// sort key bubble up first within their band).
+///
+/// Why the band ordering matters: a developer skimming for "what
+/// is my laptop *actually* running right now" wants Docker /
+/// Podman containers at the top because those are the workloads
+/// they explicitly started, then language runtimes (the daemons
+/// the developer actively launched), then system, then native.
+fn compute_visible_grouped(
+    rows: &[procs::ProcessRow],
+    by: procs::SortBy,
+    filter: &str,
+) -> Vec<ProcRender> {
+    // Bucket surviving indices by group key.
+    let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut group_for: HashMap<String, groups::Group> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if !procs::matches(r, filter) {
+            continue;
+        }
+        let key = r.group.sort_key();
+        group_for
+            .entry(key.clone())
+            .or_insert_with(|| r.group.clone());
+        buckets.entry(key).or_default().push(i);
+    }
+
+    // Sort groups by their *band* primarily (the prefix in
+    // `sort_key` already encodes that), then by aggregate of the
+    // chosen sort key descending (CPU / RSS) or ascending (PID /
+    // command — for those, fall back to alphabetic group name to
+    // keep the layout stable).
+    let mut group_keys: Vec<String> = buckets.keys().cloned().collect();
+    group_keys.sort_by(|a, b| {
+        let ag = &buckets[a];
+        let bg = &buckets[b];
+        // Same band? Order by the chosen sort key's aggregate.
+        let a_band = a.chars().next();
+        let b_band = b.chars().next();
+        if a_band != b_band {
+            return a.cmp(b);
+        }
+        match by {
+            procs::SortBy::Cpu => sum_cpu(rows, bg)
+                .partial_cmp(&sum_cpu(rows, ag))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            procs::SortBy::Mem => sum_rss(rows, bg).cmp(&sum_rss(rows, ag)),
+            procs::SortBy::Pid | procs::SortBy::Command => a.cmp(b),
+        }
+    });
+
+    let mut out: Vec<ProcRender> =
+        Vec::with_capacity(buckets.values().map(Vec::len).sum::<usize>() + buckets.len());
+    for key in group_keys {
+        let mut members = buckets.remove(&key).unwrap_or_default();
+        members.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
+        let group = group_for.remove(&key).unwrap_or(groups::Group::Native);
+        let header = GroupHeader {
+            label: group.label(),
+            band: group.band(),
+            count: members.len(),
+            total_cpu: sum_cpu(rows, &members),
+            total_rss: sum_rss(rows, &members),
+        };
+        // Synthetic header row.
+        out.push(ProcRender {
+            idx: usize::MAX,
+            prefix: String::new(),
+            header: Some(header),
+        });
+        // Members indented under the header so the visual grouping
+        // is unambiguous even before colour.
+        for idx in members {
+            out.push(ProcRender {
+                idx,
+                prefix: "  ".to_string(),
+                header: None,
+            });
+        }
+    }
+    out
+}
+
+fn sum_cpu(rows: &[procs::ProcessRow], idxs: &[usize]) -> f64 {
+    idxs.iter()
+        .filter_map(|&i| rows.get(i).and_then(|r| r.cpu_pct))
+        .sum()
+}
+
+fn sum_rss(rows: &[procs::ProcessRow], idxs: &[usize]) -> u64 {
+    idxs.iter()
+        .filter_map(|&i| rows.get(i).map(|r| r.rss_bytes))
+        .sum()
 }
 
 fn run<B: ratatui::backend::Backend>(
@@ -1264,10 +1417,28 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.clamp_selections();
         }
         KeyCode::Char('t') if app.view == View::Procs => {
-            // Tree toggle. Re-anchor by pid so the cursor stays on
-            // the same process after the row order changes.
+            // Tree toggle (Tree ↔ Flat). Pressing `t` from Group
+            // mode also lands on Tree — the user is asking for a
+            // hierarchical view either way. Re-anchor by pid so the
+            // cursor stays on the same process after rows shuffle.
             let pinned = app.selected_proc().map(|r| r.pid);
-            app.tree_mode = !app.tree_mode;
+            app.list_mode = match app.list_mode {
+                ListMode::Tree => ListMode::Flat,
+                _ => ListMode::Tree,
+            };
+            app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
+            app.clamp_selections();
+        }
+        KeyCode::Char('g') if app.view == View::Procs => {
+            // Group toggle (Group ↔ Flat). Same re-anchor logic as
+            // the tree toggle so the cursor follows the pid through
+            // the layout change.
+            let pinned = app.selected_proc().map(|r| r.pid);
+            app.list_mode = match app.list_mode {
+                ListMode::Group => ListMode::Flat,
+                _ => ListMode::Group,
+            };
             app.recompute_procs();
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
@@ -1449,6 +1620,12 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
         kv_line(
             "  t ",
             "toggle tree view (parent → children; sort + filter still apply)",
+            kb,
+            dim,
+        ),
+        kv_line(
+            "  g ",
+            "toggle group view (container / runtime / system / native, with totals)",
             kb,
             dim,
         ),
@@ -1960,6 +2137,22 @@ fn draw_proc_detail(
         lines.push(kv("CPU%", cpu, label));
         lines.push(kv("THREADS", r.threads.to_string(), label));
         lines.push(kv("RSS", proc::human_bytes(r.rss_bytes), label));
+        // GROUP / CONTAINER: developer-meaningful classification.
+        // For container processes show a more explicit label so the
+        // user knows they can run `docker ps` / `podman ps` to
+        // recover the human name; otherwise just the runtime name.
+        match &r.group {
+            groups::Group::Container(c) => {
+                lines.push(kv(
+                    "CONTAINER",
+                    format!("{}:{}", c.runtime.label(), c.id),
+                    label,
+                ));
+            }
+            groups::Group::Runtime(_) | groups::Group::System | groups::Group::Native => {
+                lines.push(kv("GROUP", r.group.label(), label));
+            }
+        }
     }
 
     // Pull live cgroup + rlimits via the same snapshot used for VMs.
@@ -2679,6 +2872,18 @@ fn cpu_glyph_color(pct: f64) -> Color {
     }
 }
 
+/// Header colour by group band: Cyan for Container (the workload
+/// the developer explicitly started), Yellow for language Runtime
+/// (the daemon they actively launched), `DarkGray` for System and
+/// Native so they sit in the visual background of the panel.
+fn group_band_color(band: groups::GroupBand) -> Color {
+    match band {
+        groups::GroupBand::Container => Color::Cyan,
+        groups::GroupBand::Runtime => Color::Yellow,
+        groups::GroupBand::System | groups::GroupBand::Native => Color::DarkGray,
+    }
+}
+
 fn battery_color(b: &battery::Battery) -> Color {
     if b.status == "Charging" || b.status == "Full" {
         Color::Green
@@ -2956,6 +3161,11 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+// `draw_proc_table` is tabular and the body reads top-to-bottom: the
+// header-row branch above the process-row branch. Splitting it would
+// turn that into two functions called from a wrapper, which costs
+// clarity for no real win.
+#[allow(clippy::too_many_lines)]
 fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let header = Row::new(vec!["PID", "USER", "S", "CPU%", "RSS", "THR", "COMMAND"])
         .style(Style::default().add_modifier(Modifier::BOLD));
@@ -2963,16 +3173,49 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let body: Vec<Row> = app
         .procs_visible
         .iter()
-        .filter_map(|pr| app.procs_all.get(pr.idx).map(|r| (pr, r)))
-        .map(|(pr, r)| {
+        .map(|pr| {
+            // Group-mode synthetic header row: render as a single
+            // banner spanning the COMMAND column with aggregated
+            // count / CPU / RSS. The leading PID-shaped columns are
+            // left blank so the eye instantly separates them from
+            // process rows.
+            if let Some(h) = &pr.header {
+                let band_color = group_band_color(h.band);
+                let cpu_text = format!("{:>5.1}", h.total_cpu);
+                let rss_text = proc::human_bytes(h.total_rss);
+                let banner = format!("▼ {label}  ({n})", label = h.label, n = h.count,);
+                return Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        cpu_text,
+                        Style::default().fg(band_color).add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Span::styled(
+                        rss_text,
+                        Style::default().fg(band_color).add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        banner,
+                        Style::default().fg(band_color).add_modifier(Modifier::BOLD),
+                    )),
+                ]);
+            }
+
+            // Real process row.
+            let Some(r) = app.procs_all.get(pr.idx) else {
+                return Row::new(vec![Cell::from("")]);
+            };
             let cpu = r
                 .cpu_pct
                 .map_or_else(|| "—".to_string(), |p| format!("{p:.1}"));
             let cpu_style = Style::default().fg(cpu_glyph_color(r.cpu_pct.unwrap_or(0.0)));
             let state_style = proc_state_style(r.state);
             // In tree mode the COMMAND cell is prefixed with the
-            // glyph chain ('│ ├─', '└─', etc). In flat mode `prefix`
-            // is empty and we render the same as before.
+            // glyph chain ('│ ├─', '└─', etc); group mode uses two
+            // leading spaces; flat mode prefix is empty.
             let cmd = if pr.prefix.is_empty() {
                 truncate_lossy(&r.command, 200)
             } else {
@@ -3000,10 +3243,17 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         Constraint::Min(30),
     ];
 
-    let title = if app.tree_mode {
-        " processes · tree (sort/filter disabled — t to leave) ".to_string()
-    } else {
-        format!(
+    let title = match app.list_mode {
+        ListMode::Tree => " processes · tree (t to leave) ".to_string(),
+        ListMode::Group => format!(
+            " processes · grouped (g to leave){} ",
+            if app.procs_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · /{}", app.procs_filter)
+            },
+        ),
+        ListMode::Flat => format!(
             " processes · by {}{}{} ",
             app.procs_sort.label(),
             app.procs_sort.arrow(),
@@ -3012,7 +3262,7 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 format!(" · /{}", app.procs_filter)
             },
-        )
+        ),
     };
     let table = Table::new(body, widths)
         .header(header)
@@ -3335,6 +3585,7 @@ mod tests {
             rss_bytes: 0,
             threads: 1,
             command: cmd.into(),
+            group: groups::Group::Native,
         }
     }
 
@@ -3464,6 +3715,103 @@ mod tests {
         for r in &v {
             assert!(r.prefix.is_empty(), "flat mode should leave prefix empty");
         }
+    }
+
+    fn p_with_group(
+        pid: i32,
+        cmd: &str,
+        cpu: f64,
+        rss: u64,
+        group: groups::Group,
+    ) -> procs::ProcessRow {
+        procs::ProcessRow {
+            cpu_pct: Some(cpu),
+            rss_bytes: rss,
+            group,
+            ..p(pid, 1, cmd)
+        }
+    }
+
+    #[test]
+    fn grouped_visible_emits_header_then_members_per_band() {
+        // Three bands: a Container, a Runtime, and a Native. The
+        // header row sits ahead of its members; the layout order is
+        // Container → Runtime → System → Native.
+        let rows = vec![
+            p_with_group(
+                100,
+                "node server.js",
+                40.0,
+                1_000_000,
+                groups::Group::Container(groups::Container {
+                    runtime: groups::ContainerRuntime::Docker,
+                    id: "abc12".into(),
+                }),
+            ),
+            p_with_group(
+                101,
+                "postgres",
+                10.0,
+                500_000,
+                groups::Group::Container(groups::Container {
+                    runtime: groups::ContainerRuntime::Docker,
+                    id: "abc12".into(),
+                }),
+            ),
+            p_with_group(
+                200,
+                "java -jar",
+                25.0,
+                2_000_000,
+                groups::Group::Runtime(groups::Lang::Java),
+            ),
+            p_with_group(300, "myapp", 1.0, 100_000, groups::Group::Native),
+        ];
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "");
+        // Pattern: header(docker) m m header(java) m header(native) m.
+        assert!(v[0].header.is_some(), "row 0 should be a header");
+        let h0 = v[0].header.as_ref().unwrap();
+        assert_eq!(h0.label, "docker:abc12");
+        assert_eq!(h0.count, 2);
+        assert!((h0.total_cpu - 50.0).abs() < 1e-9);
+        assert_eq!(h0.total_rss, 1_500_000);
+        // Members under the docker header come next, sorted by CPU desc.
+        assert!(v[1].header.is_none() && v[2].header.is_none());
+        assert_eq!(rows[v[1].idx].pid, 100);
+        assert_eq!(rows[v[2].idx].pid, 101);
+        // Then the java header, then its single member.
+        assert!(v[3].header.is_some());
+        assert_eq!(v[3].header.as_ref().unwrap().label, "java");
+        assert_eq!(rows[v[4].idx].pid, 200);
+        // Native band last.
+        assert!(v[5].header.is_some());
+        assert_eq!(v[5].header.as_ref().unwrap().label, "native");
+    }
+
+    #[test]
+    fn grouped_visible_filter_prunes_before_grouping() {
+        // Filter that matches only one group's processes drops the
+        // other group entirely (header + members).
+        let rows = vec![
+            p_with_group(
+                1,
+                "java -jar",
+                20.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Java),
+            ),
+            p_with_group(
+                2,
+                "node server",
+                5.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Node),
+            ),
+        ];
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java");
+        assert_eq!(v.len(), 2, "one header + one member");
+        assert_eq!(v[0].header.as_ref().unwrap().label, "java");
+        assert_eq!(rows[v[1].idx].pid, 1);
     }
 
     fn iface(name: &str, rx: Option<u64>, tx: Option<u64>) -> net::Iface {

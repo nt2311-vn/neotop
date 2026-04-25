@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-04-25
+
+The "process groups" release. Every process viewer the user has
+tried — `htop`, `btm`, `btop` — shows the host's PIDs as a flat
+wall of text. On a developer laptop with 30 Node processes, 5
+Java services, and a handful of Podman containers running their
+own init trees, that wall of text *buries* the signal. This
+release classifies every process into a developer-meaningful
+group and adds a third list mode that clusters them with
+aggregated CPU and RSS.
+
+The taxonomy:
+
+- **Container** (Docker / Podman / Kubernetes / Containerd / LXC)
+  — derived from `/proc/<pid>/cgroup` patterns. Container ID is
+  surfaced as a 12-char short hash so the user can `docker ps` /
+  `podman ps` it back to a human name.
+- **Runtime** (Java / Node / Bun / Deno / Python / Ruby / PHP /
+  Perl / Lua / Erlang / .NET / R) — derived from `argv[0]`.
+- **System** — PID 1, kernel threads, and the canonical systemd /
+  dbus / udev daemons.
+- **Native** — the catch-all (Go, Rust, C, C++ binaries; we'd
+  need ELF symbol parsing to detect those properly and that's
+  not worth the per-tick I/O).
+
+Container detection wins over runtime detection: a `node`
+process running inside `docker run myapp` is more usefully
+grouped with the container than lumped in with all other Node
+processes on the host.
+
+### Added
+
+- **`g` toggle** in the Procs view: cycles `Group` ↔ `Flat`. Same
+  re-anchor-by-pid behaviour as `t`, so the cursor follows the
+  process across the layout change.
+- **`compute_visible_grouped`** — buckets surviving rows by
+  group key, emits a synthetic header row per cluster, then the
+  members indented two spaces. Group bands sort
+  Container → Runtime → System → Native; within a band, groups
+  with the largest aggregate of the chosen sort key bubble up
+  first.
+- **Group header row** — banner painted in the COMMAND column
+  (`▼ docker:abc12345  (5)`), with the cluster's total CPU% and
+  total RSS in the CPU and RSS columns, all coloured by band
+  (Cyan = Container, Yellow = Runtime, DarkGray = System /
+  Native). Selectable navigation skips headers, so `j` / `k` /
+  `K` / `Ctrl-K` only ever land on real PIDs.
+- **`src/groups.rs`** — new module with `Lang`,
+  `ContainerRuntime`, `Container`, and `Group` types plus
+  `classify_lang`, `parse_container_cgroup`, and
+  `classify_process` (the layered classifier).
+- **`procs::ProcessRow.group: Group`** — derived once when the
+  pid is first seen and cached alongside `cmdline` in
+  `StaticInfo`. Steady-state cost = 0.
+- **Detail pane GROUP / CONTAINER line** — the same group label
+  appears in the right-hand detail pane regardless of which list
+  mode is active, so the classification is always one keystroke
+  (`Tab`-skip away from being visible).
+- **Help overlay** lists `g` alongside `s` / `t` / `H` / `/` / `K`.
+
+### Changed
+
+- `App.tree_mode: bool` → `App.list_mode: ListMode` (three-state
+  enum: `Flat` | `Tree` | `Group`). `t` and `g` toggle their
+  respective mode; pressing the active key returns to `Flat`.
+- `procs.rs` reads `/proc/<pid>/cgroup` once per pid first-sight;
+  the result is cached in `StaticInfo` and never re-read for the
+  pid's lifetime. Roughly +1 file read per *new* process; zero
+  steady-state cost.
+- `ProcRender` grew a `header: Option<GroupHeader>` field. `None`
+  → real process row (today's behaviour); `Some` → synthetic
+  group banner. `selected_proc()` and `reanchor_proc_selection`
+  filter `header.is_some()` rows out so kill / detail callers
+  always see real PIDs.
+- The Procs title bar now says `processes · grouped (g to leave)`
+  in group mode and keeps its existing `· tree` / `· by CPU%↓`
+  variants in the other two modes.
+
+### Tests
+
+- 107 passing (was 90). Net +17:
+  - 15 new tests in `groups::tests` covering language detection
+    (java / node / bun / deno / python / ruby / php / perl / lua
+    / erlang / dotnet / R / nodejs / Rscript / php-fpm),
+    null-separated cmdline handling, six container-runtime
+    cgroup patterns (modern docker, legacy docker, podman,
+    Kubernetes-wraps-docker, LXC, multi-line cgroup-v1), the
+    container-wins-over-runtime priority, the band ordering, and
+    the label format.
+  - `grouped_visible_emits_header_then_members_per_band` — three
+    bands rendered in the right order with header rows ahead of
+    their members.
+  - `grouped_visible_filter_prunes_before_grouping` — the
+    substring filter drops entire groups whose members all fail
+    to match.
+
+### Out of scope (tracked for v0.13.0+)
+
+- **Container-name resolution** via `docker ps` / `podman ps`
+  output or socket. Would surface "myapp" rather than
+  "docker:abc12345" in the header. Defers because it requires
+  shelling out to runtime-specific tools.
+- **Go / Rust runtime detection** via ELF section scan
+  (`.gopclntab`, etc). Defers because it costs per-tick file I/O.
+- **SMT / NUMA grouping** in the spectrum view (already deferred
+  in v0.11.0).
+- **Themes / TOML config**.
+- **Intel via i915 / Xe perf counters** (needs `CAP_PERFMON`).
+- **macOS / Windows ports**.
+
 ## [0.11.0] — 2026-04-25
 
 The "spectrum view". v0.10.0's heatmap was a flat colour grid —
@@ -717,7 +827,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/nt2311/neotop/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/nt2311/neotop/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/nt2311/neotop/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/nt2311/neotop/compare/v0.8.0...v0.9.0
