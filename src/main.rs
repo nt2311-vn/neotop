@@ -27,6 +27,7 @@
 //!     Ctrl-K        (Procs) send SIGKILL to selected pid (with confirm)
 
 mod battery;
+mod disk;
 mod errors;
 mod host;
 mod net;
@@ -179,6 +180,30 @@ struct CpuSample {
 /// parse as "what's happening right now".
 const CPU_HISTORY_CAP: usize = 60;
 
+/// Ring buffer for host-level CPU% / memory% histories. Same window
+/// logic as `CpuHistory`: 60 samples × 250 ms tick = last 15 s.
+#[derive(Debug, Default)]
+struct HostHistory {
+    cpu: VecDeque<u64>,
+    mem: VecDeque<u64>,
+}
+
+impl HostHistory {
+    fn push(&mut self, cpu_pct: Option<f64>, mem_pct: f64) {
+        push_pct(&mut self.cpu, cpu_pct.unwrap_or(0.0));
+        push_pct(&mut self.mem, mem_pct);
+    }
+}
+
+fn push_pct(buf: &mut VecDeque<u64>, pct: f64) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let v = pct.clamp(0.0, 100.0) as u64;
+    if buf.len() == CPU_HISTORY_CAP {
+        buf.pop_front();
+    }
+    buf.push_back(v);
+}
+
 #[derive(Debug, Default)]
 struct CpuHistory {
     per_pid: HashMap<i64, VecDeque<u64>>,
@@ -282,6 +307,19 @@ fn scan(
 /// where sub-millisecond precision matters.
 fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+/// Host memory usage as a 0..=100 percentage. Returns `0.0` when
+/// `mem_total_bytes` is unknown so the sparkline degrades gracefully.
+fn mem_used_pct(h: &host::HostInfo) -> f64 {
+    if h.mem_total_bytes == 0 {
+        return 0.0;
+    }
+    let used = h.mem_total_bytes.saturating_sub(h.mem_avail_bytes);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        (used as f64 / h.mem_total_bytes as f64) * 100.0
+    }
 }
 
 fn now_ns() -> i128 {
@@ -467,6 +505,9 @@ struct App {
     ifaces: Vec<net::Iface>,
     temps: Vec<temp::Reading>,
     batteries: Vec<battery::Battery>,
+    disk_tracker: disk::Tracker,
+    disks: Vec<disk::Disk>,
+    host_history: HostHistory,
 
     // Tunables
     clk_tck: u64,
@@ -493,6 +534,8 @@ impl App {
         let ifaces = net_tracker.snapshot(&mut errors);
         let temps = temp::snapshot(&mut errors);
         let batteries = battery::snapshot();
+        let mut disk_tracker = disk::Tracker::default();
+        let disks = disk_tracker.snapshot(&mut errors);
         let vms = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
         let procs_all = procs_tracker.snapshot(&passwd, clk_tck);
 
@@ -506,8 +549,20 @@ impl App {
             procs_table.select(Some(0));
         }
 
+        // Smart default view: if there's no neosandbox state-dir at
+        // all, the Vms table will only ever show "(empty)". In that
+        // case start in Procs view so neotop is immediately useful as
+        // a system monitor. If the run-dir does exist (even if empty
+        // right now), keep the Vms default — the user is probably
+        // watching for a VM to come up.
+        let view = if run_dir.is_dir() {
+            View::Vms
+        } else {
+            View::Procs
+        };
+
         Self {
-            view: View::Vms,
+            view,
             input: InputMode::Normal,
             vms,
             vms_table,
@@ -526,6 +581,9 @@ impl App {
             ifaces,
             temps,
             batteries,
+            disk_tracker,
+            disks,
+            host_history: HostHistory::default(),
             clk_tck,
             last_scan: Instant::now(),
             perf: PerfTracker::default(),
@@ -549,9 +607,16 @@ impl App {
         self.ifaces = self.net_tracker.snapshot(&mut self.errors);
         self.temps = temp::snapshot(&mut self.errors);
         self.batteries = battery::snapshot();
+        self.disks = self.disk_tracker.snapshot(&mut self.errors);
         self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
         self.recompute_procs();
         self.clamp_selections();
+
+        // Feed the host history *after* host_info has been refreshed
+        // so the sparkline tracks the same numbers shown in the line-1
+        // summary, not the previous tick.
+        let mem_pct = mem_used_pct(&self.host_info);
+        self.host_history.push(self.host_info.cpu_pct, mem_pct);
 
         self.update_self_perf(started);
 
@@ -832,7 +897,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // title
-            Constraint::Length(3),  // host overview (3 lines: summary, hw, net+temp)
+            Constraint::Length(4),  // host overview (4 lines: summary, hw, net+temp, disk)
             Constraint::Min(5),     // fleet table
             Constraint::Length(16), // serial + resources pane
             Constraint::Length(1),  // help
@@ -855,11 +920,75 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         &app.ifaces,
         &app.temps,
         &app.batteries,
+        &app.disks,
     );
-    draw_table(f, chunks[2], &app.vms, &mut app.vms_table);
+    if app.vms.is_empty() {
+        draw_vms_empty(f, chunks[2], run_dir);
+    } else {
+        draw_table(f, chunks[2], &app.vms, &mut app.vms_table);
+    }
     draw_serial(f, bottom[0], selected);
     draw_resources(f, bottom[1], selected, &app.history);
     draw_footer(f, chunks[4], app);
+}
+
+/// Empty-state for the Vms table. Replaces the otherwise-empty
+/// `Table` widget with a paragraph that tells the user *why* there's
+/// nothing to see and points them at the Procs view.
+fn draw_vms_empty(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path) {
+    let exists = run_dir.is_dir();
+    let title = if exists {
+        " fleet · empty "
+    } else {
+        " fleet · no state dir "
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if exists {
+                    "No VMs are running yet."
+                } else {
+                    "No neosandbox state directory found."
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  watching "),
+            Span::styled(
+                run_dir.display().to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Press "),
+            Span::styled(
+                " Tab ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to view host processes (sorted by CPU%)."),
+        ]),
+        Line::from(vec![
+            Span::raw("  Start a VM via "),
+            Span::styled(
+                "just demo-pvh",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Span::raw(" and it will appear here automatically."),
+        ]),
+    ];
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -868,7 +997,8 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title
-            Constraint::Length(3), // host overview
+            Constraint::Length(4), // host overview
+            Constraint::Length(3), // host CPU + MEM history
             Constraint::Min(5),    // procs table
             Constraint::Length(1), // help / prompt
         ])
@@ -882,9 +1012,43 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.ifaces,
         &app.temps,
         &app.batteries,
+        &app.disks,
     );
-    draw_proc_table(f, chunks[2], app);
-    draw_footer(f, chunks[3], app);
+    draw_host_history(f, chunks[2], &app.host_history);
+    draw_proc_table(f, chunks[3], app);
+    draw_footer(f, chunks[4], app);
+}
+
+/// Two side-by-side host-level sparklines: CPU% on the left, mem% on
+/// the right. 60 samples each → last 15 s at the default 250 ms tick.
+fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let cpu_data: Vec<u64> = h.cpu.iter().copied().collect();
+    let mem_data: Vec<u64> = h.mem.iter().copied().collect();
+
+    let cpu_title = format!(" host CPU · last {}s ", cpu_data.len() / 4);
+    let mem_title = format!(" host MEM · last {}s ", mem_data.len() / 4);
+
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(cpu_title))
+            .data(&cpu_data)
+            .max(100)
+            .style(Style::default().fg(Color::Green)),
+        halves[0],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(mem_title))
+            .data(&mem_data)
+            .max(100)
+            .style(Style::default().fg(Color::Magenta)),
+        halves[1],
+    );
 }
 
 fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize, view: View) {
@@ -947,11 +1111,13 @@ fn draw_host(
     ifaces: &[net::Iface],
     temps: &[temp::Reading],
     batteries: &[battery::Battery],
+    disks: &[disk::Disk],
 ) {
     let line1 = host_line1(h);
     let line2 = host_line2(h, batteries);
     let line3 = host_line3(ifaces, temps);
-    f.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
+    let line4 = host_line4(disks);
+    f.render_widget(Paragraph::new(vec![line1, line2, line3, line4]), area);
 }
 
 fn host_line1(h: &host::HostInfo) -> Line<'static> {
@@ -970,14 +1136,7 @@ fn host_line1(h: &host::HostInfo) -> Line<'static> {
         .cpu_pct
         .map_or_else(|| "—".to_string(), |p| format!("{p:>4.1}%"));
     let mem_used = h.mem_total_bytes.saturating_sub(h.mem_avail_bytes);
-    let mem_pct = if h.mem_total_bytes > 0 {
-        #[allow(clippy::cast_precision_loss)]
-        {
-            (mem_used as f64 / h.mem_total_bytes as f64) * 100.0
-        }
-    } else {
-        0.0
-    };
+    let mem_pct = mem_used_pct(h);
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -1080,6 +1239,46 @@ fn host_line3(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{:>4.1}°C", r.celsius),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+fn host_line4(disks: &[disk::Disk]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> =
+        vec![Span::styled(" disk ", Style::default().fg(Color::DarkGray))];
+    let picks = disk::highlights(disks, 3);
+    if picks.is_empty() {
+        spans.push(Span::raw("—"));
+        return Line::from(spans);
+    }
+    for (i, d) in picks.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            d.name.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw(format!(
+            " ↓{} ↑{}",
+            disk::human_rate(d.read_bps),
+            disk::human_rate(d.write_bps),
+        )));
+        if let Some(util) = d.util_pct {
+            // Highlight saturated devices — same yellow/red thresholds
+            // we use for CPU% to keep the eye-trained palette consistent.
+            let color = if util >= 80.0 {
+                Color::Red
+            } else if util >= 50.0 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            spans.push(Span::styled(
+                format!(" {util:>3.0}%"),
                 Style::default().fg(color),
             ));
         }
