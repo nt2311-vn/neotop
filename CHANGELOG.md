@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-25
+
+The "charts worth a thousand words" release. The user asked for
+GPU metrics and for charts that surface what `htop`, `btm`, and
+`btop` don't. Two big visual additions and one new module.
+
+### Added
+
+- **`gpu` module** with vendor-aware backends.
+  - **AMD** is fully wired via sysfs (`/sys/class/drm/card*/device/`):
+    `gpu_busy_percent`, `mem_info_vram_used`, `mem_info_vram_total`,
+    plus `power1_average` from the card's hwmon subdirectory for
+    instantaneous draw in watts. All reads are best-effort; a card
+    that disappears mid-scan (eGPU unplug, runtime PM) is silently
+    skipped.
+  - **NVIDIA** and **Intel** cards are *detected* (vendor probe
+    against `/sys/.../device/vendor`) and surfaced in the host
+    overview by name with a `(driver pending)` tag, so users on
+    hybrid laptops see the hardware was recognised. Real metrics
+    for those backends — NVML for NVIDIA, perf counters for
+    Intel — are tracked for v0.9.0.
+  - Detection only adds a row to the host overview when at least
+    one card is present; machines without a discrete GPU pay no
+    visual cost.
+- **5th sparkline column: GPU%.** Slots into the 60-second history
+  strip alongside CPU / MEM / NET↓ / NET↑ when at least one card
+  is reporting `busy_pct`. `LightRed` hue so the eye picks it out
+  at a glance — "GPU pegged" is usually the headline number on
+  machines that have one.
+- **Memory composition bar** — full-width horizontal stacked bar
+  on the Procs view, showing **used | buffers | cached | free**.
+  Each segment is solid-color and proportionally sized to the
+  underlying byte count; the title carries the exact figures
+  (`memory  4.1G used │ 312M buf │ 6.8G cache │ 4.7G free │ 16G total`).
+  This is the chart that `htop` shrinks to one tiny row and
+  `btop` doesn't surface at all — most TUIs hide the difference
+  between *real* memory pressure and instantly-reclaimable page
+  cache. Hidden on terminals shorter than 22 rows so the procs
+  body keeps a usable list.
+- New `host::HostInfo` fields: `mem_free_bytes`, `mem_buffers_bytes`,
+  `mem_cached_bytes`. `MemFree`, `Buffers`, `Cached` are all
+  parsed out of `/proc/meminfo` on the same pass as the totals.
+- `gpu::aggregate_busy_pct()` averages busy% only across cards
+  that *report* it (NVIDIA / Intel cards we don't have backends
+  for are excluded rather than zero-filled — zero would lie about
+  the workstation's true load).
+- `host_overview_rows()` helper keeps layout & paragraph in
+  lockstep: 3 by default, 4 once a GPU shows up.
+
+### Tests
+
+- 77 passing (was 66). New tests:
+  - `gpu::pci_vendor_id_matches_known_vendors`
+  - `gpu::is_real_card_node_filters_connectors_and_render_devices`
+  - `gpu::amd_parser_assembles_full_snapshot`
+  - `gpu::amd_parser_tolerates_partial_data`
+  - `gpu::amd_parser_rejects_out_of_range_busy`
+  - `gpu::vram_pct_is_none_when_total_unknown`
+  - `gpu::aggregate_busy_pct_averages_only_known_values`
+  - `gpu::aggregate_busy_pct_returns_none_when_no_backend_responds`
+  - `host_overview_rows_grows_with_gpu_presence`
+  - `scale_clamps_to_bar_width`
+  - `scale_avoids_overflow_on_terabyte_systems`
+
+### Out of scope (tracked for v0.9.0)
+
+- NVIDIA via `nvml-wrapper` — adds a runtime-loaded native
+  dependency and deserves its own focused release.
+- Intel via i915/Xe perf counters — needs root or `CAP_PERFMON`,
+  same.
+- Per-core CPU heatmap (cores × time grid) — the other "thousand
+  words" chart left on the whiteboard.
+
 ## [0.7.0] — 2026-04-25
 
 The "refined product" release. The user reported `neotop` "feels
@@ -408,7 +481,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/nt2311/neotop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/nt2311/neotop/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nt2311/neotop/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nt2311/neotop/compare/v0.4.0...v0.5.0

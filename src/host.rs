@@ -17,6 +17,20 @@ pub(crate) struct HostInfo {
     pub(crate) cpu_model: String,
     pub(crate) mem_total_bytes: u64,
     pub(crate) mem_avail_bytes: u64,
+    /// `MemFree` from `/proc/meminfo`, in bytes. The *truly* free
+    /// memory (not held by the page cache) \u2014 used as the rightmost
+    /// segment of the memory composition bar.
+    pub(crate) mem_free_bytes: u64,
+    /// `Buffers` from `/proc/meminfo`, in bytes. Memory the kernel
+    /// is using to back block-I/O queues. Reclaimable.
+    pub(crate) mem_buffers_bytes: u64,
+    /// `Cached` from `/proc/meminfo`, in bytes. The page cache;
+    /// memory holding recent file-system reads. Reclaimable. Shown
+    /// as the third segment of the composition bar so the user can
+    /// see at a glance how much "memory pressure" is real and how
+    /// much is just page cache that will evaporate the moment
+    /// anything needs it.
+    pub(crate) mem_cached_bytes: u64,
     /// `SwapTotal` from `/proc/meminfo`, in bytes. `0` when the
     /// system has no swap configured (common on servers, microVMs).
     pub(crate) swap_total_bytes: u64,
@@ -160,6 +174,12 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         |kb| kb * 1024,
     );
     let mem_avail_bytes = read_meminfo_kb("MemAvailable:").map_or(0, |kb| kb * 1024);
+    // The composition triple. None of these are individually fatal:
+    // an old kernel without `Buffers` reports 0, the bar renderer
+    // gracefully reduces to "used / cached / free" without it.
+    let mem_free_bytes = read_meminfo_kb("MemFree:").map_or(0, |kb| kb * 1024);
+    let mem_buffers_bytes = read_meminfo_kb("Buffers:").map_or(0, |kb| kb * 1024);
+    let mem_cached_bytes = read_meminfo_kb("Cached:").map_or(0, |kb| kb * 1024);
     // Swap is optional — a missing key isn't an error, just means the
     // system has no swap configured. We don't push to the error ring.
     let swap_total_bytes = read_meminfo_kb("SwapTotal:").map_or(0, |kb| kb * 1024);
@@ -175,6 +195,9 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         cpu_model,
         mem_total_bytes,
         mem_avail_bytes,
+        mem_free_bytes,
+        mem_buffers_bytes,
+        mem_cached_bytes,
         swap_total_bytes,
         swap_free_bytes,
         loadavg_1: loads.0,

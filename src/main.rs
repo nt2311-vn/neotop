@@ -33,6 +33,7 @@
 mod battery;
 mod disk;
 mod errors;
+mod gpu;
 mod host;
 mod net;
 mod proc;
@@ -197,25 +198,41 @@ struct CpuSample {
 /// At a tighter `+`-tuned tick the window scales accordingly.
 const CPU_HISTORY_CAP: usize = 60;
 
-/// Ring buffer for host-level CPU% / memory% / net rate histories.
-/// Same window logic as `CpuHistory`: 60 samples × 1 s tick = last
-/// minute. CPU and mem are stored as `0..=100` percentages; net is
-/// stored as raw bytes/sec so `draw_host_history` can compute a
-/// rolling max for the sparkline ceiling and label the actual rate.
+/// Ring buffer for host-level CPU% / memory% / net rate / GPU%
+/// histories. Same window logic as `CpuHistory`: 60 samples × 1 s
+/// tick = last minute. CPU / mem / GPU are stored as `0..=100`
+/// percentages; net is stored as raw bytes/sec so `draw_host_history`
+/// can compute a rolling max for the sparkline ceiling and label the
+/// actual rate. GPU is `None`-tolerant: machines without a card-with-
+/// metrics keep an empty deque and the sparkline column hides itself.
 #[derive(Debug, Default)]
 struct HostHistory {
     cpu: VecDeque<u64>,
     mem: VecDeque<u64>,
     net_down: VecDeque<u64>,
     net_up: VecDeque<u64>,
+    gpu: VecDeque<u64>,
 }
 
 impl HostHistory {
-    fn push(&mut self, cpu_pct: Option<f64>, mem_pct: f64, net_down_bps: u64, net_up_bps: u64) {
+    fn push(
+        &mut self,
+        cpu_pct: Option<f64>,
+        mem_pct: f64,
+        net_down_bps: u64,
+        net_up_bps: u64,
+        gpu_pct: Option<f64>,
+    ) {
         push_pct(&mut self.cpu, cpu_pct.unwrap_or(0.0));
         push_pct(&mut self.mem, mem_pct);
         push_raw(&mut self.net_down, net_down_bps);
         push_raw(&mut self.net_up, net_up_bps);
+        // Only record GPU samples when a backend gave us a real
+        // number. Otherwise the deque stays empty and
+        // `draw_host_history` knows to hide the column.
+        if let Some(p) = gpu_pct {
+            push_pct(&mut self.gpu, p);
+        }
     }
 }
 
@@ -543,6 +560,14 @@ struct App {
     batteries: Vec<battery::Battery>,
     disk_tracker: disk::Tracker,
     disks: Vec<disk::Disk>,
+    gpu_tracker: gpu::Tracker,
+    /// All GPUs found under `/sys/class/drm/card*`. AMD cards have
+    /// real metrics (`busy_pct`, `vram_*`); NVIDIA / Intel are
+    /// detected-only until we ship NVML / i915 backends in a later
+    /// release. The host overview surfaces *all* cards (so the user
+    /// knows the hardware was recognised); the sparkline only
+    /// covers cards that report `busy_pct`.
+    gpus: Vec<gpu::Gpu>,
     host_history: HostHistory,
 
     // Tunables
@@ -608,6 +633,8 @@ impl App {
         let batteries = battery::snapshot();
         let mut disk_tracker = disk::Tracker::default();
         let disks = disk_tracker.snapshot(&mut errors);
+        let mut gpu_tracker = gpu::Tracker::default();
+        let gpus = gpu_tracker.snapshot();
         let vms = scan(run_dir, &mut prev_cpu, &mut history, clk_tck);
         let procs_all = procs_tracker.snapshot(&passwd, clk_tck);
 
@@ -657,6 +684,8 @@ impl App {
             batteries,
             disk_tracker,
             disks,
+            gpu_tracker,
+            gpus,
             host_history: HostHistory::default(),
             clk_tck,
             last_scan: Instant::now(),
@@ -714,6 +743,13 @@ impl App {
             self.temps = self.temp_tracker.snapshot(&mut self.errors);
             self.batteries = battery::snapshot();
             self.disks = self.disk_tracker.snapshot(&mut self.errors);
+            // GPU sysfs reads are cheap (single-digit microseconds
+            // on AMD), so they could go in the fast path. Keeping
+            // them here means the GPU number ticks at the same
+            // human-paced cadence as temps and disk I/O — fine for
+            // a 1 Hz UI, and saves a few hundred microseconds per
+            // tick on machines with multiple cards.
+            self.gpus = self.gpu_tracker.snapshot();
         }
         self.slow_tick_counter = (self.slow_tick_counter + 1) % SLOW_TICK_EVERY;
 
@@ -733,8 +769,9 @@ impl App {
         // summary, not the previous tick.
         let mem_pct = mem_used_pct(&self.host_info);
         let (net_down, net_up) = total_net_rates(&self.ifaces);
+        let gpu_pct = gpu::aggregate_busy_pct(&self.gpus);
         self.host_history
-            .push(self.host_info.cpu_pct, mem_pct, net_down, net_up);
+            .push(self.host_info.cpu_pct, mem_pct, net_down, net_up, gpu_pct);
 
         self.update_self_perf(started);
 
@@ -1429,14 +1466,20 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 
 fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
     let area = f.area();
+    // Host overview is 3 rows by default and 4 when at least one
+    // GPU is detected. Computing it once and reusing the value
+    // keeps `draw_host`'s own "add a line iff GPUs is non-empty"
+    // behaviour honest — the layout reserves exactly the space the
+    // paragraph will consume.
+    let host_h = host_overview_rows(&app.gpus);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // title
-            Constraint::Length(3),  // host overview (summary, net+temp, disk)
-            Constraint::Min(5),     // fleet table
-            Constraint::Length(16), // serial + resources pane
-            Constraint::Length(1),  // help
+            Constraint::Length(1),      // title
+            Constraint::Length(host_h), // host overview (3 or 4 lines)
+            Constraint::Min(5),         // fleet table
+            Constraint::Length(16),     // serial + resources pane
+            Constraint::Length(1),      // help
         ])
         .split(area);
 
@@ -1457,6 +1500,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
         &app.temps,
         &app.batteries,
         &app.disks,
+        &app.gpus,
     );
     if app.vms.is_empty() {
         draw_vms_empty(f, chunks[2], run_dir);
@@ -1530,13 +1574,19 @@ fn draw_vms_empty(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path) {
 fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = f.area();
     let percore_h = percore_height(app.host_info.per_core_pct.len(), area.width);
+    let host_h = host_overview_rows(&app.gpus);
+    // The memory composition bar needs 3 rows (top border, content,
+    // bottom border). Hide it on terminals shorter than ~24 rows
+    // so the procs body still gets at least 5 rows of useful list.
+    let mem_bar_h: u16 = if area.height >= 22 { 3 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),         // title
-            Constraint::Length(3),         // host overview (summary, net+temp, disk)
+            Constraint::Length(host_h),    // host overview (3 or 4 lines)
             Constraint::Length(percore_h), // per-core CPU grid (0..=2)
-            Constraint::Length(3),         // CPU + MEM + NET\u{2193} + NET\u{2191} sparklines
+            Constraint::Length(mem_bar_h), // memory composition bar (0 or 3)
+            Constraint::Length(3),         // CPU + MEM + NET + GPU sparklines
             Constraint::Min(5),            // procs table + detail pane (split horiz)
             Constraint::Length(1),         // help / prompt
         ])
@@ -1551,15 +1601,19 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.temps,
         &app.batteries,
         &app.disks,
+        &app.gpus,
     );
     if percore_h > 0 {
         draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
     }
-    draw_host_history(f, chunks[3], &app.host_history);
+    if mem_bar_h > 0 {
+        draw_mem_bar(f, chunks[3], &app.host_info);
+    }
+    draw_host_history(f, chunks[4], &app.host_history);
 
     // Allocate the detail pane only when the terminal is wide enough.
     // Below ~110 cols the table needs every column to stay readable.
-    let body = chunks[4];
+    let body = chunks[5];
     if body.width >= 110 {
         let split = Layout::default()
             .direction(Direction::Horizontal)
@@ -1571,7 +1625,7 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         draw_proc_table(f, body, app);
     }
-    draw_footer(f, chunks[5], app);
+    draw_footer(f, chunks[6], app);
 }
 
 /// Per-core row width = `c{nn} {bar} {pct}%  ` ≈ 11 columns. The grid
@@ -1579,6 +1633,17 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
 /// procs body never gets squeezed into nothing on a 24-row terminal.
 const PERCORE_CELL_W: u16 = 11;
 const PERCORE_MAX_ROWS: u16 = 2;
+
+/// 3 by default; 4 once a GPU is detected. The layout keeps the
+/// host-overview height in lockstep with what `draw_host` will
+/// actually paint so we never reserve a blank row.
+fn host_overview_rows(gpus: &[gpu::Gpu]) -> u16 {
+    if gpus.is_empty() {
+        3
+    } else {
+        4
+    }
+}
 
 fn percore_height(num_cores: usize, width: u16) -> u16 {
     if num_cores == 0 {
@@ -1726,20 +1791,128 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Four side-by-side host-level sparklines — CPU%, MEM%, NET↓, NET↑.
-/// 60 samples each → last minute at the default 1 s tick. CPU/MEM
-/// share a 0-100 ceiling; the two net sparklines auto-scale to the
-/// rolling max in their window so a 30 KB/s burst is still visible
-/// next to a 200 MB/s spike on a different interface earlier.
+/// Wide horizontal stacked bar showing the four classes of memory
+/// usage at full screen width: **used | buffers | cached | free**.
+/// The reason this beats the line-1 `MEM 5G/16G (32%)` summary is
+/// that "32%" hides what kind of usage you're looking at — page
+/// cache (cyan, instantly reclaimable) vs. real allocations (red,
+/// the number that actually matters when you're chasing OOMs).
+///
+/// `htop` shows this *tiny* and only one row tall; `btop` doesn't
+/// surface buffers + cached at all. Giving it a dedicated full-width
+/// row turns memory composition from an afterthought into a chart
+/// you can read in one glance.
+fn draw_mem_bar(f: &mut ratatui::Frame<'_>, area: Rect, h: &host::HostInfo) {
+    if h.mem_total_bytes == 0 || area.width < 20 {
+        return;
+    }
+    // Compute segment widths in cells. We render the bar on the
+    // *content* row inside a bordered block, hence area.width - 2
+    // for left/right borders.
+    let total = h.mem_total_bytes;
+    let cached = h.mem_cached_bytes;
+    let buffers = h.mem_buffers_bytes;
+    // Used = total - free - buffers - cached. This is the real
+    // "memory I can't get back without paging" number, which
+    // matches what `free -h`'s `used` column shows.
+    let free = h.mem_free_bytes;
+    let used = total
+        .saturating_sub(free)
+        .saturating_sub(buffers)
+        .saturating_sub(cached);
+
+    let bar_w = u64::from(area.width.saturating_sub(2));
+    let used_w = scale(used, total, bar_w);
+    let buffers_w = scale(buffers, total, bar_w);
+    let cached_w = scale(cached, total, bar_w);
+    // Free fills whatever pixels the rounding left over; this avoids
+    // the bar being one cell short on the right edge.
+    let free_w = bar_w
+        .saturating_sub(used_w)
+        .saturating_sub(buffers_w)
+        .saturating_sub(cached_w);
+
+    // Build the bar by appending colored space-spans. Each cell is
+    // a single ASCII space painted with a background color — that
+    // gives a solid-fill block on every terminal without needing
+    // Unicode block glyphs.
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
+    spans.push(seg(" used ", Color::Red, used_w, used));
+    spans.push(seg(" buf ", Color::Blue, buffers_w, buffers));
+    spans.push(seg(" cache ", Color::Cyan, cached_w, cached));
+    spans.push(seg(" free ", Color::DarkGray, free_w, free));
+
+    let title = format!(
+        " memory  {} used \u{2502} {} buf \u{2502} {} cache \u{2502} {} free \u{2502} {} total ",
+        proc::human_bytes(used),
+        proc::human_bytes(buffers),
+        proc::human_bytes(cached),
+        proc::human_bytes(free),
+        proc::human_bytes(total),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// Scale `n` out of `total` to a cell count, never returning more
+/// than `bar_w`. `total == 0` short-circuits to 0 — the meminfo
+/// loop guards against that anyway.
+fn scale(n: u64, total: u64, bar_w: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    // Use u128 to avoid overflow on multi-TB systems.
+    u64::try_from(u128::from(n) * u128::from(bar_w) / u128::from(total))
+        .unwrap_or(bar_w)
+        .min(bar_w)
+}
+
+/// Build one segment of the memory bar. Each segment is a single
+/// span of `width` spaces, painted with a solid background. We
+/// inline a tiny ASCII label (e.g. `" used "`) when the segment is
+/// wide enough; very narrow segments get a single dot to avoid
+/// truncated label fragments. Bytes are passed through so the
+/// caller can compose a tooltip-style summary in the title.
+fn seg(label: &str, bg: Color, width: u64, _bytes: u64) -> Span<'static> {
+    let w = usize::try_from(width).unwrap_or(0);
+    if w == 0 {
+        return Span::raw("");
+    }
+    // Show the label only when there's room for it plus padding.
+    let content = if w >= label.len() + 2 {
+        let pad_total = w - label.len();
+        let left = pad_total / 2;
+        let right = pad_total - left;
+        format!("{}{label}{}", " ".repeat(left), " ".repeat(right))
+    } else {
+        " ".repeat(w)
+    };
+    Span::styled(content, Style::default().fg(Color::Black).bg(bg))
+}
+
+/// Side-by-side host-level sparklines — CPU%, MEM%, NET↓, NET↑,
+/// and (when an AMD-class card is reporting) GPU%. 60 samples each
+/// → last minute at the default 1 s tick. CPU/MEM/GPU share a
+/// 0-100 ceiling; the two net sparklines auto-scale to the rolling
+/// max in their window so a 30 KB/s burst is still visible next to
+/// a 200 MB/s spike from earlier.
 fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
+    // The GPU column only appears once we have at least one sample
+    // — otherwise we'd reserve 1/5 of the row for a blank
+    // sparkline on every box that has no AMD card. This keeps
+    // workstations and laptops visually identical until the dGPU
+    // actually reports something.
+    let show_gpu = !h.gpu.is_empty();
+    let constraints: Vec<Constraint> = if show_gpu {
+        vec![Constraint::Ratio(1, 5); 5]
+    } else {
+        vec![Constraint::Ratio(1, 4); 4]
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-        ])
+        .constraints(constraints)
         .split(area);
 
     let cpu_data: Vec<u64> = h.cpu.iter().copied().collect();
@@ -1748,7 +1921,7 @@ fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
     let up_data: Vec<u64> = h.net_up.iter().copied().collect();
 
     // Newest sample = label value; the user thinks "what's it doing
-    // *right now*", not "what's the average over the last 15 s".
+    // *right now*", not "what's the average over the last minute".
     let cpu_now = cpu_data.last().copied().unwrap_or(0);
     let mem_now = mem_data.last().copied().unwrap_or(0);
     let down_now = down_data.last().copied().unwrap_or(0);
@@ -1796,6 +1969,24 @@ fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
             .style(Style::default().fg(Color::Yellow)),
         cols[3],
     );
+
+    if show_gpu {
+        let gpu_data: Vec<u64> = h.gpu.iter().copied().collect();
+        let gpu_now = gpu_data.last().copied().unwrap_or(0);
+        let gpu_title = format!(" GPU {gpu_now}% ");
+        f.render_widget(
+            Sparkline::default()
+                .block(Block::default().borders(Borders::ALL).title(gpu_title))
+                .data(&gpu_data)
+                .max(100)
+                // Distinct hue from the four neighbours so the eye
+                // can pick it out at a glance: red/orange-leaning
+                // since "GPU pegged" is usually the headline number
+                // on machines that have one.
+                .style(Style::default().fg(Color::LightRed)),
+            cols[4],
+        );
+    }
 }
 
 /// Sum the per-interface RX/TX rates currently visible in the host
@@ -1893,6 +2084,14 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(title)), area);
 }
 
+// `clippy::too_many_arguments`: the eight slices are exactly the
+// host-snapshot data sources rendered as a paragraph. Wrapping
+// them in a struct just to please the lint would mean either (a)
+// borrowing eight fields out of `App` into a temporary view
+// struct on every draw or (b) adding lifetimes for `App`'s field
+// borrows to a public type. Neither is worth the cost; the
+// parameter list is tabular and clear at the call site.
+#[allow(clippy::too_many_arguments)]
 fn draw_host(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -1901,20 +2100,83 @@ fn draw_host(
     temps: &[temp::Reading],
     batteries: &[battery::Battery],
     disks: &[disk::Disk],
+    gpus: &[gpu::Gpu],
 ) {
-    // Three tighter lines instead of four:
-    //   1. kvm + CPU% + MEM + load + battery (the "tell me now" line)
-    //   2. net + temps (moving-parts line)
-    //   3. disks
-    // The kernel/CPU-model line was static information that didn't
-    // earn its row — it now lives in the `?` overlay. The inline
-    // per-core bar strip was also removed from line 1 because the
-    // Procs view has a dedicated per-core panel; the Vms view gets
-    // per-core detail from its right-hand resources pane anyway.
-    let line1 = host_line1(h, batteries);
-    let line2 = host_line_net_temp(ifaces, temps);
-    let line3 = host_line4(disks);
-    f.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
+    // Three tight lines by default. A fourth GPU line appears only
+    // when at least one card was discovered under `/sys/class/drm`,
+    // so machines without a discrete GPU don't pay a row of screen
+    // real estate for nothing.
+    let mut lines = vec![
+        host_line1(h, batteries),
+        host_line_net_temp(ifaces, temps),
+        host_line4(disks),
+    ];
+    if !gpus.is_empty() {
+        lines.push(host_line_gpu(gpus));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// One-line summary covering every detected GPU. AMD cards report
+/// real numbers (busy %, VRAM, watts); NVIDIA / Intel cards are
+/// shown by name with a `(driver pending)` tag so the user knows
+/// the hardware *is* recognised — the metrics just aren't wired up
+/// in this neotop yet.
+fn host_line_gpu(gpus: &[gpu::Gpu]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> =
+        vec![Span::styled(" gpu ", Style::default().fg(Color::DarkGray))];
+    for (i, g) in gpus.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            g.name.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some(busy) = g.busy_pct {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let busy_int = busy.round() as i64;
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{busy_int:>3}%"),
+                Style::default().fg(gpu_busy_color(busy)),
+            ));
+        }
+        if g.vram_total > 0 {
+            let pct_label = g
+                .vram_pct()
+                .map(|p| format!(" ({p:>4.1}%)"))
+                .unwrap_or_default();
+            spans.push(Span::raw(format!(
+                " vram {}/{}{pct_label}",
+                proc::human_bytes(g.vram_used),
+                proc::human_bytes(g.vram_total),
+            )));
+        }
+        if let Some(w) = g.power_watts {
+            spans.push(Span::raw(format!(" {w:.1}W")));
+        }
+        if !g.has_busy_data() && g.vram_total == 0 {
+            // No backend wired up yet for this vendor.
+            spans.push(Span::styled(
+                " (driver pending)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Same green/yellow/red ramp the per-core CPU grid uses, so the
+/// user reads the GPU number with the same eye they read CPU.
+fn gpu_busy_color(busy: f64) -> Color {
+    if busy >= 80.0 {
+        Color::Red
+    } else if busy >= 50.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
 }
 
 fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'static> {
@@ -2965,6 +3227,41 @@ mod tests {
         // 1 col-per-cell minimum; 2 cores in a 5-col terminal still
         // returns at least 1 row, never panics.
         assert!(percore_height(2, 5) >= 1);
+    }
+
+    #[test]
+    fn host_overview_rows_grows_with_gpu_presence() {
+        let no_gpu: Vec<gpu::Gpu> = Vec::new();
+        assert_eq!(host_overview_rows(&no_gpu), 3);
+
+        let one_gpu = vec![gpu::Gpu {
+            vendor: gpu::GpuVendor::Amd,
+            name: "RX 7900 XTX".into(),
+            busy_pct: Some(40.0),
+            vram_used: 0,
+            vram_total: 0,
+            power_watts: None,
+        }];
+        assert_eq!(host_overview_rows(&one_gpu), 4);
+    }
+
+    #[test]
+    fn scale_clamps_to_bar_width() {
+        // 50% of a 100-wide bar = 50 cells.
+        assert_eq!(scale(500, 1000, 100), 50);
+        // Total 0 → never panics, returns 0.
+        assert_eq!(scale(500, 0, 100), 0);
+        // Saturation: n exceeding total is clamped to bar_w.
+        assert_eq!(scale(2000, 1000, 100), 100);
+    }
+
+    #[test]
+    fn scale_avoids_overflow_on_terabyte_systems() {
+        // 16 TiB / 32 TiB on a 200-cell bar should give 100 cells
+        // without overflowing the multiplication.
+        let half_tib = 16_u64 * 1024 * 1024 * 1024 * 1024;
+        let full_tib = 32_u64 * 1024 * 1024 * 1024 * 1024;
+        assert_eq!(scale(half_tib, full_tib, 200), 100);
     }
 
     #[test]

@@ -199,8 +199,12 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Calmer 1 Hz default refresh (was 4 Hz, felt like a stock-ticker) — shipped in 0.7.0
 - [x] Swap + 5m / 15m load averages in host overview — shipped in 0.7.0
 - [x] Sort + filter inside tree mode — shipped in 0.7.0
-- [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
-  via `intel_gpu_top`-style perf counters)
+- [x] AMD GPU metrics (busy %, VRAM, watts) — shipped in 0.8.0
+- [x] NVIDIA / Intel GPU detection (driver-pending) — shipped in 0.8.0
+- [x] Memory composition bar (used / buffers / cached / free) — shipped in 0.8.0
+- [ ] NVIDIA via `nvml-wrapper`
+- [ ] Intel via `intel_gpu_top`-style perf counters
+- [ ] Per-core CPU heatmap (cores × time grid)
 - [ ] Themes / layout config
 - [ ] macOS / Windows ports
 
