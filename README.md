@@ -58,13 +58,15 @@ neotop --refresh-ms 500             # slower poll (default 250 ms)
 
 ## What it shows
 
-**Host overview (3 lines):**
+**Host overview (4 lines):**
 
 - `kvm:ok`/`kvm:MISSING` indicator, host CPU% with per-core bar glyphs,
   memory used/total, 1-min load average
 - kernel version, CPU model, battery (`%` + `chg/dsch/full` + watts)
 - network RX/TX per interface, temperature readouts (CPU package, NVMe,
   Wi-Fi…) colored green/yellow/red by severity
+- per-disk read/write rate + utilisation% for the top three physical
+  devices (partitions, loop, ram, dm-, md, zram filtered out)
 
 **Fleet table:** one row per running VM — `PID PHASE MODE UPTIME CPU%
 RSS IO MMIO HLT SHDN LAST_SERIAL`.
@@ -77,7 +79,14 @@ that actually matter for microVMs.
 **Procs view (`Tab` to switch):** htop-style process table for every
 PID on the host — `PID USER STATE CPU% RSS THR COMMAND`. Sortable by
 CPU%, RSS, PID, or command. Substring filter, and SIGTERM/SIGKILL with
-a confirmation prompt before either signal is delivered.
+a confirmation prompt before either signal is delivered. Above the
+table, two 15-second sparklines track host CPU% (green) and host
+memory% (magenta).
+
+**Default view:** when `$NEOSANDBOX_STATE/run` doesn't exist, neotop
+opens directly in Procs so it's immediately useful as a system
+monitor. When the state-dir exists but is empty, the Vms view shows
+a hint pointing at `Tab`.
 
 **Footer:** quick help on the left; on the right, neotop measures and
 shows its own overhead — scan/render time in milliseconds, our own
@@ -105,8 +114,10 @@ appears between the help text and perf metrics for 5 seconds.
 | Kernel | `/proc/version` |
 | Load avg | `/proc/loadavg` |
 | Network | `/proc/net/dev` |
+| Disks | `/proc/diskstats` |
 | Temperatures | `/sys/class/hwmon/hwmon*/temp*_input` + `_label` |
 | Battery | `/sys/class/power_supply/BAT*/{capacity,status,power_now}` |
+| Host processes | `/proc/<pid>/{stat,status,cmdline}` |
 | `/dev/kvm` | `Path::new("/dev/kvm").exists()` |
 
 No privileged syscalls. No `unsafe`. Two sampling passes per scan, no
@@ -116,11 +127,11 @@ background threads.
 
 Things `btm`/`btop` have that neotop does not yet:
 
-- [ ] Process tree (walk all of `/proc/` not just VMs)
-- [ ] Per-device disk I/O (`/proc/diskstats`)
+- [ ] Process tree (walk parent links in the existing Procs view)
+- [x] Per-device disk I/O (`/proc/diskstats`) — shipped in 0.2.0
+- [x] Memory history chart — shipped in 0.2.0
 - [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
   via `intel_gpu_top`-style perf counters)
-- [ ] Memory history chart
 - [ ] Themes / layout config
 - [ ] macOS / Windows ports
 

@@ -153,8 +153,14 @@ impl Tracker {
 pub(crate) fn highlights(disks: &[Disk], limit: usize) -> Vec<&Disk> {
     let mut sorted: Vec<&Disk> = disks.iter().collect();
     sorted.sort_by(|a, b| {
-        let ar = a.read_bps.unwrap_or(0).saturating_add(a.write_bps.unwrap_or(0));
-        let br = b.read_bps.unwrap_or(0).saturating_add(b.write_bps.unwrap_or(0));
+        let ar = a
+            .read_bps
+            .unwrap_or(0)
+            .saturating_add(a.write_bps.unwrap_or(0));
+        let br = b
+            .read_bps
+            .unwrap_or(0)
+            .saturating_add(b.write_bps.unwrap_or(0));
         br.cmp(&ar).then_with(|| a.name.cmp(&b.name))
     });
     sorted.into_iter().take(limit).collect()

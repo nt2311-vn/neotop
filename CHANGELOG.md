@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-25
+
+The "neotop is now usable as a general system monitor" release. The
+v0.1.0 first impression — empty table when no VMs were running — is
+replaced with sensible defaults and three new host-level signals.
+
+### Added
+
+- **Smart default view.** When `$NEOSANDBOX_STATE/run` doesn't exist
+  at startup, neotop now opens in the Procs view (host process
+  table, sorted by CPU%) instead of the empty Vms view. When the
+  state-dir exists but is empty, the Vms view renders a friendly
+  hint paragraph pointing at `Tab` and `just demo-pvh` instead of
+  showing an empty table.
+- **Disk I/O.** New `src/disk.rs` parses `/proc/diskstats` and
+  shows the top three physical devices' read/write/util on a new
+  4th host-overview line. Partitions, loop, ram, dm-, md, and
+  zram are filtered out — same heuristic as `iostat`/`btm`. Util%
+  uses the same yellow/red thresholds as CPU and temp.
+- **Host history sparklines.** `HostHistory` keeps the last 60
+  CPU% / mem% samples (15 s at the default tick). The Procs view
+  has a new 3-row band rendering two side-by-side `Sparkline`s
+  for host CPU and host memory. Vms view is unchanged.
+
+### Changed
+
+- The host overview block grew from 3 to 4 rows in both views to
+  accommodate the disk line.
+- `mem_used_pct` extracted from `host_line1` and reused by the
+  history sampler so the sparkline tracks exactly what line 1
+  shows.
+
+### Tests
+
+- 51 passing (was 43). 7 new disk-module tests cover
+  `parse_diskstats`, `is_physical_disk` on every device-class
+  shape, `snapshot_from_str` rate computation, `highlights`
+  ordering, and `human_rate` formatting.
+
 ## [0.1.0] — 2026-04-25
 
 The first daily-driver release. neotop now passes the bar laid out in
@@ -70,5 +109,6 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/nt2311/neotop/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nt2311/neotop/releases/tag/v0.1.0
