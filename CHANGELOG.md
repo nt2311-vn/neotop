@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-25
+
+The "ergonomics + visibility" release. Four user-visible
+improvements: scrolling is smooth, every long table has a
+scrollbar, the Procs view grew a dedicated per-core CPU panel,
+and the host sparklines now include net-down + net-up alongside
+CPU% and MEM%.
+
+### Added
+
+- **Scrollbar on Vms and Procs tables.** A vertical scrollbar
+  paints on the right border of each scrollable table, with the
+  thumb position tracking the selected row vs total. The bar
+  hides automatically when the row count fits in the visible
+  area, so small fleets / short process lists don't get a
+  decorative track.
+- **Per-core CPU grid.** Procs view picks up a dedicated row
+  (or two, if there are more cores than fit in one) showing
+  every logical core with `c{n} {bar} {pct}%`, color-coded
+  green/yellow/red. Auto-flows based on terminal width, capped
+  at two rows so the procs body never gets squeezed.
+- **NET↓ / NET↑ sparklines.** The host history strip went from
+  two columns (CPU, MEM) to four (CPU, MEM, NET↓, NET↑). The
+  net charts auto-scale to the rolling max in their 15 s window
+  (floored at 1 KB/s so an idle window doesn't draw a wall of
+  full bars), and each title carries the live human-readable
+  rate, e.g. `NET↓ 1.2 MB/s`.
+- **Sparkline title shows the live value.** CPU and MEM titles
+  now include the current sample (e.g. `CPU 42%`), matching the
+  net titles. No need to glance back at the host overview line
+  to read the number off the chart.
+
+### Changed
+
+- **Smoother input.** The run loop now drains *all* queued key
+  events before redrawing, so holding `j` collapses ten queued
+  presses into a single render at the right final position.
+  Previously, each key triggered its own redraw and on slower
+  terminals (~10 ms render time) a 33 ms key-repeat felt
+  visibly chunky.
+- **`KeyEventKind::Release` and `Repeat` are filtered out.** On
+  kitty / Windows-style terminals where every keystroke fires
+  Press *and* Release events, neotop used to apply each binding
+  twice (e.g. Tab → flip → flip-back → no-op). Now only Press
+  events are honored.
+
+### Tests
+
+- 59 passing (was 54). New tests:
+  - `total_net_rates_sums_with_none_as_zero`
+  - `percore_height_zero_when_no_cores`
+  - `percore_height_fits_in_one_row_when_wide_enough`
+  - `percore_height_caps_at_two_rows`
+  - `percore_height_handles_narrow_terminal`
+
 ## [0.3.0] — 2026-04-25
 
 The "refined daily-driver" release. The Procs view picks up six
@@ -163,7 +218,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/nt2311/neotop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nt2311/neotop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nt2311/neotop/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nt2311/neotop/releases/tag/v0.1.0

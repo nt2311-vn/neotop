@@ -83,11 +83,20 @@ that actually matter for microVMs.
 **Procs view (`Tab` to switch):** htop-style process table for every
 PID on the host — `PID USER STATE CPU% RSS THR COMMAND`. The cursor
 is pid-locked, so sorting by CPU% never slides the selection off the
-process you were watching. Sortable by CPU%, RSS, PID, or command
-(`s`). Substring filter (`/`). SIGTERM/SIGKILL via `K` / `Ctrl-K`
-with a y/N prompt. Press `t` to switch to tree view (parent →
-children, standard `├─ │ └─` glyphs). Above the table, two 15-second
-sparklines track host CPU% (green) and host memory% (magenta).
+process you were watching. A vertical scrollbar tracks your
+position in the list. Sortable by CPU%, RSS, PID, or command (`s`).
+Substring filter (`/`). SIGTERM/SIGKILL via `K` / `Ctrl-K` with a
+y/N prompt. Press `t` to switch to tree view (parent → children,
+standard `├─ │ └─` glyphs).
+
+Above the procs table sits a **per-core CPU grid** — every logical
+core as `c{n} {bar} {pct}%`, color-coded green / yellow / red.
+Auto-flows over up to two rows depending on terminal width. Below
+that, four 15-second **sparklines**: host CPU% (green), memory%
+(magenta), NET↓ (cyan), NET↑ (yellow). Each sparkline title
+shows the current sample, e.g. `NET↓ 1.2 MB/s`. Net charts
+auto-scale to the rolling max in their window so small bursts stay
+visible next to large ones.
 
 When the terminal is at least 110 columns wide, a **detail pane**
 appears on the right of the Procs table showing the selected
@@ -150,6 +159,9 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Process tree — shipped in 0.3.0 (`t` toggle in Procs view)
 - [x] Per-device disk I/O (`/proc/diskstats`) — shipped in 0.2.0
 - [x] Memory history chart — shipped in 0.2.0
+- [x] Per-core CPU panel — shipped in 0.4.0
+- [x] Network history chart — shipped in 0.4.0
+- [x] Scrollbars on long tables — shipped in 0.4.0
 - [ ] Sort + filter inside tree mode (currently disabled when `t` is on)
 - [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
   via `intel_gpu_top`-style perf counters)

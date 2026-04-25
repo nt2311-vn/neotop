@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -56,7 +56,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Sparkline, Table, TableState, Wrap,
 };
 use ratatui::Terminal;
 use serde::Deserialize;
@@ -190,24 +191,35 @@ struct CpuSample {
 /// parse as "what's happening right now".
 const CPU_HISTORY_CAP: usize = 60;
 
-/// Ring buffer for host-level CPU% / memory% histories. Same window
-/// logic as `CpuHistory`: 60 samples × 250 ms tick = last 15 s.
+/// Ring buffer for host-level CPU% / memory% / net rate histories.
+/// Same window logic as `CpuHistory`: 60 samples × 250 ms tick = last
+/// 15 s. CPU and mem are stored as `0..=100` percentages; net is
+/// stored as raw bytes/sec so `draw_host_history` can compute a
+/// rolling max for the sparkline ceiling and label the actual rate.
 #[derive(Debug, Default)]
 struct HostHistory {
     cpu: VecDeque<u64>,
     mem: VecDeque<u64>,
+    net_down: VecDeque<u64>,
+    net_up: VecDeque<u64>,
 }
 
 impl HostHistory {
-    fn push(&mut self, cpu_pct: Option<f64>, mem_pct: f64) {
+    fn push(&mut self, cpu_pct: Option<f64>, mem_pct: f64, net_down_bps: u64, net_up_bps: u64) {
         push_pct(&mut self.cpu, cpu_pct.unwrap_or(0.0));
         push_pct(&mut self.mem, mem_pct);
+        push_raw(&mut self.net_down, net_down_bps);
+        push_raw(&mut self.net_up, net_up_bps);
     }
 }
 
 fn push_pct(buf: &mut VecDeque<u64>, pct: f64) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let v = pct.clamp(0.0, 100.0) as u64;
+    push_raw(buf, v);
+}
+
+fn push_raw(buf: &mut VecDeque<u64>, v: u64) {
     if buf.len() == CPU_HISTORY_CAP {
         buf.pop_front();
     }
@@ -652,7 +664,9 @@ impl App {
         // so the sparkline tracks the same numbers shown in the line-1
         // summary, not the previous tick.
         let mem_pct = mem_used_pct(&self.host_info);
-        self.host_history.push(self.host_info.cpu_pct, mem_pct);
+        let (net_down, net_up) = total_net_rates(&self.ifaces);
+        self.host_history
+            .push(self.host_info.cpu_pct, mem_pct, net_down, net_up);
 
         self.update_self_perf(started);
 
@@ -870,25 +884,48 @@ fn run<B: ratatui::backend::Backend>(
     let mut app = App::new(run_dir, refresh);
 
     loop {
+        // Drain *all* queued input first, then redraw once. Holding `j`
+        // used to fire one redraw per keypress, which on slow terminals
+        // turned ~33 ms key-repeat into visible chunkiness. With this
+        // collapse, a burst of ten queued j's becomes one render at the
+        // right final position.
+        while let Some(k) = poll_key(Duration::ZERO)? {
+            if handle_key(&mut app, k, run_dir) {
+                return Ok(());
+            }
+        }
+
         let render_started = Instant::now();
         terminal.draw(|f| draw(f, run_dir, &mut app))?;
         app.perf.perf.render_ms = duration_ms(render_started.elapsed());
 
-        // Wait for either keyboard input or the refresh interval, whichever
-        // comes first. This keeps CPU at ~0 when idle.
+        // Block until either the next key arrives or the refresh
+        // interval elapses, whichever is first. Idle = ~0 CPU.
         let elapsed = app.last_scan.elapsed();
         let wait = app.refresh.saturating_sub(elapsed);
-        if event::poll(wait)? {
-            if let Event::Key(k) = event::read()? {
-                if handle_key(&mut app, k, run_dir) {
-                    return Ok(());
-                }
+        if let Some(k) = poll_key(wait)? {
+            if handle_key(&mut app, k, run_dir) {
+                return Ok(());
             }
         }
 
         if app.last_scan.elapsed() >= app.refresh {
             app.tick(run_dir);
         }
+    }
+}
+
+/// Wait up to `timeout` for a key *press* event. `KeyEventKind::Release`
+/// and `Repeat` are filtered out — kitty / Windows-style terminals emit
+/// both a Press and a Release per stroke, which would otherwise double
+/// every action (e.g. two `Tab`s flipping the view back to the original).
+fn poll_key(timeout: Duration) -> io::Result<Option<crossterm::event::KeyEvent>> {
+    if !event::poll(timeout)? {
+        return Ok(None);
+    }
+    match event::read()? {
+        Event::Key(k) if k.kind == KeyEventKind::Press => Ok(Some(k)),
+        _ => Ok(None),
     }
 }
 
@@ -1282,14 +1319,16 @@ fn draw_vms_empty(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path) {
 
 fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = f.area();
+    let percore_h = percore_height(app.host_info.per_core_pct.len(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(4), // host overview
-            Constraint::Length(3), // host CPU + MEM history
-            Constraint::Min(5),    // procs table + detail pane (split horiz)
-            Constraint::Length(1), // help / prompt
+            Constraint::Length(1),         // title
+            Constraint::Length(4),         // host overview
+            Constraint::Length(percore_h), // per-core CPU grid (0..=2)
+            Constraint::Length(3),         // CPU + MEM + NET\u{2193} + NET\u{2191} sparklines
+            Constraint::Min(5),            // procs table + detail pane (split horiz)
+            Constraint::Length(1),         // help / prompt
         ])
         .split(area);
 
@@ -1303,11 +1342,14 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.batteries,
         &app.disks,
     );
-    draw_host_history(f, chunks[2], &app.host_history);
+    if percore_h > 0 {
+        draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
+    }
+    draw_host_history(f, chunks[3], &app.host_history);
 
     // Allocate the detail pane only when the terminal is wide enough.
     // Below ~110 cols the table needs every column to stay readable.
-    let body = chunks[3];
+    let body = chunks[4];
     if body.width >= 110 {
         let split = Layout::default()
             .direction(Direction::Horizontal)
@@ -1319,7 +1361,50 @@ fn draw_procs(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         draw_proc_table(f, body, app);
     }
-    draw_footer(f, chunks[4], app);
+    draw_footer(f, chunks[5], app);
+}
+
+/// Per-core row width = `c{nn} {bar} {pct}%  ` ≈ 11 columns. The grid
+/// auto-flows that many cells per row and caps at 2 rows so the
+/// procs body never gets squeezed into nothing on a 24-row terminal.
+const PERCORE_CELL_W: u16 = 11;
+const PERCORE_MAX_ROWS: u16 = 2;
+
+fn percore_height(num_cores: usize, width: u16) -> u16 {
+    if num_cores == 0 {
+        return 0;
+    }
+    let per_row = (width / PERCORE_CELL_W).max(1) as usize;
+    let rows = num_cores.div_ceil(per_row);
+    u16::try_from(rows.min(PERCORE_MAX_ROWS as usize)).unwrap_or(PERCORE_MAX_ROWS)
+}
+
+fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
+    let per_row = (area.width / PERCORE_CELL_W).max(1) as usize;
+    let max_cells = per_row.saturating_mul(PERCORE_MAX_ROWS as usize);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    for (i, &pct) in percore.iter().take(max_cells).enumerate() {
+        let bar = bar_glyph(pct);
+        let color = cpu_glyph_color(pct);
+        spans.push(Span::styled(
+            format!(" c{i:<2} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(bar.to_string(), Style::default().fg(color)));
+        spans.push(Span::styled(
+            format!(" {pct:>3.0}% "),
+            Style::default().fg(color),
+        ));
+        if (i + 1) % per_row == 0 {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+        }
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Live detail view for the process under the cursor. Reuses
@@ -1431,19 +1516,38 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Two side-by-side host-level sparklines: CPU% on the left, mem% on
-/// the right. 60 samples each → last 15 s at the default 250 ms tick.
+/// Four side-by-side host-level sparklines — CPU%, MEM%, NET↓, NET↑.
+/// 60 samples each → last 15 s at the default 250 ms tick. CPU/MEM
+/// share a 0-100 ceiling; the two net sparklines auto-scale to the
+/// rolling max in their window so a 30 KB/s burst is still visible
+/// next to a 200 MB/s spike on a different interface earlier.
 fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
-    let halves = Layout::default()
+    let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+        ])
         .split(area);
 
     let cpu_data: Vec<u64> = h.cpu.iter().copied().collect();
     let mem_data: Vec<u64> = h.mem.iter().copied().collect();
+    let down_data: Vec<u64> = h.net_down.iter().copied().collect();
+    let up_data: Vec<u64> = h.net_up.iter().copied().collect();
 
-    let cpu_title = format!(" host CPU · last {}s ", cpu_data.len() / 4);
-    let mem_title = format!(" host MEM · last {}s ", mem_data.len() / 4);
+    // Newest sample = label value; the user thinks "what's it doing
+    // *right now*", not "what's the average over the last 15 s".
+    let cpu_now = cpu_data.last().copied().unwrap_or(0);
+    let mem_now = mem_data.last().copied().unwrap_or(0);
+    let down_now = down_data.last().copied().unwrap_or(0);
+    let up_now = up_data.last().copied().unwrap_or(0);
+
+    let cpu_title = format!(" CPU {cpu_now}% ");
+    let mem_title = format!(" MEM {mem_now}% ");
+    let down_title = format!(" NET\u{2193} {} ", net::human_rate(Some(down_now)));
+    let up_title = format!(" NET\u{2191} {} ", net::human_rate(Some(up_now)));
 
     f.render_widget(
         Sparkline::default()
@@ -1451,7 +1555,7 @@ fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
             .data(&cpu_data)
             .max(100)
             .style(Style::default().fg(Color::Green)),
-        halves[0],
+        cols[0],
     );
     f.render_widget(
         Sparkline::default()
@@ -1459,8 +1563,43 @@ fn draw_host_history(f: &mut ratatui::Frame<'_>, area: Rect, h: &HostHistory) {
             .data(&mem_data)
             .max(100)
             .style(Style::default().fg(Color::Magenta)),
-        halves[1],
+        cols[1],
     );
+    // Auto-scale net sparklines to the rolling max so small bursts
+    // are still visible. Floor at 1 KB/s so a totally idle window
+    // doesn't draw a wall of full bars.
+    let down_max = down_data.iter().copied().max().unwrap_or(0).max(1024);
+    let up_max = up_data.iter().copied().max().unwrap_or(0).max(1024);
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(down_title))
+            .data(&down_data)
+            .max(down_max)
+            .style(Style::default().fg(Color::Cyan)),
+        cols[2],
+    );
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(up_title))
+            .data(&up_data)
+            .max(up_max)
+            .style(Style::default().fg(Color::Yellow)),
+        cols[3],
+    );
+}
+
+/// Sum the per-interface RX/TX rates currently visible in the host
+/// overview into a single (down, up) pair for the sparklines. None
+/// rates (first sample after startup) count as zero — that produces
+/// one frame of "no signal" on the chart, which is honest.
+fn total_net_rates(ifaces: &[net::Iface]) -> (u64, u64) {
+    let mut down = 0u64;
+    let mut up = 0u64;
+    for i in ifaces {
+        down = down.saturating_add(i.rx_rate.unwrap_or(0));
+        up = up.saturating_add(i.tx_rate.unwrap_or(0));
+    }
+    (down, up)
 }
 
 fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize, view: View) {
@@ -2035,6 +2174,12 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         );
 
     f.render_stateful_widget(table, area, &mut app.procs_table);
+    draw_scrollbar(
+        f,
+        area,
+        app.procs_visible.len(),
+        app.procs_table.selected().unwrap_or(0),
+    );
 }
 
 fn proc_state_style(c: char) -> Style {
@@ -2130,6 +2275,37 @@ fn draw_table(
         );
 
     f.render_stateful_widget(table, area, table_state);
+    draw_scrollbar(f, area, rows.len(), table_state.selected().unwrap_or(0));
+}
+
+/// Vertical scrollbar painted on the right edge of a bordered table.
+/// Hides when the row count is small enough that the table doesn't
+/// scroll — no point in a stub thumb that fills the whole track.
+///
+/// Drawn *after* the table so it overlays the right border. We use the
+/// border row directly as the track so the table loses no inner width.
+fn draw_scrollbar(f: &mut ratatui::Frame<'_>, area: Rect, total: usize, selected: usize) {
+    // Subtract 2: one for the table header row, one for the bottom
+    // border. The remaining height is roughly the visible row count.
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    if total <= visible_rows.max(1) {
+        return;
+    }
+    let mut state = ScrollbarState::new(total).position(selected);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("\u{2588}")
+        .style(Style::default().fg(Color::DarkGray));
+    // Inset by 1 so we don't clobber the corner glyphs of the block.
+    let inner = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    };
+    f.render_stateful_widget(bar, inner, &mut state);
 }
 
 fn draw_serial(f: &mut ratatui::Frame<'_>, area: Rect, selected: Option<&VmRow>) {
@@ -2380,5 +2556,54 @@ mod tests {
         for r in &v {
             assert!(r.prefix.is_empty(), "flat mode should leave prefix empty");
         }
+    }
+
+    fn iface(name: &str, rx: Option<u64>, tx: Option<u64>) -> net::Iface {
+        net::Iface {
+            name: name.into(),
+            rx_rate: rx,
+            tx_rate: tx,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn total_net_rates_sums_with_none_as_zero() {
+        // None on the first sample means "not enough data yet" — count
+        // it as zero rather than dropping the iface, so the sparkline
+        // shows a real, conservative trend.
+        let ifs = vec![
+            iface("eth0", Some(1_000), Some(500)),
+            iface("wlan0", None, Some(200)),
+            iface("tun0", Some(50), None),
+        ];
+        assert_eq!(total_net_rates(&ifs), (1_050, 700));
+        assert_eq!(total_net_rates(&[]), (0, 0));
+    }
+
+    #[test]
+    fn percore_height_zero_when_no_cores() {
+        assert_eq!(percore_height(0, 200), 0);
+    }
+
+    #[test]
+    fn percore_height_fits_in_one_row_when_wide_enough() {
+        // 4 cores at 11 cols each = 44 cols → fits 1 row in 88 wide.
+        assert_eq!(percore_height(4, 88), 1);
+    }
+
+    #[test]
+    fn percore_height_caps_at_two_rows() {
+        // 32 cores in an 80-col terminal → 7 cols per row → 5 rows
+        // before capping. We cap at 2 to leave the procs body room.
+        assert_eq!(percore_height(32, 80), 2);
+    }
+
+    #[test]
+    fn percore_height_handles_narrow_terminal() {
+        // 1 col-per-cell minimum; 2 cores in a 5-col terminal still
+        // returns at least 1 row, never panics.
+        assert!(percore_height(2, 5) >= 1);
     }
 }
