@@ -532,6 +532,7 @@ struct App {
     host_info: host::HostInfo,
     net_tracker: net::Tracker,
     ifaces: Vec<net::Iface>,
+    temp_tracker: temp::Tracker,
     temps: Vec<temp::Reading>,
     batteries: Vec<battery::Battery>,
     disk_tracker: disk::Tracker,
@@ -544,6 +545,16 @@ struct App {
     /// Live refresh interval. Initialised from `--refresh-ms` and
     /// then mutable at runtime via `+` / `-`.
     refresh: Duration,
+    /// Wraps 0..`SLOW_TICK_EVERY`. When it hits zero we re-scan
+    /// hwmon temperatures, batteries, and disk I/O — three sources
+    /// that change once per second at best and don't need to gate
+    /// the UI tick. See `SLOW_TICK_EVERY` for the cadence math.
+    slow_tick_counter: u32,
+    /// When `true`, `tick()` is skipped: every snapshot is frozen
+    /// where it was when the user pressed `space`. Input keeps
+    /// working, you can scroll, sort, kill, etc. — useful for
+    /// reading a busy table without rows shuffling underneath.
+    paused: bool,
 
     // Self-profiling
     perf: PerfTracker,
@@ -558,6 +569,14 @@ struct App {
 const MIN_REFRESH: Duration = Duration::from_millis(50);
 const MAX_REFRESH: Duration = Duration::from_millis(5000);
 
+/// How many fast ticks pass between full slow-scanner runs. At the
+/// default 250 ms tick this means temps / batteries / disks refresh
+/// once per second, which is plenty: hwmon updates ~1 Hz, batteries
+/// drift on a multi-second timescale, and disk-rate spikes you care
+/// about live for whole seconds. Cuts ~5 ms/tick on machines with a
+/// lot of hwmon nodes.
+const SLOW_TICK_EVERY: u32 = 4;
+
 impl App {
     fn new(run_dir: &Path, refresh: Duration) -> Self {
         let clk_tck = proc::clk_tck();
@@ -570,7 +589,8 @@ impl App {
         let prev_host_cpu = host::read_cpu_samples(&mut errors);
         let host_info = host::snapshot(None, &mut errors);
         let ifaces = net_tracker.snapshot(&mut errors);
-        let temps = temp::snapshot(&mut errors);
+        let mut temp_tracker = temp::Tracker::default();
+        let temps = temp_tracker.snapshot(&mut errors);
         let batteries = battery::snapshot();
         let mut disk_tracker = disk::Tracker::default();
         let disks = disk_tracker.snapshot(&mut errors);
@@ -618,6 +638,7 @@ impl App {
             host_info,
             net_tracker,
             ifaces,
+            temp_tracker,
             temps,
             batteries,
             disk_tracker,
@@ -626,6 +647,8 @@ impl App {
             clk_tck,
             last_scan: Instant::now(),
             refresh,
+            slow_tick_counter: 0,
+            paused: false,
             perf: PerfTracker::default(),
             errors,
         }
@@ -641,13 +664,27 @@ impl App {
         }
         self.perf.last_scan_started = Some(started);
 
+        // Fast-path scanners: every tick. These drive the live
+        // numbers (CPU% bar, sparkline, mem%, net rates, procs).
         self.vms = scan(run_dir, &mut self.prev_cpu, &mut self.history, self.clk_tck);
         self.host_info = host::snapshot(Some(&self.prev_host_cpu), &mut self.errors);
         self.prev_host_cpu = host::read_cpu_samples(&mut self.errors);
         self.ifaces = self.net_tracker.snapshot(&mut self.errors);
-        self.temps = temp::snapshot(&mut self.errors);
-        self.batteries = battery::snapshot();
-        self.disks = self.disk_tracker.snapshot(&mut self.errors);
+
+        // Slow-path scanners: every `SLOW_TICK_EVERY` ticks (~1 s at
+        // the default 250 ms tick). The data they read updates at
+        // most once per second on real hardware — re-walking
+        // `/sys/class/hwmon` four times a second was a pure waste of
+        // file descriptors and event-loop time, and it showed up in
+        // the perf footer as a fat `scan_ms`. We always run them on
+        // the very first tick (counter == 0) so the UI isn't blank
+        // while the user waits a second after launch.
+        if self.slow_tick_counter == 0 {
+            self.temps = self.temp_tracker.snapshot(&mut self.errors);
+            self.batteries = battery::snapshot();
+            self.disks = self.disk_tracker.snapshot(&mut self.errors);
+        }
+        self.slow_tick_counter = (self.slow_tick_counter + 1) % SLOW_TICK_EVERY;
 
         // Capture which PID the cursor is on *before* re-snapshotting,
         // so we can re-anchor the row index after sort/filter changes.
@@ -909,7 +946,14 @@ fn run<B: ratatui::backend::Backend>(
             }
         }
 
-        if app.last_scan.elapsed() >= app.refresh {
+        // When paused, every snapshot is frozen but we still
+        // service input — that's the whole point of pausing. We do
+        // bump `last_scan` forward so that on un-pause the next
+        // tick fires immediately instead of having to "catch up"
+        // through a backlog of missed intervals.
+        if app.paused {
+            app.last_scan = Instant::now();
+        } else if app.last_scan.elapsed() >= app.refresh {
             app.tick(run_dir);
         }
     }
@@ -969,6 +1013,12 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
         }
         KeyCode::Char('?') => {
             app.input = InputMode::Help;
+        }
+        KeyCode::Char(' ') => {
+            // Pause / resume the live tick. Useful when CPU% sort
+            // is reshuffling rows faster than you can read them —
+            // hit space, take your time, hit space again.
+            app.paused = !app.paused;
         }
         KeyCode::Char('+' | '=') => {
             // `=` so users on US layouts don't have to chord shift.
@@ -1134,7 +1184,7 @@ fn draw(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
 /// that used to live on line 2 of the host overview — that info is
 /// static and doesn't earn a line of the always-visible header.
 fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
-    let area = centered_rect(64, 26, f.area());
+    let area = centered_rect(64, 28, f.area());
     f.render_widget(Clear, area);
 
     let dim = Style::default().fg(Color::DarkGray);
@@ -1163,6 +1213,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
         kv_line("  ? ", "toggle this help", kb, dim),
         kv_line("  r ", "force an immediate refresh", kb, dim),
         kv_line("  + / -", "speed up / slow down the refresh tick", kb, dim),
+        kv_line("  space", "pause / resume the live tick", kb, dim),
         kv_line("  j / k", "move selection (also ↓/↑)", kb, dim),
         kv_line("  PgDn / PgUp", "jump 10 rows", kb, dim),
         Line::from(""),
@@ -1255,7 +1306,7 @@ fn draw_vms(f: &mut ratatui::Frame<'_>, run_dir: &Path, app: &mut App) {
 
     let selected = app.vms.get(app.vms_table.selected().unwrap_or(0));
 
-    draw_title(f, chunks[0], run_dir, app.vms.len(), app.view);
+    draw_title(f, chunks[0], run_dir, app.vms.len(), app.view, app.paused);
     draw_host(
         f,
         chunks[1],
@@ -1619,12 +1670,19 @@ fn total_net_rates(ifaces: &[net::Iface]) -> (u64, u64) {
     (down, up)
 }
 
-fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usize, view: View) {
+fn draw_title(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    run_dir: &Path,
+    count: usize,
+    view: View,
+    paused: bool,
+) {
     let view_label = match view {
         View::Vms => " VMs ",
         View::Procs => " Procs ",
     };
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " neosandbox top ",
             Style::default()
@@ -1641,14 +1699,31 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, run_dir: &Path, count: usi
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  watching {} — {count} VM(s)", run_dir.display())),
-    ]);
-    f.render_widget(Paragraph::new(title), area);
+    ];
+    if paused {
+        spans.push(paused_badge());
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Inverse-video badge appended to whichever title is active when the
+/// user has frozen the live tick. Bright enough that you can't miss
+/// it; deliberately *not* a popup, because pausing should leave the
+/// table fully readable.
+fn paused_badge() -> Span<'static> {
+    Span::styled(
+        "  [PAUSED — space to resume] ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let total = app.procs_all.len();
     let visible = app.procs_visible.len();
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(
             " neosandbox top ",
             Style::default()
@@ -1669,8 +1744,11 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             app.procs_sort.label(),
             app.procs_sort.arrow(),
         )),
-    ]);
-    f.render_widget(Paragraph::new(title), area);
+    ];
+    if app.paused {
+        title.push(paused_badge());
+    }
+    f.render_widget(Paragraph::new(Line::from(title)), area);
 }
 
 fn draw_host(

@@ -164,6 +164,9 @@ Things `btm`/`btop` have that neotop does not yet:
 - [x] Scrollbars on long tables — shipped in 0.4.0
 - [x] Cached per-pid snapshots (3× faster scan) — shipped in 0.5.0
 - [x] Friendly sensor labels (no more `pch_cannonlake#1`) — shipped in 0.5.0
+- [x] Adaptive blacklist for slow hwmon sensors (acpitz fix) — shipped in 0.6.0
+- [x] EMA-smoothed CPU% so rows don't jump around — shipped in 0.6.0
+- [x] Pause toggle (`space`) — shipped in 0.6.0
 - [ ] Sort + filter inside tree mode (currently disabled when `t` is on)
 - [ ] GPU (AMD `gpu_busy_percent` → NVIDIA via `nvml-wrapper` → Intel
   via `intel_gpu_top`-style perf counters)

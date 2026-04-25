@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-25
+
+The "actually responsive" release. Three findings, three fixes.
+
+### The smoking gun: `acpitz` was costing 3 seconds per tick
+
+A direct measurement on real hardware uncovered the root cause of
+the persistent lag complaint:
+
+```text
+hwmon0 (acpitz):  3031 ms     ← reading this one file
+hwmon1 (nvme):      15 ms
+hwmon2 (pch_*):      1 ms
+hwmon5 (coretemp):   9 ms
+```
+
+On certain HP/Dell laptops the kernel falls through to the ACPI
+`_TMP` method when serving `/sys/class/hwmon/hwmonN/tempK_input`,
+which polls the embedded controller over a mailbox protocol. A
+single read takes hundreds of milliseconds; the whole device adds
+up to multiple seconds. We were doing it four times a second.
+
+### Fixes
+
+- **`temp::Tracker` with adaptive blacklisting.** Every hwmon
+  device's full scan is timed; anything exceeding `SLOW_THRESHOLD`
+  (50 ms) is added to a `parked` set and skipped on every
+  subsequent tick. The first tick still pays the cost so the user
+  sees a number; from tick 2 onward the device is invisible to
+  the scanner. Measured impact: **`temp::snapshot()` 3,042,534 µs
+  → 8,822 µs (345× speedup)**. There's no flag, no config — slow
+  sensors just disappear.
+- **EMA-smoothed `cpu_pct` in `procs::Tracker`.** The user
+  reported that "process IDs feel like they jump up and down with
+  no clue". Cause: instantaneous CPU% is computed from a single
+  250 ms delta, so a process that briefly busy-waits for one
+  sample shows 50%, 0%, 50%, 0% across consecutive ticks and
+  jumps from the top of the list to the bottom each time.
+  Sorting and display now use an exponentially-weighted moving
+  average (α = 0.5): a single 50% spike registers as 25%, then
+  decays to ~6% by the third tick. Rows settle to their natural
+  position in 3-5 ticks instead of yo-yoing every tick.
+- **Slow-path scanners run once per second.** `temps`,
+  `batteries`, and `disks` now refresh on every fourth tick
+  (`SLOW_TICK_EVERY = 4`). hwmon and battery firmware updates at
+  ~1 Hz on real hardware; reading them four times a second was
+  pure waste. The fast-path scanners (host stats, net rates,
+  procs) stay at full tick rate so the visible numbers don't
+  feel laggy.
+- **Pause toggle (`space`).** Freezes every snapshot in place
+  while keeping the UI fully interactive — you can scroll, sort,
+  filter, kill, switch views. Useful when CPU% sort is reshuffling
+  rows faster than you can read them. A bright `[PAUSED — space
+  to resume]` badge lights up the title bar so you can't forget
+  it's on.
+
+### Changed
+
+- `temp::snapshot()` (free function) replaced by `temp::Tracker`
+  with an instance method. `App` now holds a long-lived
+  `temp_tracker` so the parked set persists across ticks.
+- `App` gained `slow_tick_counter: u32` and `paused: bool`.
+- `procs::Sample` gained `smoothed_cpu: f64`. `cpu_pct` returned
+  by `Tracker::snapshot` is now the EMA, not the instantaneous
+  value.
+- New `procs::ema_blend()` pure helper for tests.
+
+### Tests
+
+- 63 passing (was 59). New tests:
+  - `procs::ema_blend_at_alpha_half_is_arithmetic_mean`
+  - `procs::ema_blend_decays_a_lone_spike_in_a_handful_of_ticks`
+  - `procs::ema_blend_converges_toward_steady_state`
+  - `temp::tracker_skips_already_parked_paths`
+
 ## [0.5.0] — 2026-04-25
 
 The "stop feeling laggy" release. `neotop` now feels like a monitor
@@ -273,7 +348,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311/neotop/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/nt2311/neotop/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/nt2311/neotop/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nt2311/neotop/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nt2311/neotop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nt2311/neotop/compare/v0.2.0...v0.3.0

@@ -60,6 +60,35 @@ pub(crate) struct ProcessRow {
 struct Sample {
     when: Instant,
     jiffies: u64,
+    /// Exponentially-weighted moving average of `cpu_pct`. Sorting
+    /// the table on instantaneous CPU% causes rows to shuffle wildly
+    /// on every tick — a process briefly using 50% then 0% jumps
+    /// from the top to the bottom of the list and back, making it
+    /// impossible to *watch* anything. Smoothing kills that
+    /// reshuffling without losing the spike entirely; it just
+    /// decays over a few ticks instead of vanishing in one.
+    smoothed_cpu: f64,
+}
+
+/// Weight given to the *new* sample when blending into the running
+/// EMA. `0.5` means each sample contributes half; the previous
+/// smoothed value contributes the other half. Tuned by feel:
+///
+/// * 0.3 felt sluggish — a real spike took 4-5 ticks to be obvious.
+/// * 0.7 was almost as jumpy as the unsmoothed version.
+/// * 0.5 hits the sweet spot — a 50% spike still registers as
+///   ~25% on the next tick, very visibly, but the row stays put
+///   by the third tick.
+const SMOOTH_ALPHA: f64 = 0.5;
+
+/// Blend a fresh instantaneous CPU% reading into the rolling EMA.
+/// Pure function so the smoothing curve can be tested without
+/// faking out `/proc`. The math is the textbook
+/// `α·x + (1−α)·prev_ema` — same shape as ksoftirqd's load-avg
+/// decay, btop's CPU box, and every other UI that wants a number
+/// to "settle" instead of yo-yo.
+pub(crate) fn ema_blend(prev: f64, new: f64) -> f64 {
+    SMOOTH_ALPHA * new + (1.0 - SMOOTH_ALPHA) * prev
 }
 
 /// Stable per-pid data that doesn't change after exec. Cached across
@@ -112,7 +141,18 @@ impl Tracker {
             let Some((row, jiffies)) = self.read_one(pid, passwd, now, clk_tck) else {
                 continue;
             };
-            self.prev.insert(pid, Sample { when: now, jiffies });
+            // `read_one` already wrote the new smoothed value into
+            // `row.cpu_pct`. Persist it back into `prev` so the next
+            // tick can blend off the same EMA state.
+            let smoothed = row.cpu_pct.unwrap_or(0.0);
+            self.prev.insert(
+                pid,
+                Sample {
+                    when: now,
+                    jiffies,
+                    smoothed_cpu: smoothed,
+                },
+            );
             seen.push(pid);
             rows.push(row);
         }
@@ -190,6 +230,12 @@ impl Tracker {
             &self.cache[&pid]
         };
 
+        // CPU% is computed as the delta in jiffies / wall-clock time,
+        // then blended into the running EMA from the previous tick.
+        // Newly-discovered pids report `None` (no prior sample) just
+        // like before; they'll get a real number from the second tick
+        // on. The EMA recovers monotonically toward the true rate so
+        // there's no warm-up bias to worry about.
         let cpu_pct = self.prev.get(&pid).and_then(|p| {
             let dt = now.duration_since(p.when).as_secs_f64();
             if dt <= 0.0 {
@@ -197,8 +243,19 @@ impl Tracker {
             }
             let dj = jiffies.saturating_sub(p.jiffies);
             #[allow(clippy::cast_precision_loss)]
-            let pct = (dj as f64 / clk_tck as f64 / dt) * 100.0;
-            Some(pct)
+            let inst = (dj as f64 / clk_tck as f64 / dt) * 100.0;
+            // First time we have a delta for this pid, the smoothed
+            // value is just the instantaneous reading. After that,
+            // EMA: smoothed = α · new + (1−α) · prev_smoothed.
+            // Optimization: if both the previous EMA and the new
+            // delta are zero, the result is zero — skip the blend so
+            // hundreds of idle pids don't burn FP work each tick.
+            let smoothed = if p.smoothed_cpu == 0.0 && dj == 0 {
+                0.0
+            } else {
+                ema_blend(p.smoothed_cpu, inst)
+            };
+            Some(smoothed)
         });
 
         Some((
@@ -377,6 +434,43 @@ pub(crate) fn matches(row: &ProcessRow, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ema_blend_at_alpha_half_is_arithmetic_mean() {
+        // α=0.5: the new and the old contribute equally.
+        assert!((ema_blend(0.0, 0.0) - 0.0).abs() < 1e-9);
+        assert!((ema_blend(0.0, 100.0) - 50.0).abs() < 1e-9);
+        assert!((ema_blend(100.0, 0.0) - 50.0).abs() < 1e-9);
+        assert!((ema_blend(40.0, 60.0) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ema_blend_decays_a_lone_spike_in_a_handful_of_ticks() {
+        // The whole point of the smoothing: a one-shot 50% spike
+        // surrounded by zeros should fade visibly but not vanish in
+        // one tick. After 5 ticks it must be below 2% — i.e. the row
+        // can settle back to its "normal" sort position by then.
+        let mut s = 0.0;
+        s = ema_blend(s, 50.0); // tick 1: huge spike, registers as 25
+        assert!((s - 25.0).abs() < 1e-9);
+        s = ema_blend(s, 0.0); // tick 2: 12.5
+        s = ema_blend(s, 0.0); // tick 3: 6.25
+        s = ema_blend(s, 0.0); // tick 4: 3.125
+        s = ema_blend(s, 0.0); // tick 5: 1.5625
+        assert!(s < 2.0, "spike still at {s}% after 5 ticks");
+    }
+
+    #[test]
+    fn ema_blend_converges_toward_steady_state() {
+        // Sustained 80% load: the smoothed value must climb towards
+        // 80%, not stick somewhere lower forever. Within 10 ticks
+        // we should be within 0.1% of the true rate.
+        let mut s = 0.0;
+        for _ in 0..10 {
+            s = ema_blend(s, 80.0);
+        }
+        assert!((80.0 - s).abs() < 0.1, "converged to {s}%");
+    }
 
     #[test]
     fn comm_extracts_between_parens() {

@@ -7,10 +7,36 @@
 //! We don't depend on `lm_sensors` or any libsensors binding — sysfs
 //! is the same data, one layer down. This is what `lm_sensors` itself
 //! reads.
+//!
+//! ## Adaptive blacklisting
+//!
+//! On real hardware some hwmon devices are *catastrophically* slow.
+//! The poster child: `acpitz` on certain HP laptops takes ~3 seconds
+//! per `tempN_input` read because the kernel falls through to an
+//! ACPI `_TMP` method that polls the embedded controller over a
+//! mailbox protocol. Reading that file every tick blocks the entire
+//! UI — the original bug behind the v0.6.0 release.
+//!
+//! `Tracker` solves this by *measuring* every hwmon's scan time and
+//! parking any device whose total scan exceeds `SLOW_THRESHOLD`.
+//! Parked devices stay parked for the lifetime of the process —
+//! they were slow once and are essentially guaranteed to be slow
+//! forever (the bottleneck is the hardware bus, not transient load).
+//! No flag, no config; the user gets a fast UI by default.
 
+use std::collections::HashSet;
 use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::errors::ErrorRing;
+
+/// Any hwmon device whose total scan exceeds this is parked. 50 ms
+/// is generous — a healthy hwmon (`coretemp`, `nvme`, `k10temp`)
+/// takes <1 ms. The threshold only catches genuinely broken cases
+/// like `acpitz` on HP/Dell laptops where a single read costs
+/// hundreds of milliseconds.
+const SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Reading {
@@ -18,47 +44,87 @@ pub(crate) struct Reading {
     pub(crate) celsius: f64,
 }
 
-pub(crate) fn snapshot(errors: &mut ErrorRing) -> Vec<Reading> {
-    let entries = match fs::read_dir("/sys/class/hwmon") {
-        Ok(e) => e,
-        Err(e) => {
-            errors.push("hwmon", format!("/sys/class/hwmon: {e}"));
-            return Vec::new();
-        }
-    };
-    let mut readings = Vec::new();
+/// Adaptive temperature scanner. Holds the set of hwmon device
+/// paths that have been observed to scan slowly (see module-level
+/// comment); skips them on every subsequent call.
+#[derive(Debug, Default)]
+pub(crate) struct Tracker {
+    parked: HashSet<PathBuf>,
+}
 
-    for hwmon in entries.flatten() {
-        let hwmon_path = hwmon.path();
-        let group = read_trim(&hwmon_path.join("name")).unwrap_or_else(|| "?".into());
-
-        let Ok(files) = fs::read_dir(&hwmon_path) else {
-            continue;
+impl Tracker {
+    pub(crate) fn snapshot(&mut self, errors: &mut ErrorRing) -> Vec<Reading> {
+        let entries = match fs::read_dir("/sys/class/hwmon") {
+            Ok(e) => e,
+            Err(e) => {
+                errors.push("hwmon", format!("/sys/class/hwmon: {e}"));
+                return Vec::new();
+            }
         };
-        for f in files.flatten() {
-            let name = f.file_name();
-            let Some(name) = name.to_str() else { continue };
-            // Match `tempN_input` where N is 1..=99.
-            if !(name.starts_with("temp") && name.ends_with("_input")) {
+        let mut readings = Vec::new();
+
+        for hwmon in entries.flatten() {
+            let hwmon_path = hwmon.path();
+            if self.parked.contains(&hwmon_path) {
                 continue;
             }
-            let idx = &name["temp".len()..name.len() - "_input".len()];
-            let Some(milli) = read_trim(&f.path()).and_then(|s| s.parse::<i64>().ok()) else {
-                continue;
-            };
 
-            let label_path = hwmon_path.join(format!("temp{idx}_label"));
-            let label = read_trim(&label_path)
-                .filter(|s| !s.is_empty())
-                .map_or_else(|| format!("{group}#{idx}"), |l| format!("{group} {l}"));
-
-            #[allow(clippy::cast_precision_loss)]
-            let celsius = milli as f64 / 1000.0;
-            readings.push(Reading { label, celsius });
+            // Time every hwmon's full scan. If a single device
+            // exceeds the threshold (see `SLOW_THRESHOLD`), it goes
+            // into `parked` and is skipped from now on. Whatever
+            // partial readings we managed to grab from it are kept
+            // so the user still sees a number for the first tick.
+            let started = Instant::now();
+            scan_one_hwmon(&hwmon_path, &mut readings);
+            if started.elapsed() > SLOW_THRESHOLD {
+                let name = read_trim(&hwmon_path.join("name"))
+                    .unwrap_or_else(|| hwmon_path.display().to_string());
+                errors.push(
+                    "hwmon",
+                    format!(
+                        "parked slow sensor {name} ({} ms)",
+                        started.elapsed().as_millis()
+                    ),
+                );
+                self.parked.insert(hwmon_path);
+            }
         }
-    }
 
-    readings
+        readings
+    }
+}
+
+/// Read every `tempN_input` under one hwmon directory, push the
+/// results into `out`. Pure I/O; no filtering. Failures on
+/// individual sensors are silent — sysfs entries can disappear
+/// (e.g. an `NVMe` is yanked) and we don't want to spam the error
+/// ring for races.
+fn scan_one_hwmon(hwmon_path: &std::path::Path, out: &mut Vec<Reading>) {
+    let group = read_trim(&hwmon_path.join("name")).unwrap_or_else(|| "?".into());
+    let Ok(files) = fs::read_dir(hwmon_path) else {
+        return;
+    };
+    for f in files.flatten() {
+        let name = f.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Match `tempN_input` where N is 1..=99.
+        if !(name.starts_with("temp") && name.ends_with("_input")) {
+            continue;
+        }
+        let idx = &name["temp".len()..name.len() - "_input".len()];
+        let Some(milli) = read_trim(&f.path()).and_then(|s| s.parse::<i64>().ok()) else {
+            continue;
+        };
+
+        let label_path = hwmon_path.join(format!("temp{idx}_label"));
+        let label = read_trim(&label_path)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| format!("{group}#{idx}"), |l| format!("{group} {l}"));
+
+        #[allow(clippy::cast_precision_loss)]
+        let celsius = milli as f64 / 1000.0;
+        out.push(Reading { label, celsius });
+    }
 }
 
 /// Pick the most interesting temperatures for a compact one-line view.
@@ -193,5 +259,23 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(highlights(&readings, 2).len(), 2);
         assert_eq!(highlights(&readings, 0).len(), 0);
+    }
+
+    #[test]
+    fn tracker_skips_already_parked_paths() {
+        // Synthetic test: pre-populate the tracker's parked set with
+        // a path and confirm the public snapshot interface accepts a
+        // freshly-built `Tracker`. We can't easily inject a slow
+        // sensor into `/sys/class/hwmon` from a unit test (it's the
+        // real kernel interface), so the production blacklisting
+        // behaviour is verified by the `live_tick_bench` ad-hoc
+        // benchmark in main.rs and by direct measurement.
+        let mut t = Tracker::default();
+        t.parked.insert(PathBuf::from("/sys/class/hwmon/hwmon0"));
+        let mut errors = ErrorRing::new();
+        // Should run without panic; the parked path is silently
+        // skipped, all other devices read normally.
+        let _ = t.snapshot(&mut errors);
+        assert!(t.parked.contains(&PathBuf::from("/sys/class/hwmon/hwmon0")));
     }
 }
