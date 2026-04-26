@@ -1,0 +1,90 @@
+name: codeql
+
+# CodeQL is GitHub's first-party SAST. We already run Semgrep in
+# `ci.yml` for fast PR-time feedback; CodeQL complements it with
+# data-flow analysis (taint tracking, source→sink reachability)
+# and uploads SARIF directly to the repo's Security tab where the
+# maintainer can triage findings without leaving GitHub.
+#
+# Free for public repositories. Rust support landed mid-2024 and
+# is the canonical way to satisfy OpenSSF Scorecard's
+# `SAST` heuristic on Rust projects.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Weekly retro-scan catches advisories CodeQL adds *after* a
+  # commit lands. Monday 04:23 UTC stays out of weekday-business
+  # hours when CI capacity is busy.
+  schedule:
+    - cron: "23 4 * * 1"
+
+# Cancel superseded scans on the same ref so PR retries don't
+# pile up consuming CodeQL minutes.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Required for SARIF upload back to the repo Security tab.
+      security-events: write
+      # `actions: read` lets CodeQL inspect job artifacts; needed
+      # only on private repos but harmless on public ones.
+      actions: read
+      contents: read
+      # Required so CodeQL can mark a PR with its findings.
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rust is the only language we ship today; the matrix
+        # layout makes adding a second one (e.g. `actions` for the
+        # workflow files themselves) a one-line change later.
+        language: [rust]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # Reuse the same compile cache the main `check` job uses so
+      # CodeQL doesn't pay the full 5-minute cold build twice.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: codeql
+
+      - name: CodeQL init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `manual` build-mode pairs cleanly with our explicit
+          # `cargo build` step below — `autobuild` works too but
+          # tends to pick up stray Cargo.toml files in vendored
+          # subdirs we don't want analysed.
+          build-mode: manual
+          # Pin the standard security suite. `+security-extended`
+          # adds queries that flag things like missing TLS
+          # verification or weak hash usage — relevant the day we
+          # add network code; harmless until then.
+          queries: security-extended,security-and-quality
+
+      - name: cargo build (release, --locked)
+        # CodeQL extracts CFG/IR from compiler output, so we need
+        # a real build. `--locked` keeps the dep graph identical
+        # to the one we audit elsewhere — no surprise new
+        # transitive deps slipping into the scan.
+        run: cargo build --release --locked
+
+      - name: CodeQL analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

@@ -1,0 +1,76 @@
+version: 2
+# Automated dependency updates. Two ecosystems matter on a Rust
+# project hosted on GitHub Actions:
+#
+#   - `cargo`         — the actual application deps in Cargo.toml
+#                       and the transitive set in Cargo.lock.
+#   - `github-actions` — the action versions pinned in
+#                       .github/workflows/*.yml. These deserve
+#                       weekly review because GitHub deprecates
+#                       major Action versions on its own schedule.
+#
+# Every PR Dependabot opens is auto-assigned to the owner via the
+# `reviewers:` key — combined with branch protection's required
+# status checks, that means *you* see the diff, *you* see CI go
+# green or red, *you* hit Merge. No automated merge here on
+# purpose: a Rust dep bump can quietly tighten MSRV or shift
+# Clippy lint output, both of which are caught by `cargo clippy
+# --locked` but only matter if you read the run.
+
+updates:
+  # ---------------------------------------------------------------
+  # Rust crate dependencies (Cargo.toml + Cargo.lock).
+  # ---------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Bangkok
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    reviewers:
+      - nt2311-vn
+    commit-message:
+      prefix: chore(deps)
+      include: scope
+    # Group patch + minor updates into a single PR so the review
+    # surface is "one weekly bump", not five PRs racing against
+    # each other. Major versions stay individual because they
+    # often need code-side changes.
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # MSRV is 1.88 — Dependabot will surface bumps that require a
+    # newer compiler, but we don't auto-accept them. Manual review
+    # decides whether to chase the new MSRV or pin the dep.
+
+  # ---------------------------------------------------------------
+  # GitHub Actions versions in workflow files.
+  # ---------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Bangkok
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    reviewers:
+      - nt2311-vn
+    commit-message:
+      prefix: chore(ci)
+      include: scope
+    groups:
+      gha-minor-and-patch:
+        update-types:
+          - minor
+          - patch

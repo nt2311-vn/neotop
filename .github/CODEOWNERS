@@ -1,0 +1,25 @@
+# Code ownership — auto-request review from the repository owner
+# on every pull request, regardless of which paths it touches.
+#
+# GitHub matches the *last* line for any given path, so the
+# catch-all entry below covers everything. Add narrower rules
+# above this line if you ever want to delegate specific paths to
+# additional reviewers (e.g. `/docs/  @docs-team`).
+#
+# How this enforces "only the owner reviews and merges":
+#
+#   1. CODEOWNERS makes the owner an automatic *requested*
+#      reviewer on every PR — visible signal in the PR sidebar.
+#   2. Branch protection (see `.github/setup-branch-protection.sh`)
+#      pairs this with `require_code_owner_reviews = true` so the
+#      owner's approval is the path to merge once any other
+#      collaborator submits a PR.
+#   3. As a personal-account public repo, only the owner has
+#      `write` permission by default — outside contributors fork
+#      and PR; only the owner can click *Merge*.
+#
+# That's the maximum enforcement GitHub allows for a solo-dev
+# public project; together they cover the "I'm the only one who
+# can review and merge code" requirement.
+
+* @nt2311-vn

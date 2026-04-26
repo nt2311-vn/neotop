@@ -1,0 +1,82 @@
+name: scorecard
+
+# OpenSSF Scorecard — automated assessment of supply-chain best
+# practices. Runs a couple dozen heuristic checks (branch
+# protection enabled, signed commits, pinned dependencies, SAST
+# present, dangerous-workflow patterns absent, etc.) and uploads
+# the result as SARIF so it appears in the repo Security tab next
+# to the CodeQL findings.
+#
+# Why ship this on a public repo:
+#
+#   * It surfaces regressions in security posture (dropping a
+#     pinned action SHA, accidentally disabling branch protection)
+#     as PRs from the maintainer to themselves.
+#   * The score badge — `https://api.scorecard.dev/projects/...` —
+#     gives drive-by readers an at-a-glance trust signal without
+#     them having to read every workflow.
+#
+# Free for public repositories. Private repos need a paid plan.
+
+on:
+  # Run on every push to main so badge stays current.
+  push:
+    branches: [main]
+  # Re-run when branch protection changes — that's the most
+  # common scoring delta and the trigger Scorecard documents.
+  branch_protection_rule:
+  # Weekly retrigger picks up new heuristic checks Scorecard adds
+  # upstream without us having to bump the action version.
+  schedule:
+    - cron: "0 5 * * 1"
+
+# Top-level read-only by default; specific jobs widen below.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # SARIF upload to the Security tab.
+      security-events: write
+      # OIDC for keyless signing of the result so the scorecard
+      # API can verify provenance (`publish_results: true`).
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Scorecard examines repo metadata + git history; full
+          # history is not needed, but the default fetch-depth
+          # (1) is fine. We pin to that explicitly so a future
+          # default change doesn't inflate scan time.
+          persist-credentials: false
+
+      - name: scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # `publish_results: true` opts the project into the
+          # public Scorecard API at https://api.scorecard.dev so
+          # consumers can fetch the score programmatically.
+          # Toggle to `false` if you ever want to keep results
+          # internal-only.
+          publish_results: true
+
+      - name: upload scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+      # Keep the raw SARIF as a build artifact for offline review.
+      # GitHub trims SARIF for the Security tab; the artifact is
+      # the full unfiltered output.
+      - name: upload scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 14

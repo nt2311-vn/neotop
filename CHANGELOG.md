@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-04-26
+
+### Public-repo hardening — CODEOWNERS + CodeQL + Scorecard + Dependabot
+
+Repo is now ready to flip to public on GitHub. Six new files
+together encode the security posture and merge policy:
+
+- **`.github/CODEOWNERS`** — catch-all `* @nt2311-vn`. Combined
+  with branch protection's `require_code_owner_reviews`, every
+  PR auto-requests owner review; no other path to merge.
+- **`.github/dependabot.yml`** — weekly Monday `cargo` + weekly
+  `github-actions` updates, both grouped to one PR per ecosystem
+  for minor/patch bumps. Auto-assigned to `nt2311-vn`. Major
+  bumps stay individual (often need code-side changes).
+- **`.github/SECURITY.md`** — private disclosure policy via
+  GitHub Security Advisories or maintainer email; documented
+  threat model (no network, no exec, no arbitrary dlopen besides
+  NVML); 48h ack / 7d severity / 30d fix targets.
+- **`.github/pull_request_template.md`** — checklist for
+  incoming PRs (fmt, clippy, tests, audit, deny, smoke).
+- **`.github/workflows/codeql.yml`** — GitHub's first-party SAST
+  with data-flow analysis; security-extended + security-and-quality
+  query suites; SARIF uploaded to the Security tab; weekly
+  retro-scan picks up new advisories CodeQL adds upstream.
+- **`.github/workflows/scorecard.yml`** — OpenSSF Scorecard for
+  supply-chain best-practice scoring; runs on push, weekly, and
+  on `branch_protection_rule` events; publishes to the public
+  Scorecard API for badging.
+- **`.github/setup-branch-protection.sh`** — one-shot `gh api`
+  bootstrap. Run once after going public to apply: required PR,
+  CODEOWNERS-required review, four required status checks
+  (`check (stable)`, `check (1.88)`, `security`,
+  `codeql analyze (rust)`), strict up-to-date branch, linear
+  history, no force-push, no deletion, conversation-resolution
+  required. Idempotent — re-runnable without side-effects.
+
+### Why this enforces "only the owner reviews and merges"
+
+Three layers, designed so failure of any one is recoverable:
+
+1. **Permission model.** Personal-account public repos give only
+   the owner `write` access by default. Outside contributors fork
+   and PR; only the owner can click *Merge*.
+2. **Branch protection.** `main` rejects direct pushes, requires
+   CODEOWNERS review, requires the four CI status checks above.
+3. **CODEOWNERS auto-request.** Every PR routes to `@nt2311-vn`
+   for review without manual triage.
+
+`required_approving_review_count` is set to **0** (not 1+)
+deliberately — GitHub forbids self-approval, so a non-zero count
+on a solo project would deadlock every PR the owner writes
+themselves. The permission model carries the "only I merge"
+guarantee; CODEOWNERS provides the auditable trail.
+
+### Verification
+
+- `actionlint` clean across all four workflows.
+- `bash -n` clean on `setup-branch-protection.sh`.
+- `jq` parse clean on the embedded protection payload.
+- `cargo audit` + `cargo deny check` still pass on the new lock.
+
+### Rollout instructions
+
+1. Push this release.
+2. Flip the repo to public in *Settings → General → Danger
+   Zone*.
+3. Authenticate `gh` as the owner: `gh auth status`.
+4. From the repo root: `bash .github/setup-branch-protection.sh`.
+5. Apply the companion UI settings the script prints at the end
+   (squash + rebase merging, dependabot alerts, secret scanning,
+   private vulnerability reporting).
+
 ## [0.19.1] — 2026-04-26
 
 ### CI: supply-chain + SAST scans
