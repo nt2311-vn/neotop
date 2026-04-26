@@ -216,9 +216,7 @@ fn read_kernel() -> Option<String> {
 }
 
 fn read_cpu_count() -> usize {
-    fs::read_to_string("/proc/cpuinfo")
-        .map(|s| parse_cpu_count(&s))
-        .unwrap_or(0)
+    fs::read_to_string("/proc/cpuinfo").map_or(0, |s| parse_cpu_count(&s))
 }
 
 fn read_cpu_model() -> Option<String> {

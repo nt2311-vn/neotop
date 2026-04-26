@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] — 2026-04-26
+
+### CI green again
+
+Maintenance release. Fixes the `check (stable)` and `check (1.80)`
+GitHub Actions jobs which had drifted on two fronts:
+
+- **MSRV bumped from 1.80 to 1.88** — transitive deps
+  (`darling 0.23`, `instability 0.3.12`, `unicode-segmentation
+  1.13`) now require rustc 1.88, and the `--locked` build can't
+  resolve around them. The 1.80 promise was speculative; the
+  project never had a documented user blocked on it. Bumping is
+  the honest fix.
+- **9 new clippy lints (rustc 1.95)** addressed:
+  - `host.rs`, `procs.rs`: `map(...).unwrap_or(...)` →
+    `map_or(...)`
+  - `procs.rs::sort_rows`: `sort_by` for Mem / Pid → `sort_by_key`
+    (with `Reverse` for the descending case)
+  - `main.rs`: `Duration::from_millis(5000)` →
+    `Duration::from_secs(5)`
+  - `main.rs`: three `collapsible_match` arms (Ctrl+K SIGKILL,
+    Shift+K SIGTERM, the filter-mode char-typing arm) — moved
+    the inner `if` into the match guard
+  - `main.rs`: stray trailing comma in a `format!` call
+  - `groups.rs::ContainerNames::refresh_if_stale`:
+    `Option::map_or(true, …)` → `Option::is_none_or(…)`
+    (now stable since 1.82)
+
+No behavior change. 166 tests still pass. CI matrix updated to
+test `stable + 1.88` instead of `stable + 1.80`.
+
 ## [0.17.0] — 2026-04-26
 
 ### Group view: per-app sub-buckets inside the runtime band

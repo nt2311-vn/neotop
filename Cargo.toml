@@ -1,8 +1,8 @@
 [package]
 name = "neotop"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/nt2311-vn/neotop"
 description = "Linux TUI for host metrics, processes, and GPU activity (CPU spectrum, NVIDIA + AMD GPU, container groups)"

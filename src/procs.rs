@@ -422,7 +422,7 @@ fn read_io_bytes(base: &str) -> (Option<u64>, Option<u64>) {
 /// the pid probably just exited.
 fn uid_from_proc_dir(base: &str) -> u32 {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(base).map(|m| m.uid()).unwrap_or(0)
+    fs::metadata(base).map_or(0, |m| m.uid())
 }
 
 // -----------------------------------------------------------------------------
@@ -549,8 +549,8 @@ pub(crate) fn sort_rows(rows: &mut [ProcessRow], by: SortBy) {
                 .partial_cmp(&a.cpu_pct.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        SortBy::Mem => rows.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes)),
-        SortBy::Pid => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
+        SortBy::Mem => rows.sort_by_key(|r| std::cmp::Reverse(r.rss_bytes)),
+        SortBy::Pid => rows.sort_by_key(|r| r.pid),
         SortBy::Command => rows.sort_by(|a, b| a.command.cmp(&b.command)),
     }
 }

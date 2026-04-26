@@ -444,7 +444,7 @@ struct App {
 }
 
 const MIN_REFRESH: Duration = Duration::from_millis(50);
-const MAX_REFRESH: Duration = Duration::from_millis(5000);
+const MAX_REFRESH: Duration = Duration::from_secs(5);
 
 /// Slow scanners (temps / batteries / disks / GPU / container names)
 /// fire every Nth fast tick so a 1 s UI tick → ~4 s sensor cadence.
@@ -1251,10 +1251,14 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
         }
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, 1),
         // Ctrl-k is SIGKILL; must match before the bare `k` nav arm.
-        KeyCode::Char('k') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.selected_proc().is_some() {
-                app.input = InputMode::Confirm(KillSig::Kill);
-            }
+        // The selection check rides as a guard so the arm doesn't
+        // swallow the keypress when nothing's selected — the `_ =>`
+        // fallthrough still ignores it but at least the intent
+        // reads on one line.
+        KeyCode::Char('k')
+            if k.modifiers.contains(KeyModifiers::CONTROL) && app.selected_proc().is_some() =>
+        {
+            app.input = InputMode::Confirm(KillSig::Kill);
         }
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, -1),
         KeyCode::PageDown => move_selection(app, 10),
@@ -1298,11 +1302,9 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
         KeyCode::Char('/') => {
             app.input = InputMode::Filter;
         }
-        KeyCode::Char('K') => {
-            // Shift+K = SIGTERM (Ctrl+K = SIGKILL handled above).
-            if app.selected_proc().is_some() {
-                app.input = InputMode::Confirm(KillSig::Term);
-            }
+        // Shift+K = SIGTERM (Ctrl+K = SIGKILL handled above).
+        KeyCode::Char('K') if app.selected_proc().is_some() => {
+            app.input = InputMode::Confirm(KillSig::Term);
         }
         _ => {}
     }
@@ -1328,17 +1330,18 @@ fn handle_filter_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
-        KeyCode::Char(c) => {
-            // Skip Ctrl/Alt-modified Chars (already routed upstream).
+        // Skip Ctrl/Alt-modified Chars (already routed upstream) by
+        // riding the modifier check as a match guard — clippy's
+        // collapsible_match was complaining about the nested `if`.
+        KeyCode::Char(c)
             if !k.modifiers.contains(KeyModifiers::CONTROL)
-                && !k.modifiers.contains(KeyModifiers::ALT)
-            {
-                let pinned = app.selected_proc().map(|r| r.pid);
-                app.procs_filter.push(c);
-                app.recompute_procs();
-                app.reanchor_proc_selection(pinned);
-                app.clamp_selections();
-            }
+                && !k.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let pinned = app.selected_proc().map(|r| r.pid);
+            app.procs_filter.push(c);
+            app.recompute_procs();
+            app.reanchor_proc_selection(pinned);
+            app.clamp_selections();
         }
         _ => {}
     }
@@ -3129,7 +3132,7 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 let band_color = group_band_color(h.band);
                 let cpu_text = format!("{:>5.1}", h.total_cpu);
                 let rss_text = proc::human_bytes(h.total_rss);
-                let banner = format!("▼ {label}  ({n})", label = h.label, n = h.count,);
+                let banner = format!("▼ {label}  ({n})", label = h.label, n = h.count);
                 return Row::new(vec![
                     Cell::from(""),
                     Cell::from(""),
@@ -3533,7 +3536,10 @@ mod tests {
         // Then the java header (carrying its concurrency signature)
         // and its single member.
         assert!(v[3].header.is_some());
-        assert_eq!(v[3].header.as_ref().unwrap().label, "java:app.jar [vthreads]");
+        assert_eq!(
+            v[3].header.as_ref().unwrap().label,
+            "java:app.jar [vthreads]"
+        );
         assert_eq!(rows[v[4].idx].pid, 200);
         // Native member is emitted directly with no banner ahead.
         assert!(v[5].header.is_none());
@@ -3658,7 +3664,10 @@ mod tests {
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names, false);
         assert_eq!(v.len(), 2, "one header + one member");
-        assert_eq!(v[0].header.as_ref().unwrap().label, "java:app.jar [vthreads]");
+        assert_eq!(
+            v[0].header.as_ref().unwrap().label,
+            "java:app.jar [vthreads]"
+        );
         assert_eq!(rows[v[1].idx].pid, 1);
     }
 

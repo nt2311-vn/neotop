@@ -21,9 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `1.80` is the declared MSRV in Cargo.toml. `stable` keeps us
-        # honest about the latest compiler too.
-        rust: [stable, "1.80"]
+        # `1.88` is the declared MSRV in Cargo.toml — bumped from
+        # 1.80 because transitive deps (darling 0.23, instability
+        # 0.3.12, unicode-segmentation 1.13) now require it.
+        # `stable` keeps us honest about the latest compiler too.
+        rust: [stable, "1.88"]
     steps:
       - uses: actions/checkout@v4
 

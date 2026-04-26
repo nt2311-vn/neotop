@@ -646,7 +646,7 @@ impl ContainerNames {
     pub(crate) fn refresh_if_stale(&mut self, now: Instant) {
         let stale = self
             .last_request
-            .map_or(true, |t| now.duration_since(t) >= NAME_CACHE_TTL);
+            .is_none_or(|t| now.duration_since(t) >= NAME_CACHE_TTL);
         if stale && !self.in_flight && self.request_tx.send(()).is_ok() {
             self.in_flight = true;
             self.last_request = Some(now);
