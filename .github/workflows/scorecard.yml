@@ -46,7 +46,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Scorecard examines repo metadata + git history; full
           # history is not needed, but the default fetch-depth
