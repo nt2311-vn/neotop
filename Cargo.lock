@@ -379,7 +379,7 @@ dependencies = [
  "crossterm 0.29.0",
  "nvml-wrapper",
  "ratatui",
- "rustix 0.38.44",
+ "rustix 1.1.4",
 ]
 
 [[package]]
