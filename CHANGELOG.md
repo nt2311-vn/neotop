@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-04-26
+
+### CI: supply-chain + SAST scans
+
+New parallel `security` job in `.github/workflows/ci.yml`:
+
+- **`cargo-audit`** (`rustsec/audit-check@v2.0.0`) — RustSec
+  advisory DB scan over `Cargo.lock`. Free, no auth.
+- **`cargo-deny`** (`EmbarkStudios/cargo-deny-action@v2`) —
+  supply-chain policy: licenses, duplicate versions, banned
+  crates, sources, advisories. Configured in the new top-level
+  `deny.toml`.
+- **Semgrep SAST** (`semgrep/semgrep-action@v1`) — Rust + secrets
+  + general security-audit rule packs. Uploads SARIF to the
+  Security tab on public repos. Optional `SEMGREP_APP_TOKEN` for
+  Semgrep Cloud dashboarding.
+- **Snyk** (`snyk/actions/rust@master`) — gated on `SNYK_TOKEN`
+  via a job-scoped `HAS_SNYK_TOKEN` flag so token-less PRs and
+  forks stay green. Hard-fails on `--severity-threshold=high` when
+  the token is set.
+
+`deny.toml` ships with two **explicit waivers** for transitive
+findings via `ratatui 0.29` — both informational, not CVEs:
+
+- `RUSTSEC-2024-0436` — `paste 1.0.15` is unmaintained
+  (functionally complete; tracked for ratatui to migrate to
+  `pastey`).
+- `RUSTSEC-2026-0002` — `lru 0.12.5` `IterMut` Stacked Borrows
+  unsoundness (we don't call `IterMut`; tracked for ratatui to
+  bump to `lru ≥ 0.13`).
+
+### Why no Valgrind
+
+Explicit non-decision documented in the workflow. The codebase
+has zero `unsafe` blocks (`rg unsafe src/` returns nothing).
+Without `unsafe`, Rust's ownership model rules out the
+use-after-free, double-free, and raw-pointer leak classes
+Valgrind exists to catch — running it over `cargo test` mostly
+yields false positives from libstd's allocator caching and
+libnvml's dlopen path. The Rust-native equivalents that *do*
+find things in this codebase (`cargo audit`, `cargo deny`, and
+— if we ever introduce raw FFI — `cargo miri`) are wired up
+above. The workflow comments capture the rationale so a future
+contributor doesn't re-litigate the same decision.
+
+### Verification
+
+`cargo audit` and `cargo deny check` both pass locally. CI
+workflow validated with `actionlint`. No source changes.
+
 ## [0.19.0] — 2026-04-26
 
 ### Intel iGPU busy% via RC6 residency
