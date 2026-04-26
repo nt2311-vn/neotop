@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-04-26
+
+### Group view: per-app sub-buckets inside the runtime band
+
+Splitting on language alone repeated the same "misleading totals"
+problem `native` and `system` had: every Rust binary on the host
+(neotop, alacritty, ripgrep, target/debug builds) collapsed into
+one `rust [async/threads]` row whose aggregate CPU + RSS pushed
+it to the top regardless of which specific app was actually busy.
+Same for Go, same for Java when several jars run side-by-side.
+
+`Group::Runtime(Lang)` is now `Group::Runtime(Lang, String)` where
+the second field is the app identifier. Each `(lang, app)` pair
+gets its own bucket, header, and aggregate, so a hot `caddy` Go
+process floats above a quiet `syncthing` even though both are Go.
+
+App-extraction strategy per language:
+
+- **Go / Rust** (compiled): executable basename — the binary *is*
+  the app. Runs on the ELF-detected upgrade path in
+  `procs::Tracker`.
+- **Java**: `-jar foo.jar` → `foo.jar`; otherwise the last
+  non-flag token is the main class. `-cp` / `--class-path` value
+  pairs are eaten so a classpath isn't mistaken for the entry
+  point.
+- **Python**: `-m foo.bar` → `foo.bar`, `-c '…'` → `(inline)`,
+  otherwise the script's basename.
+- **Node / Bun / Deno / Ruby / PHP / Perl / Lua / R / .NET**:
+  basename of the first non-flag argument (the script).
+- **Erlang**: empty — `beam.smp` cmdlines are too varied to
+  parse reliably; processes still cluster as one `erlang
+  [actors]` group.
+- **Empty app**: falls back to the bare `lang [signature]` form,
+  so the case where we can't identify a script (`python3` REPL,
+  `node --inspect`) still produces a single useful group rather
+  than a `:` bare-suffix label.
+
+Header format: `<lang>:<app> [<signature>]` — same shape as
+container labels (`docker:abc12`), so the eye reads them
+consistently. E.g., `▼ rust:neotop [async/threads]  (3)`,
+`▼ java:app.jar [vthreads]  (1)`, `▼ python:server.py [GIL+asyncio]  (4)`.
+
+8 new unit tests cover Java jar / main-class / classpath, Python
+`-m` and `-c` and script forms, Node first-non-flag selection,
+compiled-language argv0 basename, the empty-app fallback, and a
+regression test confirming two distinct Rust binaries produce
+different `sort_key`s (the bug this commit fixes).
+
 ## [0.16.0] — 2026-04-26
 
 ### VM Phase 3 — KVM exit counters

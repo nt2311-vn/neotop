@@ -258,7 +258,14 @@ impl Tracker {
             if matches!(group, Group::Native) {
                 let exe = std::path::PathBuf::from(format!("{base}/exe"));
                 if let Some(lang) = crate::elf::detect_native_lang(&exe) {
-                    group = Group::Runtime(lang);
+                    // Compiled binary's argv0 basename *is* the
+                    // app name (each Rust / Go binary is its own
+                    // app), so each distinct executable lands in
+                    // its own runtime group instead of all of
+                    // them collapsing into a single `rust [...]`
+                    // pile.
+                    let app = groups::argv0_basename_or_empty(&command);
+                    group = Group::Runtime(lang, app);
                 }
             }
             self.cache.insert(

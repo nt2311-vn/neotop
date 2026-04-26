@@ -152,7 +152,14 @@ pub(crate) struct Container {
 pub(crate) enum Group {
     Container(Container),
     Vm(crate::vm::VmInfo),
-    Runtime(Lang),
+    /// A language runtime *plus* the app running in it. Splitting on
+    /// the app name keeps separate Rust binaries (or distinct Java
+    /// jars / Node scripts) from collapsing into one giant pile —
+    /// which would otherwise dwarf every real workload the same way
+    /// the old `native` aggregate did. Empty `app` is allowed for
+    /// runtimes whose cmdline doesn't expose a script (e.g. a bare
+    /// `python3` REPL); those still cluster as a single group.
+    Runtime(Lang, String),
     System,
     Native,
 }
@@ -162,22 +169,34 @@ impl Group {
         match self {
             Self::Container(c) => format!("{}:{}", c.runtime.label(), c.id),
             Self::Vm(v) => v.label(),
-            // Runtime label carries the concurrency-model hint so
-            // skimmers immediately know what kind of "busy" the
-            // group is doing — `node [event loop]` vs
-            // `go [goroutines]` vs `java [vthreads]`.
-            Self::Runtime(l) => format!("{} [{}]", l.label(), l.signature()),
+            // Runtime label carries both the concrete app name and
+            // the concurrency-model hint — `rust:neotop
+            // [async/threads]`, `java:app.jar [vthreads]`,
+            // `python:server.py [GIL+asyncio]`. App empty → just
+            // `lang [sig]` so we still distinguish bands.
+            Self::Runtime(l, app) => {
+                if app.is_empty() {
+                    format!("{} [{}]", l.label(), l.signature())
+                } else {
+                    format!("{}:{} [{}]", l.label(), app, l.signature())
+                }
+            }
             Self::System => "system".into(),
             Self::Native => "native".into(),
         }
     }
 
     /// Stable order: container > vm > runtime > system > native.
+    /// Inside the runtime band, sub-key on app name so each app gets
+    /// its own bucket — the bug fix for "all Rust processes summed
+    /// into one row" that used to push the runtime band to the top
+    /// of CPU-sorted listings regardless of which app was actually
+    /// busy.
     pub(crate) fn sort_key(&self) -> String {
         match self {
             Self::Container(c) => format!("0_{}_{}", c.runtime.label(), c.id),
             Self::Vm(v) => format!("1_{}_{}", v.hypervisor.label(), v.name),
-            Self::Runtime(l) => format!("2_{}", l.label()),
+            Self::Runtime(l, app) => format!("2_{}_{}", l.label(), app),
             Self::System => "3_system".into(),
             Self::Native => "4_native".into(),
         }
@@ -187,7 +206,7 @@ impl Group {
         match self {
             Self::Container(_) => GroupBand::Container,
             Self::Vm(_) => GroupBand::Vm,
-            Self::Runtime(_) => GroupBand::Runtime,
+            Self::Runtime(_, _) => GroupBand::Runtime,
             Self::System => GroupBand::System,
             Self::Native => GroupBand::Native,
         }
@@ -224,12 +243,137 @@ pub(crate) fn classify_process(cmdline: &str, cgroup: Option<&str>) -> Group {
         return Group::Vm(vm);
     }
     if let Some(lang) = classify_lang(cmdline) {
-        return Group::Runtime(lang);
+        let app = extract_app(cmdline, lang);
+        return Group::Runtime(lang, app);
     }
     if is_system(cmdline) {
         return Group::System;
     }
     Group::Native
+}
+
+/// Public so `procs::Tracker` can call it after an ELF-based
+/// upgrade to `Lang::Go` or `Lang::Rust`. Returns the basename of
+/// the executable, which for compiled languages *is* the app
+/// identifier; for interpreted languages this is rarely the right
+/// answer (you'd get "java" or "python3"), but procs.rs only calls
+/// it on the ELF-detected path so that's fine.
+pub(crate) fn argv0_basename_or_empty(cmdline: &str) -> String {
+    argv0_basename(cmdline).unwrap_or_default()
+}
+
+/// Pull the app identifier out of a runtime cmdline. The strategy
+/// depends on the runtime:
+///
+/// * **Compiled** (Go, Rust): the executable basename — the binary
+///   *is* the app.
+/// * **Java**: `-jar foo.jar` → `foo.jar`; otherwise the first
+///   non-flag token after `java` (typically the main class).
+/// * **Python**: `-m foo.bar` → `foo.bar`; otherwise the first
+///   non-flag token after `python` (the script path's basename).
+/// * **Node / Bun / Deno / Ruby / PHP / Perl / Lua / R / .NET**:
+///   first non-flag token after the interpreter — almost always
+///   the script path. Take the basename so `node /opt/srv/idx.js`
+///   and `node ./idx.js` cluster as `idx.js`.
+/// * **Erlang**: empty — `beam.smp` cmdlines are too varied to
+///   parse reliably; processes still cluster as `erlang [actors]`.
+///
+/// Empty result is allowed and means "couldn't identify a script";
+/// the caller renders a single-language group instead of per-app.
+pub(crate) fn extract_app(cmdline: &str, lang: Lang) -> String {
+    match lang {
+        Lang::Go | Lang::Rust => argv0_basename(cmdline).unwrap_or_default(),
+        Lang::Java => extract_java_app(cmdline),
+        Lang::Python => extract_python_app(cmdline),
+        Lang::Erlang => String::new(),
+        // Generic interpreters: skip flags, take basename of the
+        // first script-shaped argument.
+        Lang::Node
+        | Lang::Bun
+        | Lang::Deno
+        | Lang::Ruby
+        | Lang::Php
+        | Lang::Perl
+        | Lang::Lua
+        | Lang::DotNet
+        | Lang::R => extract_first_script(cmdline),
+    }
+}
+
+/// Walk argv tokens, skip the first (interpreter), then take the
+/// basename of the first token that doesn't look like a CLI flag.
+/// Returns the empty string when nothing qualifies.
+fn extract_first_script(cmdline: &str) -> String {
+    let mut tokens = cmdline.split_whitespace();
+    tokens.next(); // interpreter
+    for tok in tokens {
+        if tok.starts_with('-') {
+            continue;
+        }
+        return basename(tok);
+    }
+    String::new()
+}
+
+/// Java: prefer the `-jar foo.jar` form; if absent, fall back to
+/// the last non-flag token (the main class). `java -cp x:y
+/// com.example.Main` → `com.example.Main`. Skips `-cp` /
+/// `--class-path` value pairs so they don't shadow the real entry
+/// point.
+fn extract_java_app(cmdline: &str) -> String {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut i = 1; // skip interpreter
+    let mut last_non_flag: Option<&str> = None;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "-jar" {
+            if let Some(jar) = toks.get(i + 1) {
+                return basename(jar);
+            }
+            i += 1;
+        } else if t == "-cp" || t == "-classpath" || t == "--class-path" {
+            // Eat the value too; classpaths are colon-separated
+            // and would otherwise be picked up as "the script".
+            i += 2;
+            continue;
+        } else if !t.starts_with('-') {
+            last_non_flag = Some(t);
+        }
+        i += 1;
+    }
+    last_non_flag.map(basename).unwrap_or_default()
+}
+
+/// Python: handle `-m module.path` (run a module) and `-c "code"`
+/// (inline). Otherwise the first non-flag token is the script.
+fn extract_python_app(cmdline: &str) -> String {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut i = 1;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "-m" {
+            return toks
+                .get(i + 1)
+                .map(|s| (*s).to_string())
+                .unwrap_or_default();
+        }
+        if t == "-c" {
+            return "(inline)".into();
+        }
+        if !t.starts_with('-') {
+            return basename(t);
+        }
+        i += 1;
+    }
+    String::new()
+}
+
+/// Trim a path down to its file name. Pure utility so the per-lang
+/// extractors don't each spell it out.
+fn basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |s| s.to_string_lossy().to_string())
 }
 
 /// Detect a language runtime from the binary name in cmdline. Cheap:
@@ -742,7 +886,7 @@ mod tests {
     #[test]
     fn classify_process_runtime_wins_when_no_container() {
         let g = classify_process("/usr/bin/java -jar app.jar", None);
-        assert_eq!(g, Group::Runtime(Lang::Java));
+        assert_eq!(g, Group::Runtime(Lang::Java, "app.jar".into()));
     }
 
     #[test]
@@ -770,7 +914,7 @@ mod tests {
             runtime: ContainerRuntime::Docker,
             id: "abc12345".into(),
         });
-        let runtime = Group::Runtime(Lang::Java);
+        let runtime = Group::Runtime(Lang::Java, "app.jar".into());
         let system = Group::System;
         let native = Group::Native;
         let mut keys = [
@@ -795,13 +939,106 @@ mod tests {
         assert_eq!(c.label(), "podman:abc12");
         // Runtime labels carry the concurrency-model signature so
         // the user knows what kind of "busy" the group represents.
-        assert_eq!(Group::Runtime(Lang::Node).label(), "node [event loop]");
-        assert_eq!(Group::Runtime(Lang::Go).label(), "go [goroutines]");
-        assert_eq!(Group::Runtime(Lang::Rust).label(), "rust [async/threads]");
-        assert_eq!(Group::Runtime(Lang::Java).label(), "java [vthreads]");
-        assert_eq!(Group::Runtime(Lang::Python).label(), "python [GIL+asyncio]");
+        // Runtime labels include the app identifier so each app
+        // splits into its own bucket; empty app falls back to the
+        // bare `lang [signature]` form.
+        assert_eq!(
+            Group::Runtime(Lang::Node, "server.js".into()).label(),
+            "node:server.js [event loop]"
+        );
+        assert_eq!(
+            Group::Runtime(Lang::Go, "caddy".into()).label(),
+            "go:caddy [goroutines]"
+        );
+        assert_eq!(
+            Group::Runtime(Lang::Rust, "neotop".into()).label(),
+            "rust:neotop [async/threads]"
+        );
+        assert_eq!(
+            Group::Runtime(Lang::Java, "app.jar".into()).label(),
+            "java:app.jar [vthreads]"
+        );
+        // Empty app -> single bucket per language.
+        assert_eq!(
+            Group::Runtime(Lang::Python, String::new()).label(),
+            "python [GIL+asyncio]"
+        );
         assert_eq!(Group::System.label(), "system");
         assert_eq!(Group::Native.label(), "native");
+    }
+
+    #[test]
+    fn extract_app_pulls_jar_for_java_dash_jar_form() {
+        let app = extract_app(
+            "/usr/bin/java -Xmx2g -jar /opt/srv/api.jar --port 8080",
+            Lang::Java,
+        );
+        assert_eq!(app, "api.jar");
+    }
+
+    #[test]
+    fn extract_app_falls_back_to_main_class_when_no_jar() {
+        // Classpath value mustn't be mistaken for the main class —
+        // -cp/-classpath/--class-path eat their next token.
+        let app = extract_app(
+            "java -cp lib/*.jar:src com.example.Main --serve",
+            Lang::Java,
+        );
+        assert_eq!(app, "com.example.Main");
+    }
+
+    #[test]
+    fn extract_app_handles_python_dash_m() {
+        let app = extract_app("/usr/bin/python3 -m gunicorn config.wsgi", Lang::Python);
+        assert_eq!(app, "gunicorn");
+    }
+
+    #[test]
+    fn extract_app_python_script_basename() {
+        let app = extract_app("python3 /opt/api/server.py --debug", Lang::Python);
+        assert_eq!(app, "server.py");
+    }
+
+    #[test]
+    fn extract_app_node_takes_first_non_flag() {
+        let app = extract_app("/usr/bin/node --inspect /srv/api/index.js", Lang::Node);
+        assert_eq!(app, "index.js");
+    }
+
+    #[test]
+    fn extract_app_compiled_languages_use_argv0_basename() {
+        // Go and Rust binaries: each distinct executable is its own
+        // "app". Reading the cmdline alone is enough — same path the
+        // ELF-detected upgrade in procs.rs takes.
+        assert_eq!(extract_app("/usr/local/bin/caddy run", Lang::Go), "caddy");
+        assert_eq!(
+            extract_app("/home/me/projects/neotop/target/release/neotop", Lang::Rust),
+            "neotop"
+        );
+    }
+
+    #[test]
+    fn extract_app_returns_empty_when_no_script_present() {
+        // Plain `python3` REPL — no script argument. The renderer
+        // falls back to a single `python [GIL+asyncio]` bucket.
+        assert_eq!(extract_app("python3", Lang::Python), "");
+        assert_eq!(extract_app("/usr/bin/node --inspect", Lang::Node), "");
+    }
+
+    #[test]
+    fn classify_two_rust_binaries_produce_distinct_groups() {
+        // Regression for the "all Rust processes pile into one giant
+        // group" bug — sort_key must differ so the renderer puts them
+        // in separate buckets.
+        let a = Group::Runtime(Lang::Rust, "neotop".into());
+        let b = Group::Runtime(Lang::Rust, "alacritty".into());
+        assert_ne!(a.sort_key(), b.sort_key());
+        // Same lang still clusters before another lang within the
+        // runtime band — `2_rust_*` lexicographically precedes
+        // `2_go_*`? No — `2_go_*` precedes `2_rust_*`. The point is
+        // each `(lang, app)` pair is its own bucket.
+        let c = Group::Runtime(Lang::Go, "caddy".into());
+        assert_ne!(a.sort_key(), c.sort_key());
     }
 
     #[test]
@@ -910,8 +1147,8 @@ ghi5555555555ghi5555555555ghi5555555555ghi5555555555ghi555555555 redis-cache
 
         // Non-container groups ignore the cache.
         assert_eq!(
-            Group::Runtime(Lang::Java).label_with_names(&cn),
-            "java [vthreads]"
+            Group::Runtime(Lang::Java, "app.jar".into()).label_with_names(&cn),
+            "java:app.jar [vthreads]"
         );
     }
 }

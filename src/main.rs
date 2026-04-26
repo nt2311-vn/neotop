@@ -1893,7 +1893,7 @@ fn draw_proc_detail(
         // Tiny addition that turns the static [signature] tag
         // from Phase 2 into something live.
         let threads_value = match &r.group {
-            groups::Group::Runtime(lang) => {
+            groups::Group::Runtime(lang, _) => {
                 format!("{} ({})", r.threads, lang.signature())
             }
             _ => r.threads.to_string(),
@@ -1927,7 +1927,7 @@ fn draw_proc_detail(
             groups::Group::Vm(v) => {
                 lines.push(kv("VM", v.label(), label));
             }
-            groups::Group::Runtime(_) | groups::Group::System | groups::Group::Native => {
+            groups::Group::Runtime(..) | groups::Group::System | groups::Group::Native => {
                 lines.push(kv("GROUP", r.group.label(), label));
             }
         }
@@ -3512,7 +3512,7 @@ mod tests {
                 "java -jar",
                 25.0,
                 2_000_000,
-                groups::Group::Runtime(groups::Lang::Java),
+                groups::Group::Runtime(groups::Lang::Java, "app.jar".into()),
             ),
             p_with_group(300, "myapp", 1.0, 100_000, groups::Group::Native),
         ];
@@ -3533,7 +3533,7 @@ mod tests {
         // Then the java header (carrying its concurrency signature)
         // and its single member.
         assert!(v[3].header.is_some());
-        assert_eq!(v[3].header.as_ref().unwrap().label, "java [vthreads]");
+        assert_eq!(v[3].header.as_ref().unwrap().label, "java:app.jar [vthreads]");
         assert_eq!(rows[v[4].idx].pid, 200);
         // Native member is emitted directly with no banner ahead.
         assert!(v[5].header.is_none());
@@ -3611,7 +3611,7 @@ mod tests {
                 "java -jar app",
                 10.0,
                 0,
-                groups::Group::Runtime(groups::Lang::Java),
+                groups::Group::Runtime(groups::Lang::Java, "app.jar".into()),
             )
         };
         let child = procs::ProcessRow {
@@ -3621,7 +3621,7 @@ mod tests {
                 "java worker",
                 40.0,
                 0,
-                groups::Group::Runtime(groups::Lang::Java),
+                groups::Group::Runtime(groups::Lang::Java, "app.jar".into()),
             )
         };
         let rows = vec![parent, child];
@@ -3645,20 +3645,20 @@ mod tests {
                 "java -jar",
                 20.0,
                 0,
-                groups::Group::Runtime(groups::Lang::Java),
+                groups::Group::Runtime(groups::Lang::Java, "app.jar".into()),
             ),
             p_with_group(
                 2,
                 "node server",
                 5.0,
                 0,
-                groups::Group::Runtime(groups::Lang::Node),
+                groups::Group::Runtime(groups::Lang::Node, "server.js".into()),
             ),
         ];
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names, false);
         assert_eq!(v.len(), 2, "one header + one member");
-        assert_eq!(v[0].header.as_ref().unwrap().label, "java [vthreads]");
+        assert_eq!(v[0].header.as_ref().unwrap().label, "java:app.jar [vthreads]");
         assert_eq!(rows[v[1].idx].pid, 1);
     }
 
