@@ -29,7 +29,7 @@ name = "neotop"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
 rustix = { version = "0.38", features = ["param", "process"] }
