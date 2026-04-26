@@ -13,6 +13,7 @@ mod groups;
 mod host;
 mod kvm;
 mod net;
+mod passthrough;
 mod proc;
 mod procs;
 mod temp;
@@ -426,6 +427,23 @@ struct App {
     kvm_tracker: kvm::Tracker,
     selected_kvm: Option<kvm::KvmRates>,
 
+    // VFIO + vhost + tap snapshot for the selected VM. Walked from
+    // /proc/<pid>/fd; cheap (~one readlink per fd) so we refresh
+    // it on every selection-tick alongside vCPUs and KVM rates.
+    // None until the cursor lands on a VM row.
+    selected_passthrough: Option<passthrough::Passthrough>,
+
+    // Per-VM CPU% sparkline ring. Populated only while a VM row is
+    // selected — switching to a different VM (or off VMs entirely)
+    // resets it. Same `CPU_HISTORY_CAP`-sized ring as the host
+    // chart it replaces. Stored as the *mean* of per-vCPU CPU%
+    // (0..=100) so the sparkline scale matches the host one.
+    vm_cpu_history: VecDeque<u64>,
+    /// PID the ring above belongs to. `None` when the cursor isn't
+    /// on a VM. Used to detect selection changes and clear the
+    /// ring so we don't paint VM-A's samples onto VM-B's chart.
+    vm_cpu_history_pid: Option<i32>,
+
     // Tunables
     clk_tck: u64,
     last_scan: Instant,
@@ -504,7 +522,10 @@ impl App {
             vcpu_tracker: vcpus::Tracker::new(clk_tck),
             selected_vcpus: Vec::new(),
             kvm_tracker: kvm::Tracker::new(),
+            selected_passthrough: None,
             selected_kvm: None,
+            vm_cpu_history: VecDeque::with_capacity(CPU_HISTORY_CAP),
+            vm_cpu_history_pid: None,
             clk_tck,
             last_scan: Instant::now(),
             refresh,
@@ -632,6 +653,8 @@ impl App {
         let Some(row) = self.selected_proc() else {
             self.selected_vcpus.clear();
             self.selected_kvm = None;
+            self.selected_passthrough = None;
+            self.clear_vm_cpu_history();
             return;
         };
         if let groups::Group::Vm(v) = &row.group {
@@ -642,10 +665,32 @@ impl App {
             // is selected — first call seeds the prev sample. The
             // detail pane renders "—" until rates start flowing.
             self.selected_kvm = self.kvm_tracker.snapshot(pid);
+            // Passthrough snapshot is one-shot per tick — no
+            // smoothing needed, the device list changes only when
+            // the guest reboots or hot-plugs.
+            self.selected_passthrough = Some(passthrough::snapshot(pid));
+            // Per-VM CPU sparkline (Phase 5): replace the host
+            // sparkline with a per-guest one while a VM row is
+            // selected. We push the *mean* of per-vCPU CPU% so the
+            // sparkline scale stays 0..=100 and reads the same way
+            // the host chart does. Switching VMs resets the ring.
+            if self.vm_cpu_history_pid != Some(pid) {
+                self.vm_cpu_history.clear();
+                self.vm_cpu_history_pid = Some(pid);
+            }
+            let mean = vm_mean_cpu_pct(&self.selected_vcpus);
+            push_pct(&mut self.vm_cpu_history, mean);
         } else {
             self.selected_vcpus.clear();
             self.selected_kvm = None;
+            self.selected_passthrough = None;
+            self.clear_vm_cpu_history();
         }
+    }
+
+    fn clear_vm_cpu_history(&mut self) {
+        self.vm_cpu_history.clear();
+        self.vm_cpu_history_pid = None;
     }
 
     fn recompute_procs(&mut self) {
@@ -1552,7 +1597,29 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
     if mem_bar_h > 0 {
         draw_mem_bar(f, chunks[3], &app.host_info);
     }
-    draw_host_history(f, chunks[4], &app.host_history, &app.ifaces, &app.gpus);
+    // Per-VM CPU sparkline preempts the host one when a VM is
+    // selected (Phase 5). `vm_cpu_history` is empty otherwise, so
+    // the renderer just keeps its host-mode default.
+    let vm_overlay = if app.vm_cpu_history.is_empty() {
+        None
+    } else {
+        let name = app
+            .selected_proc()
+            .and_then(|r| match &r.group {
+                groups::Group::Vm(v) => Some(v.label()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "VM".to_string());
+        Some((name, &app.vm_cpu_history))
+    };
+    draw_host_history(
+        f,
+        chunks[4],
+        &app.host_history,
+        &app.ifaces,
+        &app.gpus,
+        vm_overlay,
+    );
 
     // Detail pane only when wide enough; below ~110 cols the
     // table needs every column to stay readable.
@@ -1573,6 +1640,8 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
             &app.selected_vcpus,
             app.selected_kvm,
             app.kvm_tracker.is_available(),
+            app.selected_passthrough.as_ref(),
+            &app.ifaces,
         );
     } else {
         draw_proc_table(f, body, app);
@@ -1859,7 +1928,7 @@ fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
 /// `proc::snapshot(pid)` — the same code path the VM resources pane
 /// uses — so we get cgroup-v2 path + memory.current/max + rlimits
 /// for free.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn draw_proc_detail(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -1869,6 +1938,8 @@ fn draw_proc_detail(
     vcpus: &[vcpus::VcpuStat],
     kvm_rates: Option<kvm::KvmRates>,
     kvm_available: bool,
+    passthrough: Option<&passthrough::Passthrough>,
+    ifaces: &[net::Iface],
 ) {
     let block = Block::default().borders(Borders::ALL).title(" detail ");
     let Some(pid) = pid else {
@@ -1982,6 +2053,16 @@ fn draw_proc_detail(
         push_kvm_lines(&mut lines, kvm_rates, kvm_available, label);
     }
 
+    // VFIO + vhost + tap blocks (Phase 4). Same VM-only gate as
+    // the kvm block above: passthrough is `Some` only for VM rows
+    // and `is_empty()` skips the section entirely when the guest
+    // isn't using any pass-through.
+    if let Some(p) = passthrough {
+        if !p.is_empty() {
+            push_passthrough_lines(&mut lines, p, ifaces, label);
+        }
+    }
+
     if let Some(r) = row {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -2000,6 +2081,27 @@ fn draw_proc_detail(
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Mean CPU% across all vCPUs of a VM. Used as the per-VM
+/// sparkline sample (Phase 5) so the chart's 0..=100 scale matches
+/// the host one. Empty / all-`None` input maps to 0.0 — first-tick
+/// samples land in the ring but read as flatlined until the
+/// tracker's prev-sample is established.
+fn vm_mean_cpu_pct(vcpus: &[vcpus::VcpuStat]) -> f64 {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for v in vcpus {
+        if let Some(p) = v.cpu_pct {
+            sum += p;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / f64::from(n)
+    }
 }
 
 /// `── vcpus ──` block in the detail pane. Each row carries vCPU
@@ -2065,6 +2167,82 @@ fn push_kvm_lines(
     lines.push(kv("io_exits", per_sec(r.io_exits), label));
     lines.push(kv("halt_exits", per_sec(r.halt_exits), label));
     lines.push(kv("irq_inj", per_sec(r.irq_injections), label));
+}
+
+/// `── devices ──` and `── network ──` blocks for VM rows that
+/// have any passthrough surface in use. Each VFIO group renders one
+/// header line plus one indented row per PCI function. Vhost
+/// flavours are listed inline. Tap interfaces are cross-referenced
+/// against `ifaces` so the rows carry live rx / tx rates.
+fn push_passthrough_lines(
+    lines: &mut Vec<Line<'static>>,
+    p: &passthrough::Passthrough,
+    ifaces: &[net::Iface],
+    label: Style,
+) {
+    if !p.vfio_groups.is_empty() || !p.vhost.is_empty() {
+        lines.push(section("── devices ──"));
+        for group in &p.vfio_groups {
+            // Empty device list (rare — group existed in /dev/vfio
+            // but iommu_groups was unreadable) still earns a line so
+            // the user knows the group is open.
+            if group.devices.is_empty() {
+                lines.push(kv(
+                    "vfio",
+                    format!("group {} (devices unreadable)", group.group_id),
+                    label,
+                ));
+                continue;
+            }
+            for (i, dev) in group.devices.iter().enumerate() {
+                // Only the first row carries the "vfio:N" key — the
+                // rest indent under it for grouped readability when
+                // a single IOMMU group spans several functions
+                // (e.g. GPU + its HDMI audio sibling).
+                let key = if i == 0 {
+                    format!("vfio:{}", group.group_id)
+                } else {
+                    String::new()
+                };
+                lines.push(kv(&short_left(&key, 10), dev.label(), label));
+            }
+        }
+        for v in &p.vhost {
+            lines.push(kv("vhost", v.label().to_string(), label));
+        }
+    }
+
+    if !p.taps.is_empty() {
+        lines.push(section("── network ──"));
+        for tap in &p.taps {
+            // Pull live rx / tx from the existing `net::Tracker`
+            // snapshot — no extra syscalls. Foreign or freshly-up
+            // interfaces show "—" until a second sample lands.
+            let rates = ifaces
+                .iter()
+                .find(|i| i.name == *tap)
+                .map(|i| (i.rx_rate, i.tx_rate));
+            let value = match rates {
+                Some((rx, tx)) => {
+                    format!("rx {} · tx {}", net::human_rate(rx), net::human_rate(tx))
+                }
+                None => "(no counters)".to_string(),
+            };
+            lines.push(kv(&format!("tap:{tap}"), value, label));
+        }
+    }
+}
+
+/// Left-justify-and-truncate a key for the detail-pane KV column —
+/// the layout assumes ≤ 10 chars. Pure presentation helper kept
+/// near `push_passthrough_lines` because that's where the rule
+/// matters most (BDFs are long).
+fn short_left(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
+    } else {
+        s.chars().take(width).collect()
+    }
 }
 
 /// Render a per-second rate in the same compact style as the rest
@@ -2210,12 +2388,18 @@ fn center(s: &str, w: usize) -> String {
 /// Side-by-side host-level sparklines: CPU%, MEM%, NET↓, NET↑, GPU%,
 /// VRAM%. GPU + VRAM cells appear only when a backend reports them.
 /// 60 samples each → last minute at the default 1 s tick.
+// `vm_cpu_overlay` is `Some((vm_name, &ring))` when a VM row is
+// selected; the first sparkline cell switches from host CPU to
+// per-guest CPU%. Same 0..=100 scale, same width, just a different
+// data source + title.
+#[allow(clippy::too_many_lines)]
 fn draw_host_history(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
     h: &HostHistory,
     ifaces: &[net::Iface],
     gpus: &[gpu::Gpu],
+    vm_cpu_overlay: Option<(String, &VecDeque<u64>)>,
 ) {
     let show_gpu = !h.gpu.is_empty();
     let show_vram = !h.vram.is_empty();
@@ -2228,17 +2412,33 @@ fn draw_host_history(
         .constraints(constraints)
         .split(area);
 
-    let cpu_data: Vec<u64> = h.cpu.iter().copied().collect();
+    // CPU sparkline cell defaults to host samples but is preempted
+    // by a per-VM ring when the user has a VM row selected. Same
+    // shape — both rings are 0..=100 percent — so the layout doesn't
+    // shift and the eye reads the chart the same way.
+    let (cpu_data, cpu_title) = if let Some((vm_name, ring)) = vm_cpu_overlay {
+        let data: Vec<u64> = ring.iter().copied().collect();
+        let now = data.last().copied().unwrap_or(0);
+        // Truncate long VM labels so the chart title doesn't bleed
+        // past the cell border.
+        let label = if vm_name.chars().count() > 20 {
+            vm_name.chars().take(20).collect::<String>()
+        } else {
+            vm_name
+        };
+        (data, format!(" {label} {now}% "))
+    } else {
+        let data: Vec<u64> = h.cpu.iter().copied().collect();
+        let now = data.last().copied().unwrap_or(0);
+        (data, format!(" CPU {now}% "))
+    };
     let mem_data: Vec<u64> = h.mem.iter().copied().collect();
     let down_data: Vec<u64> = h.net_down.iter().copied().collect();
     let up_data: Vec<u64> = h.net_up.iter().copied().collect();
 
-    let cpu_now = cpu_data.last().copied().unwrap_or(0);
     let mem_now = mem_data.last().copied().unwrap_or(0);
     let down_now = down_data.last().copied().unwrap_or(0);
     let up_now = up_data.last().copied().unwrap_or(0);
-
-    let cpu_title = format!(" CPU {cpu_now}% ");
     let mem_title = format!(" MEM {mem_now}% ");
     let (top_rx, top_tx) = top_iface_names(ifaces);
     let down_title = format!(

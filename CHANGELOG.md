@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-04-26
+
+### VM Phase 4 — passthrough surface (VFIO + vhost + tap)
+
+New module `passthrough.rs`. When a VM row is selected, walk
+`/proc/<pid>/fd/` once per tick (~one `readlink` per fd, single
+digits of syscalls per VM) and surface three things in the detail
+pane:
+
+- **VFIO devices.** Each open `/dev/vfio/<group>` resolves to the
+  IOMMU group via `/sys/kernel/iommu_groups/<group>/devices/`,
+  then each PCI BDF gets vendor / device / class IDs from
+  `/sys/bus/pci/devices/<bdf>/`. Banner format:
+  `vfio:24  0000:01:00.0 NVIDIA 10de:1d01 [display]`. Sibling
+  functions in the same IOMMU group (e.g. GPU + its HDMI audio)
+  indent under the first row.
+- **vhost back-ends.** Open `/dev/vhost-{net,vsock,scsi,fs}`
+  handles render as `vhost:vhost-net`, etc. We deliberately don't
+  reach for queue depth — that's an `ioctl` surface and would
+  break the "observe via /proc and /sys only" contract neotop
+  ships with.
+- **Tap interfaces.** `/dev/net/tun` fds carry the interface name
+  in `/proc/<pid>/fdinfo/<fd>` as `iff:<name>`; we cross-reference
+  with the existing `net::Tracker` snapshot so each tap row
+  carries live `rx 18 MB/s · tx 412 KB/s` rates.
+
+A vendor-name lookup ships in the binary for the eight vendors
+worth recognising in passthrough scenarios (NVIDIA, Intel, AMD,
+Mellanox, Broadcom, Realtek, Red Hat, Marvell, Samsung,
+ASMedia). Everything else renders the bare `vendor:device` IDs —
+the user can run `lspci -s …` for more.
+
+### VM Phase 5 — per-VM CPU sparkline
+
+The first sparkline cell in the host history strip now switches
+from host CPU% to **per-guest CPU%** when a VM row is selected.
+Same 0..=100 scale, same width, just a different data source —
+the eye reads the chart the same way the host one does. Title
+becomes `qemu/kvm myapp 62%` instead of `CPU 62%`.
+
+The ring is the *mean* of per-vCPU CPU% values from the existing
+`vcpu_tracker` (no extra walks of `/proc/<pid>/task`). Switching
+to a different VM clears the ring; switching to a non-VM row
+restores the host chart. 60 samples = the last minute at the
+default 1 s tick.
+
+### Tests
+
+7 new unit tests in `passthrough.rs` cover PCI label rendering
+(known + unknown vendors), class-code categorisation, vhost
+labels, the `Default::is_empty` contract, the nonexistent-PID
+fast path, and `0xABCD\n`-style hex parsing. 173 tests passing
+total.
+
 ## [0.17.1] — 2026-04-26
 
 ### CI green again
