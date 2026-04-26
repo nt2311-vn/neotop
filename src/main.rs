@@ -11,6 +11,7 @@ mod errors;
 mod gpu;
 mod groups;
 mod host;
+mod kvm;
 mod net;
 mod proc;
 mod procs;
@@ -417,6 +418,14 @@ struct App {
     vcpu_tracker: vcpus::Tracker,
     selected_vcpus: Vec<vcpus::VcpuStat>,
 
+    // KVM exit-counter tracker; same selection-scoped pattern as
+    // `vcpu_tracker`. `selected_kvm` is `Some` only when the
+    // selection is a VM *and* the tracker is enabled (root-only
+    // debugfs); a `None` means "draw a `(debugfs not readable)`
+    // hint instead of the kvm exits block".
+    kvm_tracker: kvm::Tracker,
+    selected_kvm: Option<kvm::KvmRates>,
+
     // Tunables
     clk_tck: u64,
     last_scan: Instant,
@@ -494,6 +503,8 @@ impl App {
             host_history: HostHistory::default(),
             vcpu_tracker: vcpus::Tracker::new(clk_tck),
             selected_vcpus: Vec::new(),
+            kvm_tracker: kvm::Tracker::new(),
+            selected_kvm: None,
             clk_tck,
             last_scan: Instant::now(),
             refresh,
@@ -547,6 +558,12 @@ impl App {
             self.disks = self.disk_tracker.snapshot(&mut self.errors);
             self.gpus = self.gpu_tracker.snapshot();
             self.container_names.refresh_if_stale(Instant::now());
+            // Drop kvm-tracker entries for VMs that have exited
+            // since the last slow tick. Only sees the freshly
+            // re-snapshotted procs_all so it picks up reboots and
+            // crashes too.
+            let alive: Vec<i32> = self.procs_all.iter().map(|r| r.pid).collect();
+            self.kvm_tracker.purge_dead(&alive);
         }
         self.slow_tick_counter = (self.slow_tick_counter + 1) % SLOW_TICK_EVERY;
 
@@ -614,14 +631,20 @@ impl App {
     fn refresh_selected_vcpus(&mut self) {
         let Some(row) = self.selected_proc() else {
             self.selected_vcpus.clear();
+            self.selected_kvm = None;
             return;
         };
         if let groups::Group::Vm(v) = &row.group {
             let pid = row.pid;
             let hv = v.hypervisor;
             self.selected_vcpus = self.vcpu_tracker.snapshot(pid, hv);
+            // KVM rates only land on the *second* tick after a VM
+            // is selected — first call seeds the prev sample. The
+            // detail pane renders "—" until rates start flowing.
+            self.selected_kvm = self.kvm_tracker.snapshot(pid);
         } else {
             self.selected_vcpus.clear();
+            self.selected_kvm = None;
         }
     }
 
@@ -1545,6 +1568,8 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
             app.selected_proc(),
             &app.container_names,
             &app.selected_vcpus,
+            app.selected_kvm,
+            app.kvm_tracker.is_available(),
         );
     } else {
         draw_proc_table(f, body, app);
@@ -1831,6 +1856,7 @@ fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
 /// `proc::snapshot(pid)` — the same code path the VM resources pane
 /// uses — so we get cgroup-v2 path + memory.current/max + rlimits
 /// for free.
+#[allow(clippy::too_many_arguments)]
 fn draw_proc_detail(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -1838,6 +1864,8 @@ fn draw_proc_detail(
     row: Option<&procs::ProcessRow>,
     names: &groups::ContainerNames,
     vcpus: &[vcpus::VcpuStat],
+    kvm_rates: Option<kvm::KvmRates>,
+    kvm_available: bool,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" detail ");
     let Some(pid) = pid else {
@@ -1856,8 +1884,28 @@ fn draw_proc_detail(
         lines.push(kv("USER", r.user.clone(), label));
         lines.push(kv("STATE", r.state.to_string(), label));
         lines.push(kv("CPU%", cpu, label));
-        lines.push(kv("THREADS", r.threads.to_string(), label));
+        // THREADS reads as a bare integer for Container / VM /
+        // System / Native rows. For the language-runtime band we
+        // append the concurrency signature so the user can map
+        // "this process has 18 OS threads" → "the Go runtime is
+        // multiplexing N goroutines onto 18 threads", or "this
+        // JVM has 24 platform threads carrying virtual threads".
+        // Tiny addition that turns the static [signature] tag
+        // from Phase 2 into something live.
+        let threads_value = match &r.group {
+            groups::Group::Runtime(lang) => {
+                format!("{} ({})", r.threads, lang.signature())
+            }
+            _ => r.threads.to_string(),
+        };
+        lines.push(kv("THREADS", threads_value, label));
         lines.push(kv("RSS", proc::human_bytes(r.rss_bytes), label));
+        // Disk I/O rates from /proc/<pid>/io. `—` when the file
+        // isn't readable (foreign uid without CAP_SYS_PTRACE) or
+        // we haven't sampled twice yet; blank-ish "0 B/s" when the
+        // process simply hasn't touched disk this tick.
+        lines.push(kv("DISK R", io_rate_detail(r.read_bps), label));
+        lines.push(kv("DISK W", io_rate_detail(r.write_bps), label));
         // GROUP / CONTAINER: developer-meaningful classification.
         // For container processes show a more explicit label so the
         // user knows they can run `docker ps` / `podman ps` to
@@ -1923,6 +1971,14 @@ fn draw_proc_detail(
         push_vcpu_lines(&mut lines, vcpus, label);
     }
 
+    // KVM exit-rate block: only relevant when the selected row is
+    // a VM. The vcpus list is empty for non-VM rows, so we piggy-
+    // back on it as the "is this a VM?" gate without re-checking
+    // the group enum.
+    if !vcpus.is_empty() {
+        push_kvm_lines(&mut lines, kvm_rates, kvm_available, label);
+    }
+
     if let Some(r) = row {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1973,6 +2029,55 @@ fn push_vcpu_lines(lines: &mut Vec<Line<'static>>, vcpus: &[vcpus::VcpuStat], la
             ));
         }
         lines.push(Line::from(spans));
+    }
+}
+
+/// `── kvm exits ──` block in the detail pane. Each row reports a
+/// per-second rate for one VM-exit class. When debugfs isn't
+/// readable (the common case for non-root users) the block
+/// collapses to a single hint line so the user knows the data
+/// exists but they need elevated privileges to see it.
+fn push_kvm_lines(
+    lines: &mut Vec<Line<'static>>,
+    rates: Option<kvm::KvmRates>,
+    available: bool,
+    label: Style,
+) {
+    lines.push(section("── kvm exits ──"));
+    if !available {
+        lines.push(Line::from(Span::styled(
+            "  (run as root for /sys/kernel/debug/kvm)",
+            label,
+        )));
+        return;
+    }
+    let Some(r) = rates else {
+        // First tick after VM selection — tracker has the prev
+        // sample now; rates land on the next tick.
+        lines.push(Line::from(Span::styled("  (sampling…)", label)));
+        return;
+    };
+    lines.push(kv("exits", per_sec(r.exits), label));
+    lines.push(kv("mmio_exits", per_sec(r.mmio_exits), label));
+    lines.push(kv("io_exits", per_sec(r.io_exits), label));
+    lines.push(kv("halt_exits", per_sec(r.halt_exits), label));
+    lines.push(kv("irq_inj", per_sec(r.irq_injections), label));
+}
+
+/// Render a per-second rate in the same compact style as the rest
+/// of the detail block — `1.2k/s`, `4.7M/s`, `38/s`. Anything below
+/// 0.1/s collapses to `—` so flatlined counters don't look like
+/// noise.
+fn per_sec(v: f64) -> String {
+    if v < 0.1 {
+        return "—".to_string();
+    }
+    if v >= 1_000_000.0 {
+        format!("{:.1}M/s", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.1}k/s", v / 1_000.0)
+    } else {
+        format!("{v:.0}/s")
     }
 }
 
@@ -2645,6 +2750,44 @@ fn bar_glyph(pct: f64) -> char {
     BARS[idx.min(BARS.len() - 1)]
 }
 
+/// Render a bytes-per-second rate for the proc table's `R/s`/`W/s`
+/// columns. Compact 8-char form: `—`, `512 B`, `4.2K`, `38M`, `1.2G`.
+/// Same shape as `proc::human_bytes` but tighter so two columns fit
+/// in the row budget. `None` collapses to `—` and zero collapses to
+/// blank — most processes never touch disk and we don't want a wall
+/// of zeros drawing the eye.
+fn io_rate_cell(bps: Option<u64>) -> String {
+    let Some(n) = bps else {
+        return "—".to_string();
+    };
+    if n == 0 {
+        return String::new();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let f = n as f64;
+    if n >= 1_000_000_000 {
+        format!("{:.1}G", f / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", f / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", f / 1_000.0)
+    } else {
+        format!("{n}B")
+    }
+}
+
+/// Detail-pane variant of `io_rate_cell` — keeps the trailing `/s`
+/// suffix because the detail block has plenty of room and a bare
+/// `4.2K` next to other lines could be mistaken for an absolute
+/// counter.
+fn io_rate_detail(bps: Option<u64>) -> String {
+    match bps {
+        None => "—".to_string(),
+        Some(0) => "0 B/s".to_string(),
+        Some(n) => format!("{}/s", proc::human_bytes(n)),
+    }
+}
+
 fn cpu_glyph_color(pct: f64) -> Color {
     if pct >= 80.0 {
         Color::Red
@@ -2968,8 +3111,10 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 // clarity for no real win.
 #[allow(clippy::too_many_lines)]
 fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let header = Row::new(vec!["PID", "USER", "S", "CPU%", "RSS", "THR", "COMMAND"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "PID", "USER", "S", "CPU%", "RSS", "THR", "R/s", "W/s", "COMMAND",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
     let body: Vec<Row> = app
         .procs_visible
@@ -2997,6 +3142,8 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         rss_text,
                         Style::default().fg(band_color).add_modifier(Modifier::BOLD),
                     )),
+                    Cell::from(""),
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(Span::styled(
                         banner,
@@ -3029,6 +3176,8 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 Cell::from(Span::styled(cpu, cpu_style)),
                 Cell::from(proc::human_bytes(r.rss_bytes)),
                 Cell::from(r.threads.to_string()),
+                Cell::from(io_rate_cell(r.read_bps)),
+                Cell::from(io_rate_cell(r.write_bps)),
                 Cell::from(cmd),
             ])
         })
@@ -3041,37 +3190,30 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         Constraint::Length(6),
         Constraint::Length(9),
         Constraint::Length(4),
+        Constraint::Length(8),
+        Constraint::Length(8),
         Constraint::Min(30),
     ];
 
+    // Sort key applies to *every* mode (siblings inside a tree,
+    // members inside a group, the whole flat list), so surface it
+    // in every title — used to be flat-only and made sort changes
+    // invisible in the other modes.
+    let sort_tag = format!("{}{}", app.procs_sort.label(), app.procs_sort.arrow());
+    let filter_tag = if app.procs_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" · /{}", app.procs_filter)
+    };
     let title = match app.list_mode {
-        ListMode::Tree => " processes · tree (t to leave) ".to_string(),
-        ListMode::Group => format!(
-            " processes · grouped (g to leave){} ",
-            if app.procs_filter.is_empty() {
-                String::new()
-            } else {
-                format!(" · /{}", app.procs_filter)
-            },
-        ),
-        ListMode::GroupTree => format!(
-            " processes · group+tree (g/t to peel off){} ",
-            if app.procs_filter.is_empty() {
-                String::new()
-            } else {
-                format!(" · /{}", app.procs_filter)
-            },
-        ),
-        ListMode::Flat => format!(
-            " processes · by {}{}{} ",
-            app.procs_sort.label(),
-            app.procs_sort.arrow(),
-            if app.procs_filter.is_empty() {
-                String::new()
-            } else {
-                format!(" · /{}", app.procs_filter)
-            },
-        ),
+        ListMode::Tree => format!(" processes · tree · {sort_tag} (t to leave){filter_tag} "),
+        ListMode::Group => {
+            format!(" processes · grouped · {sort_tag} (g to leave){filter_tag} ")
+        }
+        ListMode::GroupTree => {
+            format!(" processes · group+tree · {sort_tag} (g/t to peel off){filter_tag} ")
+        }
+        ListMode::Flat => format!(" processes · by {sort_tag}{filter_tag} "),
     };
     let table = Table::new(body, widths)
         .header(header)
@@ -3188,6 +3330,8 @@ mod tests {
             cpu_pct: None,
             rss_bytes: 0,
             threads: 1,
+            read_bps: None,
+            write_bps: None,
             command: cmd.into(),
             group: groups::Group::Native,
         }

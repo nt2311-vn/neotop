@@ -53,6 +53,15 @@ pub(crate) struct ProcessRow {
     pub(crate) cpu_pct: Option<f64>,
     pub(crate) rss_bytes: u64,
     pub(crate) threads: i32,
+    /// EMA-smoothed disk read rate from `/proc/<pid>/io` `read_bytes`.
+    /// `None` when the io file is unreadable (other users' processes
+    /// without `CAP_SYS_PTRACE`) or this is the first sample for the
+    /// pid. Smoothed with the same alpha as `cpu_pct` so the column
+    /// doesn't yo-yo on every tick.
+    pub(crate) read_bps: Option<u64>,
+    /// EMA-smoothed disk write rate; same semantics as `read_bps`
+    /// but for `write_bytes`.
+    pub(crate) write_bps: Option<u64>,
     /// Full command line if readable, else the kernel `comm` (15-char
     /// name). We skip kernel threads (cmdline empty + parent 2).
     pub(crate) command: String,
@@ -75,6 +84,17 @@ struct Sample {
     /// reshuffling without losing the spike entirely; it just
     /// decays over a few ticks instead of vanishing in one.
     smoothed_cpu: f64,
+    /// Last `read_bytes` from `/proc/<pid>/io`. Monotonically
+    /// increasing per-pid; differentiate against the next sample to
+    /// get bytes/s. `None` when the io file isn't readable for this
+    /// uid — recorded so we don't keep retrying every tick.
+    read_bytes: Option<u64>,
+    /// Last `write_bytes`; same shape as `read_bytes`.
+    write_bytes: Option<u64>,
+    /// EMA-smoothed read rate, same alpha as `smoothed_cpu`.
+    smoothed_read_bps: f64,
+    /// EMA-smoothed write rate.
+    smoothed_write_bps: f64,
 }
 
 /// Weight given to the *new* sample when blending into the running
@@ -149,21 +169,12 @@ impl Tracker {
             let Ok(pid) = name.parse::<i32>() else {
                 continue;
             };
-            let Some((row, jiffies)) = self.read_one(pid, passwd, now, clk_tck) else {
+            let Some((row, sample)) = self.read_one(pid, passwd, now, clk_tck) else {
                 continue;
             };
-            // `read_one` already wrote the new smoothed value into
-            // `row.cpu_pct`. Persist it back into `prev` so the next
-            // tick can blend off the same EMA state.
-            let smoothed = row.cpu_pct.unwrap_or(0.0);
-            self.prev.insert(
-                pid,
-                Sample {
-                    when: now,
-                    jiffies,
-                    smoothed_cpu: smoothed,
-                },
-            );
+            // `read_one` returns the next-tick Sample with EMA state
+            // already updated; persist it as-is.
+            self.prev.insert(pid, sample);
             seen.push(pid);
             rows.push(row);
         }
@@ -177,13 +188,14 @@ impl Tracker {
         rows
     }
 
+    #[allow(clippy::too_many_lines)]
     fn read_one(
         &mut self,
         pid: i32,
         passwd: &PasswdCache,
         now: Instant,
         clk_tck: u64,
-    ) -> Option<(ProcessRow, u64)> {
+    ) -> Option<(ProcessRow, Sample)> {
         let base = format!("/proc/{pid}");
         let stat_raw = fs::read_to_string(format!("{base}/stat")).ok()?;
 
@@ -267,7 +279,8 @@ impl Tracker {
         // like before; they'll get a real number from the second tick
         // on. The EMA recovers monotonically toward the true rate so
         // there's no warm-up bias to worry about.
-        let cpu_pct = self.prev.get(&pid).and_then(|p| {
+        let prev = self.prev.get(&pid).copied();
+        let cpu_pct = prev.and_then(|p| {
             let dt = now.duration_since(p.when).as_secs_f64();
             if dt <= 0.0 {
                 return None;
@@ -289,6 +302,36 @@ impl Tracker {
             Some(smoothed)
         });
 
+        // Disk I/O sample: read `/proc/<pid>/io`. Permission-gated
+        // (own uid or `CAP_SYS_PTRACE`); when it fails we record
+        // `None` so we don't bother retrying every tick. Even when
+        // the permission *is* there, kernel threads have an empty
+        // io file — same `None` path.
+        let (read_bytes, write_bytes) = read_io_bytes(&base);
+        let dt = prev.map_or(0.0, |p| now.duration_since(p.when).as_secs_f64());
+        let (read_bps, smoothed_read_bps) = blend_rate(
+            prev.and_then(|p| p.read_bytes),
+            read_bytes,
+            dt,
+            prev.map_or(0.0, |p| p.smoothed_read_bps),
+        );
+        let (write_bps, smoothed_write_bps) = blend_rate(
+            prev.and_then(|p| p.write_bytes),
+            write_bytes,
+            dt,
+            prev.map_or(0.0, |p| p.smoothed_write_bps),
+        );
+
+        let sample = Sample {
+            when: now,
+            jiffies,
+            smoothed_cpu: cpu_pct.unwrap_or(0.0),
+            read_bytes,
+            write_bytes,
+            smoothed_read_bps,
+            smoothed_write_bps,
+        };
+
         Some((
             ProcessRow {
                 pid,
@@ -299,12 +342,70 @@ impl Tracker {
                 cpu_pct,
                 rss_bytes,
                 threads,
+                read_bps,
+                write_bps,
                 command: info.command.clone(),
                 group: info.group.clone(),
             },
-            jiffies,
+            sample,
         ))
     }
+}
+
+/// Differentiate two byte counters one tick apart, blend the
+/// instantaneous rate into the running EMA. Returns
+/// `(displayed_rate, next_smoothed_state)`. `None` for the
+/// displayed rate signals "no prior data yet" — the table renders
+/// "—" until the second tick.
+fn blend_rate(
+    prev_bytes: Option<u64>,
+    cur_bytes: Option<u64>,
+    dt: f64,
+    prev_smoothed: f64,
+) -> (Option<u64>, f64) {
+    let (Some(cur), Some(prev_b)) = (cur_bytes, prev_bytes) else {
+        // Either the current sample is missing (permission denied,
+        // pid gone) or this is the first sample for the pid. In
+        // both cases there's nothing to display, but the EMA state
+        // should decay rather than freeze — multiply by (1-α) so a
+        // dead-after-busy process reports zero within a few ticks.
+        let next = prev_smoothed * (1.0 - SMOOTH_ALPHA);
+        return (None, next);
+    };
+    if dt <= 0.0 {
+        return (None, prev_smoothed);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inst = cur.saturating_sub(prev_b) as f64 / dt;
+    let smoothed = if prev_smoothed == 0.0 && inst == 0.0 {
+        0.0
+    } else {
+        ema_blend(prev_smoothed, inst)
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let displayed = smoothed.max(0.0).round() as u64;
+    (Some(displayed), smoothed)
+}
+
+/// Parse `/proc/<pid>/io` for `read_bytes` and `write_bytes`. These
+/// are the post-pagecache counters (what actually hit storage) — same
+/// numbers `iotop` displays. Returns `(None, None)` when the file
+/// isn't readable: typical for processes owned by other users without
+/// `CAP_SYS_PTRACE`, and for kernel threads.
+fn read_io_bytes(base: &str) -> (Option<u64>, Option<u64>) {
+    let Ok(raw) = fs::read_to_string(format!("{base}/io")) else {
+        return (None, None);
+    };
+    let mut r = None;
+    let mut w = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("read_bytes:") {
+            r = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("write_bytes:") {
+            w = rest.trim().parse().ok();
+        }
+    }
+    (r, w)
 }
 
 /// Read the owning uid of `/proc/<pid>` without parsing
@@ -528,6 +629,8 @@ mod tests {
             cpu_pct: Some(1.0),
             rss_bytes: 0,
             threads: 1,
+            read_bps: None,
+            write_bps: None,
             command: "/usr/bin/BASH".into(),
             group: Group::Native,
         };
@@ -607,6 +710,8 @@ mod tests {
             cpu_pct: None,
             rss_bytes: 0,
             threads: 1,
+            read_bps: None,
+            write_bps: None,
             command: "café-server".into(),
             group: Group::Native,
         };
@@ -632,6 +737,46 @@ alice:x:1000:1000::/home/alice:/bin/zsh
         assert_eq!(cache.lookup(9999), "uid=9999");
     }
 
+    #[test]
+    fn blend_rate_returns_none_until_two_samples() {
+        // First sight of a pid: no prev_bytes, no prev_smoothed.
+        // Caller should render "—" (None) but state must still
+        // initialise to 0.0 so the next tick can blend properly.
+        let (display, smoothed) = blend_rate(None, Some(1_000), 1.0, 0.0);
+        assert!(display.is_none());
+        assert!((smoothed - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blend_rate_decays_when_io_file_unreadable() {
+        // Process loses io permission mid-life (won't happen in
+        // practice but is what makes the EMA decay path testable):
+        // smoothed value should fall toward zero, not stick at the
+        // last visible rate forever.
+        let (display, smoothed) = blend_rate(Some(0), None, 1.0, 100_000.0);
+        assert!(display.is_none());
+        // α = 0.5 → smoothed becomes (1-α) × prev = 50_000.
+        assert!((smoothed - 50_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blend_rate_smooths_consecutive_samples() {
+        // Sustained 1 MB/s over four ticks should converge near
+        // 1 MB/s — same EMA shape as cpu_pct.
+        let mut smoothed = 0.0;
+        let mut bytes: u64 = 0;
+        let mut last_display = None;
+        for _ in 0..4 {
+            let (d, next) = blend_rate(Some(bytes), Some(bytes + 1_000_000), 1.0, smoothed);
+            smoothed = next;
+            last_display = d;
+            bytes += 1_000_000;
+        }
+        let r = last_display.unwrap();
+        // After 4 ticks the EMA should be within 10% of the truth.
+        assert!(r > 900_000 && r < 1_100_000, "settled at {r}/s");
+    }
+
     fn make_row(pid: i32, cpu_pct: Option<f64>, rss_kb: u64) -> ProcessRow {
         ProcessRow {
             pid,
@@ -642,6 +787,8 @@ alice:x:1000:1000::/home/alice:/bin/zsh
             cpu_pct,
             rss_bytes: rss_kb * 1024,
             threads: 1,
+            read_bps: None,
+            write_bps: None,
             command: format!("cmd{pid}"),
             group: Group::Native,
         }

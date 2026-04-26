@@ -7,7 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.15.0] — 2026-04-26
+## [0.16.0] — 2026-04-26
+
+### VM Phase 3 — KVM exit counters
+
+The "standout" feature from `VMPLAN.md` is live. New module
+`kvm.rs` reads `/sys/kernel/debug/kvm/<pid>-<inode>/` for the
+selected VM and computes per-second rates of:
+
+- `exits` (total VM exits)
+- `mmio_exits` (device-emulation cost)
+- `io_exits` (legacy port-IO emulation)
+- `halt_exits` (guest idle)
+- `irq_injections` (host→guest interrupts)
+
+These show up in the detail pane as a `── kvm exits ──` block
+when a VM row is selected. `htop`/`btop`/`btm` show none of this
+— it's the single best signal for "this guest is thrashing"
+visible from the host without a guest agent.
+
+Permissions are root-only on most distros. The tracker
+feature-detects on construction; non-root users see a single hint
+line ("(run as root for /sys/kernel/debug/kvm)") instead of a
+table of —. No errors are logged.
+
+5 unit tests cover rate computation, counter resets (live
+migration), zero-dt safety, the unavailable-tracker fast path,
+and dead-pid purging.
+
+### Per-process disk I/O (R/s, W/s)
+
+`procs::Tracker` now reads `/proc/<pid>/io` per tick and
+EMA-smooths the `read_bytes` / `write_bytes` deltas with the same
+α=0.5 curve used for CPU%. Two new columns in the proc table
+(R/s, W/s) plus dedicated lines in the detail pane (`DISK R`,
+`DISK W`).
+
+- Permission-aware: `/proc/<pid>/io` is owner-only without
+  `CAP_SYS_PTRACE`. Foreign-uid rows render `—`; same column,
+  silent fallback.
+- Compact 8-char rendering (`4.2K`, `38M`, `1.2G`) keeps the row
+  budget intact at 80 cols.
+- Idle processes show blank rather than `0` so the eye isn't
+  drawn to a wall of zeros.
+- Three new tests cover EMA convergence, decay-on-loss, and the
+  None-on-first-sample contract.
+
+### Live thread context for runtime groups
+
+The `THREADS` line in the detail pane now appends the runtime's
+concurrency signature when the process is in a `Runtime` band:
+
+- `THREADS  18 (goroutines)`
+- `THREADS  24 (vthreads)`
+- `THREADS  4 (event loop)`
+
+Turns the static `[signature]` tag introduced in v0.15.0 into a
+live signal — the user can map "this process has 18 OS threads"
+to "the Go runtime is multiplexing N goroutines onto them" at a
+glance.
+
+### Sort key visible in tree / group titles
+
+The proc-table title now carries the active sort tag (`CPU%↓`,
+`RSS↓`, `PID↑`, `CMD↑`) in **every** mode, not just flat. Hitting
+`s` in tree or group mode used to be silent — the rows reshuffled
+but nothing in the chrome told you what the new key was.
 
 ### Group view: drop the misleading "native" / "system" totals
 
