@@ -1,9 +1,18 @@
 # neotop
 
-A Linux terminal observer for **host metrics, processes, and GPU
-activity**. Designed to fill the gaps generic monitors (`htop`,
-`btop`, `btm`) leave open: per-core CPU spectrum charts, NVIDIA + AMD
-GPU activity (busy %, VRAM, watts), and developer-meaningful process
+[![crates.io](https://img.shields.io/crates/v/neotop.svg)](https://crates.io/crates/neotop)
+[![downloads](https://img.shields.io/crates/d/neotop.svg)](https://crates.io/crates/neotop)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/nt2311-vn/neotop/actions/workflows/ci.yml/badge.svg)](https://github.com/nt2311-vn/neotop/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml/badge.svg)](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
+
+A Linux terminal observer for **host metrics, processes, GPU
+activity, containers, and KVM virtual machines**. Designed to
+fill the gaps generic monitors (`htop`, `btop`, `btm`) leave open:
+per-core CPU spectrum charts, NVIDIA + AMD + Intel GPU activity
+(busy %, VRAM, watts), per-VM CPU sparklines with vCPU pinning
+and VFIO passthrough discovery, and developer-meaningful process
 grouping by container / language runtime / system / native.
 
 ```text
@@ -31,18 +40,26 @@ codebase is split one module per data source.
 
 ## Install
 
+From [crates.io](https://crates.io/crates/neotop) (recommended):
+
 ```sh
-cargo install --path .                # from a checkout
-cargo install --git https://github.com/nt2311-vn/neotop  # remote
+cargo install neotop --locked
+```
+
+From source:
+
+```sh
+cargo install --git https://github.com/nt2311-vn/neotop --locked
+cargo install --path .                                  # from a checkout
 ```
 
 The binary is **single-file**, ~1.3 MB, no runtime deps. NVIDIA
-support is on by default but dynamically loads `libnvidia-ml.so` at
-launch — boxes without the driver fall back gracefully to detect-only.
-For a smaller, NVIDIA-free build:
+support is on by default but dynamically loads `libnvidia-ml.so`
+at launch — boxes without the driver fall back gracefully to
+detect-only. For a smaller, NVIDIA-free build:
 
 ```sh
-cargo install --path . --no-default-features
+cargo install neotop --locked --no-default-features
 ```
 
 ## Develop
@@ -95,21 +112,26 @@ of these:
 
 ## Architecture
 
-Single binary, no `unsafe`, MSRV 1.80. One module per data source:
+Single binary, no `unsafe`, MSRV 1.88. One module per data source:
 
 ```text
 src/
-  main.rs      App, run loop, all UI rendering
-  proc.rs      /proc/<pid>/{stat,status,limits,cgroup} parsers
-  procs.rs     host-wide process tracker + EMA cpu_pct
-  host.rs      /proc/{stat,meminfo,loadavg,cpuinfo,version}
-  net.rs       /proc/net/dev tracker
-  disk.rs      /proc/diskstats tracker
-  temp.rs      /sys/class/hwmon walker (off-thread worker)
-  battery.rs   /sys/class/power_supply
-  gpu.rs       /sys/class/drm + NVML (feature-gated)
-  groups.rs    process classification + docker/podman ps cache
-  errors.rs    bounded ring of non-fatal events (Info + Warn tiers)
+  main.rs        App, run loop, all UI rendering
+  proc.rs        /proc/<pid>/{stat,status,limits,cgroup} parsers
+  procs.rs       host-wide process tracker + EMA cpu_pct
+  host.rs        /proc/{stat,meminfo,loadavg,cpuinfo,version}
+  net.rs         /proc/net/dev tracker
+  disk.rs        /proc/diskstats tracker
+  temp.rs        /sys/class/hwmon walker (off-thread worker)
+  battery.rs     /sys/class/power_supply
+  gpu.rs         /sys/class/drm + Intel RC6 + NVML (feature-gated)
+  groups.rs      process classification + docker/podman ps cache
+  vm.rs          QEMU/KVM VM discovery + per-VM CPU history
+  vcpus.rs       /proc/<qemu>/task vCPU → host-CPU pinning
+  kvm.rs         KVM exit counters via /sys/kernel/debug/kvm
+  passthrough.rs VFIO + vhost + tap discovery for VM detail pane
+  elf.rs         ELF section probe (Go .gopclntab, Rust panic strs)
+  errors.rs      bounded ring of non-fatal events (Info + Warn tiers)
 ```
 
 Key design choices:
@@ -131,16 +153,40 @@ Key design choices:
   classification) is computed once on first sight and cached. Steady
   state is a single `read_to_string` per PID per tick.
 
+## Documentation
+
+- [`CHANGELOG.md`](CHANGELOG.md) — release history with per-version rationale.
+- [`SECURITY.md`](.github/SECURITY.md) — disclosure policy + threat model.
+- [`VMPLAN.md`](VMPLAN.md) — the design doc behind the VM-support feature set (historical reference).
+
+## Contributing
+
+PRs welcome. The `main` branch is protected: every change goes
+through a feature branch + PR + CI (the `check`, `security`, and
+`codeql` workflows must pass). See
+[`.github/pull_request_template.md`](.github/pull_request_template.md)
+for the incoming-PR checklist. Security-sensitive issues go
+through a private advisory — see [`SECURITY.md`](.github/SECURITY.md),
+not a public PR.
+
 ## License
 
-Apache-2.0.
+Apache-2.0. See [`LICENSE`](LICENSE) for the full text.
 
 ## Roadmap
 
 Items still open:
 
-- [ ] Go / Rust runtime detection via ELF section scan (`.gopclntab`)
 - [ ] Themes / TOML config
-- [ ] Intel GPU via i915 / Xe perf counters (needs `CAP_PERFMON`)
+- [ ] Per-engine Intel GPU breakdown (rcs / bcs / vcs / vecs) — needs `CAP_PERFMON` and `i915_pmu` perf events
 - [ ] SMT / NUMA grouping in the spectrum view
 - [ ] macOS / Windows ports (per-OS modules)
+
+Recently shipped (see [`CHANGELOG.md`](CHANGELOG.md) for the full
+history):
+
+- [x] Intel iGPU busy% via RC6 residency (`v0.19.0`)
+- [x] KVM exit counters + per-VM CPU sparkline (`v0.16.0` / `v0.18.0`)
+- [x] VFIO + vhost + tap passthrough discovery (`v0.18.0`)
+- [x] Go / Rust runtime detection via ELF section scan (`v0.16.0`)
+- [x] Per-app sub-buckets inside the runtime band (`v0.17.0`)

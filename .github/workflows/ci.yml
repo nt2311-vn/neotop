@@ -69,12 +69,6 @@ jobs:
       # Required for Semgrep's SARIF upload to the security tab on
       # public repos. Harmless on private repos that disable it.
       security-events: write
-    env:
-      # Presence flag for the optional Snyk step. `if:` blocks
-      # can't read `secrets.*` reliably, so we project the
-      # has-it / lacks-it answer onto a job-scoped env var that
-      # the step's `if:` can compare.
-      HAS_SNYK_TOKEN: ${{ secrets.SNYK_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -123,14 +117,16 @@ jobs:
           # connected to Semgrep Cloud. Action runs fine without.
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
-      # Snyk — proprietary dep scanner. Gated on SNYK_TOKEN
-      # because the action errors out without a token; skipping
-      # the step entirely keeps forks / token-less PRs green.
-      # When the secret is present, hard-fail on high+ severity.
-      - name: snyk (gated on SNYK_TOKEN)
-        if: env.HAS_SNYK_TOKEN == 'true'
-        uses: snyk/actions/rust@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
+      # No Snyk step. Snyk does not support Rust:
+      #   * They removed `snyk/actions/rust@master` from their
+      #     Supported Actions in 2024 (only Node, Python, Ruby,
+      #     Go, Maven, Gradle, PHP, .NET, etc. remain).
+      #   * The CLI itself errors with "Could not detect package
+      #     manager for file: Cargo.lock" — there is no Cargo
+      #     plugin.
+      # `cargo audit` above already covers the same advisory DB
+      # Snyk would, and `cargo deny` covers the license / dup-dep
+      # surface their Open Source product would. The CodeQL and
+      # Scorecard workflows in this repo cover SAST and supply-
+      # chain best-practices respectively. Snyk would add zero
+      # coverage for this codebase.

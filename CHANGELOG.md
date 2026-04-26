@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-04-26
+
+### crates.io release prep
+
+First release published to crates.io. No source changes — only
+metadata + README polish so the project surfaces correctly in the
+crates.io UI and `cargo install neotop --locked` produces the
+right binary.
+
+`Cargo.toml`:
+
+- Added `homepage` (mirrors `repository`).
+- Refreshed `description` from "container groups" to the current
+  scope: *Linux TUI for host metrics, processes, GPU activity,
+  containers, and KVM virtual machines*.
+- Swapped the `system` keyword for `kvm` (more discoverable).
+- Added two crates.io categories: `os::linux-apis` and
+  `visualization`.
+- Added an explicit `include` allowlist so the published tarball
+  ships **only** what an installer needs: `src/`, `Cargo.toml`,
+  `Cargo.lock`, `LICENSE`, `README.md`, `CHANGELOG.md`. This
+  cuts ~50 KB of dev-only files (`.github/`, `VMPLAN.md`,
+  `deny.toml`, `justfile`) that have no meaning outside the
+  GitHub repo. Tarball is now 23 files / 498 KB / 154 KB
+  compressed.
+
+`README.md`:
+
+- Six badges at the top: crates.io version + downloads, license,
+  CI, CodeQL, MSRV.
+- `cargo install neotop --locked` is now the primary install
+  command; `--git` and `--path` follow as alternatives.
+- Fixed stale **MSRV claim** (was "1.80", actually 1.88 since
+  `v0.17.1`).
+- Refreshed module list — added `vm.rs`, `vcpus.rs`, `kvm.rs`,
+  `passthrough.rs`, `elf.rs` (all shipped in 0.16+ but missing
+  from the architecture table).
+- Description now mentions Intel GPU, KVM VMs, vCPU pinning, and
+  VFIO passthrough — features that landed in `v0.16` through
+  `v0.19` but weren't reflected in the headline paragraph.
+- Added `Documentation`, `Contributing`, refreshed `License` and
+  `Roadmap` sections. Roadmap now distinguishes "still open"
+  (themes, per-engine Intel GPU, SMT/NUMA, OS ports) from
+  "recently shipped" with version anchors.
+
+### Removed: Snyk from the `security` CI job
+
+Snyk does not support Rust. Two independent failures confirmed
+this: their per-language `snyk/actions/rust@master` was removed
+from the Supported Actions list in 2024 (only Node, Python, Ruby,
+Go, Maven, Gradle, PHP, .NET, etc. remain), and the standalone
+CLI errors with `Could not detect package manager for file:
+Cargo.lock` because there is no Cargo plugin.
+
+Rather than maintain a permanently skipped step or wire up
+`snyk test --unmanaged` (which fingerprints unmanaged C/C++
+binaries and would only flag the binary's own NVML dlopen, not
+its Cargo deps), the `security` job now drops Snyk entirely.
+The remaining stack covers everything Snyk would have:
+
+- `cargo audit` — RustSec advisory DB (the same DB Snyk reads
+  for its other ecosystems).
+- `cargo deny` — licenses, dup versions, banned crates, sources.
+- CodeQL — first-party SAST with data-flow analysis.
+- Semgrep — pattern-based SAST.
+- OpenSSF Scorecard — supply-chain best-practices scoring.
+- Dependabot — automated dep-bump PRs.
+
+Net change to CI surface: minus one always-failing step. The
+`HAS_SNYK_TOKEN` env var is gone; you can revoke the
+`SNYK_TOKEN` repo secret at your leisure (it's now unused).
+
+### Fixed: CodeQL Rust uses buildless extractor (`build-mode: none`)
+
+The initial `codeql.yml` configured `build-mode: manual` paired
+with an explicit `cargo build --release --locked` step. CodeQL's
+Rust extractor is **buildless** — it reads source files directly
+without invoking cargo — and rejects `manual` and `autobuild`
+with `A fatal error occurred: Rust does not support the manual
+build mode.`
+
+`build-mode: none` is the only accepted value. With that flip,
+the explicit `cargo build` step plus the `dtolnay/rust-toolchain`
+and `Swatinem/rust-cache` steps that fed it are all redundant
+and have been removed. Net effect: ~30 seconds shaved off every
+CodeQL run.
+
+### Verification
+
+`cargo publish --dry-run` succeeds; `cargo audit`,
+`cargo deny check`, full `cargo test --all-targets --locked`
+(176 tests) all clean. `actionlint` clean on the two patched
+workflows.
+
 ## [0.20.0] — 2026-04-26
 
 ### Public-repo hardening — CODEOWNERS + CodeQL + Scorecard + Dependabot
