@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-04-26
+
+### crates.io release prep
+
+First release published to crates.io. No source changes — only
+metadata + README polish so the project surfaces correctly in the
+crates.io UI and `cargo install neotop --locked` produces the
+right binary.
+
+`Cargo.toml`:
+
+- Added `homepage` (mirrors `repository`).
+- Refreshed `description` from "container groups" to the current
+  scope: *Linux TUI for host metrics, processes, GPU activity,
+  containers, and KVM virtual machines*.
+- Swapped the `system` keyword for `kvm` (more discoverable).
+- Added two crates.io categories: `os::linux-apis` and
+  `visualization`.
+- Added an explicit `include` allowlist so the published tarball
+  ships **only** what an installer needs: `src/`, `Cargo.toml`,
+  `Cargo.lock`, `LICENSE`, `README.md`, `CHANGELOG.md`. This
+  cuts ~50 KB of dev-only files (`.github/`, `VMPLAN.md`,
+  `deny.toml`, `justfile`) that have no meaning outside the
+  GitHub repo. Tarball is now 23 files / 498 KB / 154 KB
+  compressed.
+
+`README.md`:
+
+- Six badges at the top: crates.io version + downloads, license,
+  CI, CodeQL, MSRV.
+- `cargo install neotop --locked` is now the primary install
+  command; `--git` and `--path` follow as alternatives.
+- Fixed stale **MSRV claim** (was "1.80", actually 1.88 since
+  `v0.17.1`).
+- Refreshed module list — added `vm.rs`, `vcpus.rs`, `kvm.rs`,
+  `passthrough.rs`, `elf.rs` (all shipped in 0.16+ but missing
+  from the architecture table).
+- Description now mentions Intel GPU, KVM VMs, vCPU pinning, and
+  VFIO passthrough — features that landed in `v0.16` through
+  `v0.19` but weren't reflected in the headline paragraph.
+- Added `Documentation`, `Contributing`, refreshed `License` and
+  `Roadmap` sections. Roadmap now distinguishes "still open"
+  (themes, per-engine Intel GPU, SMT/NUMA, OS ports) from
+  "recently shipped" with version anchors.
+
+Verification: `cargo publish --dry-run` succeeds; `cargo audit`,
+`cargo deny check`, full `cargo test --all-targets --locked`
+(176 tests) all clean.
+
 ## [0.20.0] — 2026-04-26
 
 ### Public-repo hardening — CODEOWNERS + CodeQL + Scorecard + Dependabot
