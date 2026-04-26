@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-04-26
+
+### Group view: drop the misleading "native" / "system" totals
+
+In `g`-mode the synthetic banner row used to aggregate every static
+host binary into a single `▼ native (N)` line — and the same for
+kernel daemons under `▼ system`. Because every runtime-less process
+on the laptop landed in one of those two buckets, that row was
+**always** the largest CPU + RSS in the table and read like a real
+workload when it isn't. The banners are gone for both bands;
+their members render as flush-left rows in the same band slot.
+Container, VM, and Runtime banners still appear (those are
+genuinely cohesive workloads).
+
+### Group view: language signatures for Go, Rust, and friends
+
+`procs::Tracker` now opens `/proc/<pid>/exe` and parses ELF section
+headers when classification would otherwise fall through to
+`Native`. Two new `Lang` variants:
+
+- **Go** — detected via `.note.go.buildid` / `.gopclntab` /
+  `.go.buildinfo` section names (every modern `go build` writes
+  at least one of those).
+- **Rust** — detected by searching `.rodata*` sections for
+  `library/std/src/` or `/rustc/` (panic-location strings that
+  ride along even after stripping), with a symbol-table fallback
+  for unstripped binaries (`_RNv` v0 mangling, legacy `..llvm.`
+  suffix).
+
+The runtime label now carries a one-token concurrency-model tag —
+`go [goroutines]`, `rust [async/threads]`, `java [vthreads]`,
+`node [event loop]`, `python [GIL+asyncio]`, `bun [event loop]`,
+`erlang [actors/BEAM]`, etc. — so the user can tell at a glance
+*how* a runtime spends its time, not just which one is running.
+
+New module `elf.rs` (200 LOC, safe Rust, no new crates) holds the
+ELF64 LE parser. Detection is a one-shot `O(K)` read amortised
+across the lifetime of the pid — already cached alongside the
+`cmdline` and `cgroup` fields in `procs::StaticInfo`. Steady-state
+CPU cost is zero.
+8 unit tests cover the substring search, the name-table walker,
+and the I/O failure paths.
+
 ### Inline braille mini-charts for GPU and disk panels
 
 GPU and disk overview rows now carry an 8-cell Unicode braille

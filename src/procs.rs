@@ -235,7 +235,20 @@ impl Tracker {
             // a cgroup-enabled init or for kernel threads — in either
             // case the classifier falls through to System / Native.
             let cgroup_raw = fs::read_to_string(format!("{base}/cgroup")).ok();
-            let group = groups::classify_process(&command, cgroup_raw.as_deref());
+            let mut group = groups::classify_process(&command, cgroup_raw.as_deref());
+            // cmdline-only classification can't tell Go or Rust
+            // binaries apart from any other native ELF — they look
+            // like a single static executable named after the
+            // target. Inspect /proc/<pid>/exe section headers as a
+            // second pass *only* when we'd otherwise tag the row
+            // Native (so we don't pay the I/O for processes that
+            // already classified as Container/VM/Runtime/System).
+            if matches!(group, Group::Native) {
+                let exe = std::path::PathBuf::from(format!("{base}/exe"));
+                if let Some(lang) = crate::elf::detect_native_lang(&exe) {
+                    group = Group::Runtime(lang);
+                }
+            }
             self.cache.insert(
                 pid,
                 StaticInfo {

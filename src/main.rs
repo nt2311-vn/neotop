@@ -6,6 +6,7 @@
 
 mod battery;
 mod disk;
+mod elf;
 mod errors;
 mod gpu;
 mod groups;
@@ -1021,31 +1022,44 @@ fn compute_visible_grouped(
         let mut members = buckets.remove(&key).unwrap_or_default();
         members.sort_by(|&a, &b| cmp_rows(rows, a, b, by));
         let group = group_for.remove(&key).unwrap_or(groups::Group::Native);
-        let header = GroupHeader {
-            // Prefer the human-readable name when the docker/podman
-            // ps cache has resolved it; falls back to the 12-char
-            // hash when the daemon isn't reachable or the container
-            // hasn't been polled yet.
-            label: group.label_with_names(names),
-            band: group.band(),
-            count: members.len(),
-            total_cpu: sum_cpu(rows, &members),
-            total_rss: sum_rss(rows, &members),
-        };
-        // Synthetic header row.
-        out.push(ProcRender {
-            idx: usize::MAX,
-            prefix: String::new(),
-            header: Some(header),
-        });
+        // Skip the synthetic banner for the catch-all `system` and
+        // `native` bands. Their aggregate CPU / RSS totals tend to
+        // dwarf every other group (every kernel / daemon / static
+        // binary on the host lands in one of them) and the user
+        // reads that sum as a "real" workload — but it isn't a
+        // meaningful one. Render their members as flat rows in the
+        // same slot the header would have occupied; band ordering
+        // is preserved.
+        let suppress_header = matches!(
+            group.band(),
+            groups::GroupBand::System | groups::GroupBand::Native
+        );
+        if !suppress_header {
+            let header = GroupHeader {
+                // Prefer the human-readable name when the docker/podman
+                // ps cache has resolved it; falls back to the 12-char
+                // hash when the daemon isn't reachable or the container
+                // hasn't been polled yet.
+                label: group.label_with_names(names),
+                band: group.band(),
+                count: members.len(),
+                total_cpu: sum_cpu(rows, &members),
+                total_rss: sum_rss(rows, &members),
+            };
+            out.push(ProcRender {
+                idx: usize::MAX,
+                prefix: String::new(),
+                header: Some(header),
+            });
+        }
+        let prefix = if suppress_header { "" } else { "  " };
         if as_tree {
-            emit_group_as_tree(rows, &members, by, &mut out);
+            emit_group_as_tree(rows, &members, by, &mut out, prefix);
         } else {
-            // Members indented under the header.
             for idx in members {
                 out.push(ProcRender {
                     idx,
-                    prefix: "  ".to_string(),
+                    prefix: prefix.to_string(),
                     header: None,
                 });
             }
@@ -1065,6 +1079,7 @@ fn emit_group_as_tree(
     members: &[usize],
     by: procs::SortBy,
     out: &mut Vec<ProcRender>,
+    prefix: &str,
 ) {
     use std::collections::HashSet;
 
@@ -1103,10 +1118,11 @@ fn emit_group_as_tree(
             &mut local,
         );
     }
-    // Indent the whole sub-forest by 2 cells so the tree visually
-    // hangs off the group header.
+    // Indent the whole sub-forest under the group header (when one
+    // exists). For headerless bands (system/native) `prefix` is
+    // empty so members render flush-left like flat mode.
     for mut r in local {
-        r.prefix = format!("  {}", r.prefix);
+        r.prefix = format!("{prefix}{}", r.prefix);
         out.push(r);
     }
 }
@@ -3323,8 +3339,9 @@ mod tests {
     #[test]
     fn grouped_visible_emits_header_then_members_per_band() {
         // Three bands: a Container, a Runtime, and a Native. The
-        // header row sits ahead of its members; the layout order is
-        // Container → Runtime → System → Native.
+        // header row sits ahead of its members for Container and
+        // Runtime; Native (and System) skip the header to avoid the
+        // misleading "sum of every static binary on the host" line.
         let rows = vec![
             p_with_group(
                 100,
@@ -3357,7 +3374,8 @@ mod tests {
         ];
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
-        // Pattern: header(docker) m m header(java) m header(native) m.
+        // Pattern: header(docker) m m header(java [vthreads]) m m_native.
+        assert_eq!(v.len(), 6, "no header for the native band");
         assert!(v[0].header.is_some(), "row 0 should be a header");
         let h0 = v[0].header.as_ref().unwrap();
         assert_eq!(h0.label, "docker:abc12");
@@ -3368,20 +3386,28 @@ mod tests {
         assert!(v[1].header.is_none() && v[2].header.is_none());
         assert_eq!(rows[v[1].idx].pid, 100);
         assert_eq!(rows[v[2].idx].pid, 101);
-        // Then the java header, then its single member.
+        // Then the java header (carrying its concurrency signature)
+        // and its single member.
         assert!(v[3].header.is_some());
-        assert_eq!(v[3].header.as_ref().unwrap().label, "java");
+        assert_eq!(v[3].header.as_ref().unwrap().label, "java [vthreads]");
         assert_eq!(rows[v[4].idx].pid, 200);
-        // Native band last.
-        assert!(v[5].header.is_some());
-        assert_eq!(v[5].header.as_ref().unwrap().label, "native");
+        // Native member is emitted directly with no banner ahead.
+        assert!(v[5].header.is_none());
+        assert_eq!(rows[v[5].idx].pid, 300);
+        assert!(
+            v[5].prefix.is_empty(),
+            "headerless members render flush-left like flat mode"
+        );
     }
 
     #[test]
     fn grouped_visible_sort_cpu_floats_busy_group_above_band_priority() {
-        // Native group at 80% CPU must appear above a Docker group
-        // at 5% CPU when sorted by CPU. Band priority only kicks in
-        // when the sort key isn't an aggregate (PID / Command).
+        // A native binary pegging 80% CPU should appear *above* a
+        // Docker group at 5% CPU when sorted by CPU. The native
+        // group renders without a banner, so the row at v[0] is the
+        // member itself; the docker header lands at v[1] with its
+        // member at v[2]. Band priority only kicks back in when the
+        // sort key isn't an aggregate (PID / Command).
         let rows = vec![
             p_with_group(
                 10,
@@ -3397,13 +3423,36 @@ mod tests {
         ];
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
-        assert_eq!(v[0].header.as_ref().unwrap().label, "native");
-        assert_eq!(v[2].header.as_ref().unwrap().label, "docker:abc12");
+        assert_eq!(v.len(), 3, "native member + docker header + docker member");
+        assert!(v[0].header.is_none(), "native band has no banner");
+        assert_eq!(rows[v[0].idx].pid, 20);
+        assert_eq!(v[1].header.as_ref().unwrap().label, "docker:abc12");
+        assert_eq!(rows[v[2].idx].pid, 10);
 
-        // Sort by PID: band priority restored (docker first).
+        // Sort by PID: band priority restored (docker first, then
+        // the bannerless native member).
         let v = compute_visible_grouped(&rows, procs::SortBy::Pid, "", &names, false);
         assert_eq!(v[0].header.as_ref().unwrap().label, "docker:abc12");
-        assert_eq!(v[2].header.as_ref().unwrap().label, "native");
+        assert!(v[2].header.is_none());
+        assert_eq!(rows[v[2].idx].pid, 20);
+    }
+
+    #[test]
+    fn grouped_visible_skips_native_and_system_headers() {
+        // Regression for the "misleading total" bug: Native and
+        // System used to emit a banner that aggregated every static
+        // binary / kernel daemon on the host into a single huge
+        // CPU + RSS line. The row was always the largest in the
+        // table and gave the user a false signal. Confirm both
+        // bands now render members only, no banner.
+        let rows = vec![
+            p_with_group(1, "/lib/systemd/systemd", 0.0, 0, groups::Group::System),
+            p_with_group(2, "/usr/local/bin/myapp", 0.0, 0, groups::Group::Native),
+        ];
+        let names = groups::ContainerNames::default();
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
+        assert_eq!(v.len(), 2, "two members, no banners");
+        assert!(v.iter().all(|r| r.header.is_none()));
     }
 
     #[test]
@@ -3465,7 +3514,7 @@ mod tests {
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "java", &names, false);
         assert_eq!(v.len(), 2, "one header + one member");
-        assert_eq!(v[0].header.as_ref().unwrap().label, "java");
+        assert_eq!(v[0].header.as_ref().unwrap().label, "java [vthreads]");
         assert_eq!(rows[v[1].idx].pid, 1);
     }
 

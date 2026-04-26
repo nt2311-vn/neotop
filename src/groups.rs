@@ -49,6 +49,13 @@ pub(crate) enum Lang {
     Erlang,
     DotNet,
     R,
+    /// Go — detected by ELF section parsing of `/proc/<pid>/exe`
+    /// (cmdline alone is useless because `go build` produces a
+    /// statically-linked binary named after the target).
+    Go,
+    /// Rust — same story as Go, detected by ELF inspection of the
+    /// executable's read-only data sections.
+    Rust,
 }
 
 impl Lang {
@@ -66,6 +73,47 @@ impl Lang {
             Self::Erlang => "erlang",
             Self::DotNet => "dotnet",
             Self::R => "r",
+            Self::Go => "go",
+            Self::Rust => "rust",
+        }
+    }
+
+    /// One-token concurrency-model tag rendered alongside the group
+    /// label so the user can tell at a glance *how* a runtime spends
+    /// its time. These are the model the runtime exposes to user
+    /// code — what shows up when you read documentation, not the
+    /// implementation detail underneath. The strings stay short
+    /// because they share row-budget with the count + totals.
+    pub(crate) fn signature(self) -> &'static str {
+        match self {
+            // Goroutines are the headline concurrency primitive of
+            // Go — M:N scheduled by the runtime onto OS threads.
+            Self::Go => "goroutines",
+            // Rust has no built-in runtime; the user picks one.
+            // tokio is overwhelmingly dominant for async, std::thread
+            // for synchronous code. Lump them as async/threads.
+            Self::Rust => "async/threads",
+            // Project Loom virtual threads (1:N green threads on top
+            // of platform threads) are the modern face of JVM
+            // concurrency since JDK 21.
+            Self::Java => "vthreads",
+            // libuv event loop, single-threaded JS execution.
+            Self::Node | Self::Bun | Self::Deno => "event loop",
+            // The GIL serialises Python bytecode, but `asyncio`
+            // gives the runtime its async story.
+            Self::Python => "GIL+asyncio",
+            // Ruby's Fibers / async gem layered on a GIL-equivalent.
+            Self::Ruby => "GVL+fibers",
+            // PHP-FPM is process-per-request; no shared concurrency.
+            Self::Php => "process pool",
+            Self::Perl => "threads",
+            Self::Lua => "coroutines",
+            // BEAM scheduler runs lightweight processes (actors)
+            // across one scheduler thread per core.
+            Self::Erlang => "actors/BEAM",
+            // .NET's TPL = task scheduler over a thread pool.
+            Self::DotNet => "TPL",
+            Self::R => "single-thread",
         }
     }
 }
@@ -114,7 +162,11 @@ impl Group {
         match self {
             Self::Container(c) => format!("{}:{}", c.runtime.label(), c.id),
             Self::Vm(v) => v.label(),
-            Self::Runtime(l) => l.label().to_string(),
+            // Runtime label carries the concurrency-model hint so
+            // skimmers immediately know what kind of "busy" the
+            // group is doing — `node [event loop]` vs
+            // `go [goroutines]` vs `java [vthreads]`.
+            Self::Runtime(l) => format!("{} [{}]", l.label(), l.signature()),
             Self::System => "system".into(),
             Self::Native => "native".into(),
         }
@@ -741,9 +793,45 @@ mod tests {
             id: "abc12".into(),
         });
         assert_eq!(c.label(), "podman:abc12");
-        assert_eq!(Group::Runtime(Lang::Node).label(), "node");
+        // Runtime labels carry the concurrency-model signature so
+        // the user knows what kind of "busy" the group represents.
+        assert_eq!(Group::Runtime(Lang::Node).label(), "node [event loop]");
+        assert_eq!(Group::Runtime(Lang::Go).label(), "go [goroutines]");
+        assert_eq!(Group::Runtime(Lang::Rust).label(), "rust [async/threads]");
+        assert_eq!(Group::Runtime(Lang::Java).label(), "java [vthreads]");
+        assert_eq!(Group::Runtime(Lang::Python).label(), "python [GIL+asyncio]");
         assert_eq!(Group::System.label(), "system");
         assert_eq!(Group::Native.label(), "native");
+    }
+
+    #[test]
+    fn lang_signature_is_short_and_distinct_per_runtime() {
+        // The signature shares row-budget with the count + totals
+        // in the group banner — keep them ≤ ~14 chars so a 80-col
+        // terminal still fits the rest of the row.
+        for l in [
+            Lang::Java,
+            Lang::Node,
+            Lang::Bun,
+            Lang::Deno,
+            Lang::Python,
+            Lang::Ruby,
+            Lang::Php,
+            Lang::Perl,
+            Lang::Lua,
+            Lang::Erlang,
+            Lang::DotNet,
+            Lang::R,
+            Lang::Go,
+            Lang::Rust,
+        ] {
+            assert!(!l.signature().is_empty());
+            assert!(
+                l.signature().len() <= 14,
+                "{} signature too long",
+                l.label()
+            );
+        }
     }
 
     #[test]
@@ -821,6 +909,9 @@ ghi5555555555ghi5555555555ghi5555555555ghi5555555555ghi555555555 redis-cache
         assert_eq!(g2.label_with_names(&cn), "podman:ffffff");
 
         // Non-container groups ignore the cache.
-        assert_eq!(Group::Runtime(Lang::Java).label_with_names(&cn), "java");
+        assert_eq!(
+            Group::Runtime(Lang::Java).label_with_names(&cn),
+            "java [vthreads]"
+        );
     }
 }
