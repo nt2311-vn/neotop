@@ -52,16 +52,36 @@ right binary.
   (themes, per-engine Intel GPU, SMT/NUMA, OS ports) from
   "recently shipped" with version anchors.
 
-CI fix bundled in the same release: Snyk deprecated
-`snyk/actions/rust@master` in 2024 (Rust was removed from their
-`Supported Actions` list — only Node, Python, Ruby, Go, Maven,
-Gradle, PHP, etc. remain). The `security` job's snyk step now
-uses the language-agnostic `snyk/actions/setup@master` to install
-the CLI followed by an explicit `snyk test --file=Cargo.lock
---severity-threshold=high`. Both steps stay gated on
-`HAS_SNYK_TOKEN` so token-less PRs still skip cleanly.
+### Removed: Snyk from the `security` CI job
 
-Verification: `cargo publish --dry-run` succeeds; `cargo audit`,
+Snyk does not support Rust. Two independent failures confirmed
+this: their per-language `snyk/actions/rust@master` was removed
+from the Supported Actions list in 2024 (only Node, Python, Ruby,
+Go, Maven, Gradle, PHP, .NET, etc. remain), and the standalone
+CLI errors with `Could not detect package manager for file:
+Cargo.lock` because there is no Cargo plugin.
+
+Rather than maintain a permanently skipped step or wire up
+`snyk test --unmanaged` (which fingerprints unmanaged C/C++
+binaries and would only flag the binary's own NVML dlopen, not
+its Cargo deps), the `security` job now drops Snyk entirely.
+The remaining stack covers everything Snyk would have:
+
+- `cargo audit` — RustSec advisory DB (the same DB Snyk reads
+  for its other ecosystems).
+- `cargo deny` — licenses, dup versions, banned crates, sources.
+- CodeQL — first-party SAST with data-flow analysis.
+- Semgrep — pattern-based SAST.
+- OpenSSF Scorecard — supply-chain best-practices scoring.
+- Dependabot — automated dep-bump PRs.
+
+Net change to CI surface: minus one always-failing step. The
+`HAS_SNYK_TOKEN` env var is gone; you can revoke the
+`SNYK_TOKEN` repo secret at your leisure (it's now unused).
+
+### Verification
+
+`cargo publish --dry-run` succeeds; `cargo audit`,
 `cargo deny check`, full `cargo test --all-targets --locked`
 (176 tests) all clean. `actionlint` clean on the patched
 workflow.
