@@ -50,7 +50,7 @@ jobs:
         language: [rust]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: CodeQL init
         uses: github/codeql-action/init@v4
