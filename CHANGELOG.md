@@ -79,12 +79,27 @@ Net change to CI surface: minus one always-failing step. The
 `HAS_SNYK_TOKEN` env var is gone; you can revoke the
 `SNYK_TOKEN` repo secret at your leisure (it's now unused).
 
+### Fixed: CodeQL Rust uses buildless extractor (`build-mode: none`)
+
+The initial `codeql.yml` configured `build-mode: manual` paired
+with an explicit `cargo build --release --locked` step. CodeQL's
+Rust extractor is **buildless** — it reads source files directly
+without invoking cargo — and rejects `manual` and `autobuild`
+with `A fatal error occurred: Rust does not support the manual
+build mode.`
+
+`build-mode: none` is the only accepted value. With that flip,
+the explicit `cargo build` step plus the `dtolnay/rust-toolchain`
+and `Swatinem/rust-cache` steps that fed it are all redundant
+and have been removed. Net effect: ~30 seconds shaved off every
+CodeQL run.
+
 ### Verification
 
 `cargo publish --dry-run` succeeds; `cargo audit`,
 `cargo deny check`, full `cargo test --all-targets --locked`
-(176 tests) all clean. `actionlint` clean on the patched
-workflow.
+(176 tests) all clean. `actionlint` clean on the two patched
+workflows.
 
 ## [0.20.0] — 2026-04-26
 

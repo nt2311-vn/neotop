@@ -52,37 +52,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      # Reuse the same compile cache the main `check` job uses so
-      # CodeQL doesn't pay the full 5-minute cold build twice.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: codeql
-
       - name: CodeQL init
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
-          # `manual` build-mode pairs cleanly with our explicit
-          # `cargo build` step below — `autobuild` works too but
-          # tends to pick up stray Cargo.toml files in vendored
-          # subdirs we don't want analysed.
-          build-mode: manual
+          # CodeQL's Rust extractor is **buildless** — it reads
+          # source files directly without invoking cargo. The
+          # only build mode it accepts is `none`. `manual` and
+          # `autobuild` both error out with:
+          #   A fatal error occurred: Rust does not support the
+          #   manual build mode.
+          # Because we don't run cargo here, we also skip the
+          # rust-toolchain setup and rust-cache steps that the
+          # `check` and `security` jobs need.
+          build-mode: none
           # Pin the standard security suite. `+security-extended`
           # adds queries that flag things like missing TLS
           # verification or weak hash usage — relevant the day we
           # add network code; harmless until then.
           queries: security-extended,security-and-quality
-
-      - name: cargo build (release, --locked)
-        # CodeQL extracts CFG/IR from compiler output, so we need
-        # a real build. `--locked` keeps the dep graph identical
-        # to the one we audit elsewhere — no surprise new
-        # transitive deps slipping into the scan.
-        run: cargo build --release --locked
 
       - name: CodeQL analyze
         uses: github/codeql-action/analyze@v3
