@@ -124,13 +124,23 @@ jobs:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
       # Snyk — proprietary dep scanner. Gated on SNYK_TOKEN
-      # because the action errors out without a token; skipping
-      # the step entirely keeps forks / token-less PRs green.
-      # When the secret is present, hard-fail on high+ severity.
-      - name: snyk (gated on SNYK_TOKEN)
+      # because the CLI errors out without a token; skipping the
+      # step entirely keeps forks / token-less PRs green.
+      #
+      # Snyk deprecated their per-language `snyk/actions/rust@*`
+      # composite action in 2024 — Rust is no longer in the
+      # `Supported Actions` list at https://github.com/snyk/actions.
+      # The current pattern is `snyk/actions/setup` (installs the
+      # CLI) followed by an explicit `snyk test` call. We point
+      # `--file=Cargo.lock` at the lockfile because Snyk's Rust
+      # support reads the resolved dep graph there, not Cargo.toml.
+      # Hard-fail on high+ severity when the token is set.
+      - name: snyk setup (gated on SNYK_TOKEN)
         if: env.HAS_SNYK_TOKEN == 'true'
-        uses: snyk/actions/rust@master
+        uses: snyk/actions/setup@master
+
+      - name: snyk test (gated on SNYK_TOKEN)
+        if: env.HAS_SNYK_TOKEN == 'true'
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
+        run: snyk test --file=Cargo.lock --severity-threshold=high

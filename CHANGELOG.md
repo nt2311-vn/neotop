@@ -52,9 +52,19 @@ right binary.
   (themes, per-engine Intel GPU, SMT/NUMA, OS ports) from
   "recently shipped" with version anchors.
 
+CI fix bundled in the same release: Snyk deprecated
+`snyk/actions/rust@master` in 2024 (Rust was removed from their
+`Supported Actions` list — only Node, Python, Ruby, Go, Maven,
+Gradle, PHP, etc. remain). The `security` job's snyk step now
+uses the language-agnostic `snyk/actions/setup@master` to install
+the CLI followed by an explicit `snyk test --file=Cargo.lock
+--severity-threshold=high`. Both steps stay gated on
+`HAS_SNYK_TOKEN` so token-less PRs still skip cleanly.
+
 Verification: `cargo publish --dry-run` succeeds; `cargo audit`,
 `cargo deny check`, full `cargo test --all-targets --locked`
-(176 tests) all clean.
+(176 tests) all clean. `actionlint` clean on the patched
+workflow.
 
 ## [0.20.0] — 2026-04-26
 
