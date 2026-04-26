@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-04-26
+
+### CI green again
+
+`v0.18.0` shipped a `Cargo.toml` version bump but the matching
+`Cargo.lock` refresh wasn't committed. Both CI jobs (`check
+(stable)` and `check (1.88)`) run with `--locked` and refused to
+update the lock file, failing with `the lock file needs to be
+updated but --locked was passed to prevent this`.
+
+This patch release re-syncs `Cargo.lock` with `Cargo.toml`. No
+code changes.
+
 ## [0.18.0] — 2026-04-26
 
 ### VM Phase 4 — passthrough surface (VFIO + vhost + tap)
