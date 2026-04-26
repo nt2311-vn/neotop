@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-04-26
+
+### Intel iGPU busy% via RC6 residency
+
+The last vendor gap closes. Intel `i915` cards now report a coarse
+busy% derived from `/sys/class/drm/card*/gt/gt0/rc6_residency_ms`
+— RC6 is the deepest GPU power-save state, time accrues there
+when the engine is idle, so `busy% ≈ (1 − ΔRC6 / Δwallclock) ×
+100`. Same fallback `intel_gpu_top` uses when it can't open
+`i915_pmu` perf events; works without root, without
+`CAP_PERFMON`, without ioctls.
+
+The `Tracker` now keeps a per-card RC6 sample (24 B each, keyed
+by canonical PCI address) so busy% is a proper derivative across
+ticks. First sample seeds the cache; busy% lands on the second
+tick. Cards that disappear between ticks have their cache entry
+purged.
+
+Falls back to the legacy `power/rc6_residency_ms` path on older
+kernels. Per-engine breakdown (rcs / bcs / vcs / vecs) and Intel
+power draw stay deferred — both need ioctls or perf events.
+
+Verified live on a Comet Lake-H UHD: idle iGPU shows ~0.1% busy,
+matching `intel_gpu_top -s 1`.
+
+### Tests
+
+3 new unit tests in `gpu.rs` cover the busy% derivative (typical
+case → 80%), the over-report clamp (RC6 delta exceeds wallclock
+delta → 0%), and the skip-on-counter-reset / zero-window guards.
+176 tests passing total.
+
 ## [0.18.1] — 2026-04-26
 
 ### CI green again

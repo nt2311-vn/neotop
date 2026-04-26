@@ -22,16 +22,24 @@
 //!      (proprietary driver loaded but the card was hot-disabled,
 //!      runtime PM suspended) stay as detect-only.
 //!
-//! Intel still has no real backend; its Xe / i915 perf counters
-//! need `CAP_PERFMON` or root and are deferred to a later release.
+//! Intel `i915` cards get a coarse busy% computed from the RC6
+//! residency counter under `/sys/class/drm/card*/gt/gt0/`. RC6 is
+//! the deepest GPU power-save state — when the engine is idle and
+//! has nothing queued, time accrues there. Subtract its delta from
+//! the wall-clock delta and you have an approximate busy %. It's
+//! the same fallback `intel_gpu_top` uses when it can't open
+//! `i915_pmu` perf events (which require `CAP_PERFMON` and the
+//! `perf_event_open` syscall — out of scope for an observe-only
+//! tool). Per-engine breakdown (rcs / bcs / vcs / vecs) and power
+//! draw stay deferred for the same reason.
 //!
 //! All probes are best-effort: a card that disappears mid-scan
 //! (eGPU unplug, runtime PM) is silently skipped, never panics.
 
-#[cfg(feature = "nvml")]
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpuVendor {
@@ -154,10 +162,28 @@ impl std::fmt::Debug for NvmlState {
 /// repeated snapshots reuse the same library context — `Nvml::init`
 /// is itself a 50-100 ms call we don't want on the hot path. AMD's
 /// sysfs reads are stateless and don't need caching.
+///
+/// `intel_state` keeps the previous RC6 residency sample per
+/// Intel card (keyed by canonical PCI address). Busy% is the
+/// derivative of that counter against wall-clock — needs the prev
+/// sample to compute, so we cache it here for the lifetime of the
+/// process and purge entries for cards that have disappeared.
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
     #[cfg(feature = "nvml")]
     nvml: NvmlState,
+    intel_state: HashMap<String, IntelSample>,
+}
+
+/// Per-Intel-card sample for RC6 derivative. Tiny (24 B) so the
+/// `HashMap` stays cheap even on multi-iGPU laptops.
+#[derive(Debug, Clone, Copy)]
+struct IntelSample {
+    when: Instant,
+    /// Cumulative milliseconds spent in RC6 power-save state since
+    /// driver load. Read from
+    /// `/sys/class/drm/card*/gt/gt0/rc6_residency_ms`.
+    rc6_ms: u64,
 }
 
 impl Tracker {
@@ -167,12 +193,47 @@ impl Tracker {
     // the call site stable across feature combinations.
     #[cfg_attr(not(feature = "nvml"), allow(clippy::unused_self))]
     pub(crate) fn snapshot(&mut self) -> Vec<Gpu> {
-        // The `mut` is used by the `nvml` cfg branch below.
-        #[allow(unused_mut)]
         let mut out = scan_sysfs_cards();
         #[cfg(feature = "nvml")]
         self.merge_nvml(&mut out);
+        self.merge_intel(&mut out);
         out
+    }
+
+    /// For every Intel sysfs card, read RC6 residency and convert
+    /// the delta against the previous tick into a busy %. The
+    /// first sample seeds the cache and leaves `busy_pct = None`;
+    /// every subsequent tick produces a real number. Cards that
+    /// disappear between ticks have their cache entry dropped.
+    fn merge_intel(&mut self, gpus: &mut [Gpu]) {
+        if !gpus.iter().any(|g| g.vendor == GpuVendor::Intel) {
+            return;
+        }
+        let now = Instant::now();
+        let pci_to_card = build_intel_card_map();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(gpus.len());
+        for g in gpus.iter_mut() {
+            if g.vendor != GpuVendor::Intel {
+                continue;
+            }
+            let Some(addr) = g.pci_addr.clone() else {
+                continue;
+            };
+            seen.insert(addr.clone());
+            let Some(card_path) = pci_to_card.get(&addr) else {
+                continue;
+            };
+            let Some(rc6_ms) = read_intel_rc6_ms(card_path) else {
+                continue;
+            };
+            let cur = IntelSample { when: now, rc6_ms };
+            if let Some(prev) = self.intel_state.get(&addr).copied() {
+                g.busy_pct = compute_intel_busy_pct(prev, cur);
+            }
+            self.intel_state.insert(addr, cur);
+        }
+        self.intel_state.retain(|k, _| seen.contains(k));
     }
 
     /// For each NVIDIA card we found via sysfs, replace the
@@ -397,6 +458,76 @@ fn read_amd(dev: &Path, name: String, pci_addr: Option<String>) -> Gpu {
     }
 }
 
+/// Build a PCI-address → card-path lookup limited to Intel cards.
+/// The Intel busy% reader needs the `cardN` directory itself
+/// (not the `device/` subdir we pass through `read_one`) because
+/// `gt/gt0/rc6_residency_ms` lives one level up. Filtering by
+/// vendor here keeps the hot path off non-Intel cards.
+fn build_intel_card_map() -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return map;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_real_card_node(name) {
+            continue;
+        }
+        let card_path = e.path();
+        let dev = card_path.join("device");
+        let Some(vendor) = read_trim(&dev.join("vendor")) else {
+            continue;
+        };
+        if GpuVendor::from_pci_id(&vendor) != GpuVendor::Intel {
+            continue;
+        }
+        let Some(addr) = sysfs_pci_addr(&dev) else {
+            continue;
+        };
+        map.insert(addr, card_path);
+    }
+    map
+}
+
+/// Read the cumulative RC6 residency counter (milliseconds) for
+/// an Intel card. Tries the modern path first (`gt/gt0/`) and
+/// falls back to the legacy `power/` location for older kernels.
+/// Returns `None` on any IO / parse error so the caller can fall
+/// back to detect-only mode without crashing.
+fn read_intel_rc6_ms(card_path: &Path) -> Option<u64> {
+    let modern = card_path.join("gt/gt0/rc6_residency_ms");
+    let legacy = card_path.join("power/rc6_residency_ms");
+    for p in [modern, legacy] {
+        if let Some(s) = read_trim(&p) {
+            if let Ok(v) = s.parse::<u64>() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Pure busy% derivative — `(1 − ΔRC6 / Δwallclock) × 100`,
+/// clamped to `0..=100`. Skips the sample when the wall-clock
+/// delta is zero (back-to-back ticks) or the counter went
+/// backwards (driver reload, counter reset).
+fn compute_intel_busy_pct(prev: IntelSample, cur: IntelSample) -> Option<f64> {
+    let dt_ms = cur.when.duration_since(prev.when).as_millis();
+    if dt_ms == 0 {
+        return None;
+    }
+    if cur.rc6_ms < prev.rc6_ms {
+        return None;
+    }
+    let drc6 = cur.rc6_ms - prev.rc6_ms;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let dt = dt_ms as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let idle_frac = (drc6 as f64 / dt).min(1.0);
+    Some(((1.0 - idle_frac) * 100.0).clamp(0.0, 100.0))
+}
+
 /// AMD `power1_average` lives in microwatts under
 /// `/sys/.../device/hwmon/hwmonN/power1_average`. We pick the first
 /// hwmon directory under the card and read it. Returns watts.
@@ -513,6 +644,64 @@ mod tests {
         // Whitespace + capitalisation tolerated (sysfs files have a
         // trailing newline; some kernels uppercase the hex).
         assert_eq!(GpuVendor::from_pci_id(" 0X10DE \n"), GpuVendor::Nvidia);
+    }
+
+    #[test]
+    fn intel_busy_pct_inverts_rc6_fraction() {
+        // Card spent 200 ms in RC6 over a 1000 ms wall-clock
+        // window → 80% busy.
+        let now = Instant::now();
+        let prev = IntelSample {
+            when: now,
+            rc6_ms: 1000,
+        };
+        let cur = IntelSample {
+            when: now + std::time::Duration::from_secs(1),
+            rc6_ms: 1200,
+        };
+        let busy = compute_intel_busy_pct(prev, cur).unwrap();
+        assert!((busy - 80.0).abs() < 0.01, "got {busy}");
+    }
+
+    #[test]
+    fn intel_busy_pct_clamps_full_idle_window() {
+        // RC6 caught up with wall-clock (counter is monotonic but
+        // the driver's accounting can momentarily over-report).
+        // Result must clamp to 0.
+        let now = Instant::now();
+        let prev = IntelSample {
+            when: now,
+            rc6_ms: 1000,
+        };
+        let cur = IntelSample {
+            when: now + std::time::Duration::from_millis(500),
+            rc6_ms: 2000, // delta(1000) > dt(500) → idle_frac caps at 1.0
+        };
+        let busy = compute_intel_busy_pct(prev, cur).unwrap();
+        assert!(busy.abs() < 0.01, "got {busy}");
+    }
+
+    #[test]
+    fn intel_busy_pct_skips_zero_window_and_counter_reset() {
+        let now = Instant::now();
+        // Same instant → dt = 0; no derivative possible.
+        let same = IntelSample {
+            when: now,
+            rc6_ms: 1000,
+        };
+        assert_eq!(compute_intel_busy_pct(same, same), None);
+
+        // Counter went backwards (driver reload). Skip rather
+        // than report bogus -inf%.
+        let prev = IntelSample {
+            when: now,
+            rc6_ms: 5000,
+        };
+        let cur = IntelSample {
+            when: now + std::time::Duration::from_secs(1),
+            rc6_ms: 100,
+        };
+        assert_eq!(compute_intel_busy_pct(prev, cur), None);
     }
 
     #[test]
