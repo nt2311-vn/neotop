@@ -1,34 +1,16 @@
 //! temp.rs — hwmon temperature readout.
-//!
-//! Walks `/sys/class/hwmon/hwmon*`, finds every `tempN_input` file,
-//! reads the value (milli-Celsius), and labels it via `tempN_label`
-//! when present or the hwmon `name` otherwise.
-//!
-//! We don't depend on `lm_sensors` or any libsensors binding — sysfs
-//! is the same data, one layer down. This is what `lm_sensors` itself
-//! reads.
-//!
-//! ## Adaptive blacklisting
-//!
-//! On real hardware some hwmon devices are *catastrophically* slow.
-//! The poster child: `acpitz` on certain HP laptops takes ~3 seconds
-//! per `tempN_input` read because the kernel falls through to an
-//! ACPI `_TMP` method that polls the embedded controller over a
-//! mailbox protocol. Reading that file every tick blocks the entire
-//! UI — the original bug behind the v0.6.0 release.
-//!
-//! `Tracker` solves this by *measuring* every hwmon's scan time and
-//! parking any device whose total scan exceeds `SLOW_THRESHOLD`.
-//! Parked devices stay parked for the lifetime of the process —
-//! they were slow once and are essentially guaranteed to be slow
-//! forever (the bottleneck is the hardware bus, not transient load).
-//! No flag, no config; the user gets a fast UI by default.
+//! Linux: `/sys/class/hwmon`. macOS: not implemented (returns empty).
 
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::mpsc;
+#[cfg(target_os = "linux")]
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 /// Any hwmon device whose total scan exceeds this is parked. 50 ms
@@ -165,36 +147,36 @@ pub(crate) struct PollOutput {
 }
 
 impl TempWorker {
+    #[cfg(target_os = "linux")]
     pub(crate) fn spawn() -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<()>();
-        let (res_tx, res_rx) = mpsc::channel::<ScanReport>();
-        // The thread owns the Tracker, including the parked-paths
-        // HashSet, so parking decisions persist across scans
-        // exactly the same way the sync path did. We don't keep
-        // the JoinHandle — the worker terminates naturally when
-        // the request channel closes, which happens when this
-        // struct is dropped.
+        let (request_tx, request_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel::<ScanReport>();
         thread::Builder::new()
             .name("neotop-temp".into())
             .spawn(move || {
                 let mut tracker = Tracker::default();
-                while req_rx.recv().is_ok() {
-                    // Coalesce: if multiple requests piled up
-                    // while we were scanning, collapse them into
-                    // a single fresh scan. The user sees the most
-                    // recent state, never a stale backlog.
-                    while req_rx.try_recv().is_ok() {}
+                while request_rx.recv().is_ok() {
+                    while request_rx.try_recv().is_ok() {}
                     let report = tracker.scan();
-                    if res_tx.send(report).is_err() {
-                        // UI thread gone; nothing left to report to.
+                    if result_tx.send(report).is_err() {
                         return;
                     }
                 }
             })
             .expect("spawn temp worker");
         Self {
-            request_tx: req_tx,
-            result_rx: res_rx,
+            request_tx,
+            result_rx,
+            in_flight: false,
+            cached: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn spawn() -> Self {
+        Self {
+            request_tx: std::sync::mpsc::channel().0,
+            result_rx: std::sync::mpsc::channel().1,
             in_flight: false,
             cached: Vec::new(),
         }

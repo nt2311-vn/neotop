@@ -1,28 +1,21 @@
-//! proc.rs — tiny slice of `/proc/<pid>/` for the neotop UI.
+//! proc.rs — Linux /proc/<pid>/ or macOS libproc process info.
 //!
-//! We intentionally avoid the `procfs` crate: the fields we need are
-//! small, stable, and zero-dep. If a file is unreadable (process gone,
-//! permission issue) every function returns `None` so the caller can
-//! render "—" without ceremony.
-//!
-//! Fields and their sources:
-//!
-//! | Field          | Source                | Unit                    |
-//! | -------------- | --------------------- | ----------------------- |
-//! | `utime+stime`  | /proc/<pid>/stat (14,15) | clock ticks (jiffies) |
-//! | `num_threads`  | /proc/<pid>/stat (20) | count                   |
-//! | `state`        | /proc/<pid>/stat (3)  | R/S/D/Z/T/I letter      |
-//! | `VmRSS`/`VmSize` | /proc/<pid>/status  | kB → bytes              |
-//! | `limits`       | /proc/<pid>/limits    | per-rlimit column text  |
+//! Linux: reads `/proc/<pid>/`. macOS: uses `libproc`.
+//! Fields return `None` when unavailable so UI renders "—".
 
+#[cfg(target_os = "linux")]
 use std::fs;
 
-/// Clock ticks per second on this host. Typical values: 100 (most
-/// distros), 250, 300 (Arch stock), 1000 (`CachyOS`, low-latency
-/// kernels). CPU-time maths depends on this, so we read it correctly
-/// via `sysconf` (wrapped safely by `rustix`).
+/// Clock ticks per second. Linux: rustix, macOS: constant 100.
 pub(crate) fn clk_tck() -> u64 {
-    rustix::param::clock_ticks_per_second()
+    #[cfg(target_os = "linux")]
+    {
+        rustix::param::clock_ticks_per_second()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        100
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,16 +71,23 @@ pub(crate) struct Snapshot {
 }
 
 pub(crate) fn snapshot(pid: i64) -> Option<Snapshot> {
-    let stat = read_stat(pid)?;
-    let mem = read_mem(pid).unwrap_or_default();
-    let limits = read_limits(pid).unwrap_or_default();
-    let cgroup = read_cgroup(pid);
-    Some(Snapshot {
-        stat,
-        mem,
-        limits,
-        cgroup,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let stat = read_stat(pid)?;
+        let mem = read_mem(pid).unwrap_or_default();
+        let limits = read_limits(pid).unwrap_or_default();
+        let cgroup = read_cgroup(pid);
+        Some(Snapshot {
+            stat,
+            mem,
+            limits,
+            cgroup,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        snapshot_macos(pid)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -346,5 +346,46 @@ mod tests {
         // Non-byte units are kept verbatim — caller decides formatting.
         assert_eq!(format_limit_value("4096", "files"), "4096");
         assert_eq!(format_limit_value("1024", "us"), "1024");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_macos(pid: i64) -> Option<Snapshot> {
+    use libc::{c_int, c_void};
+
+    let pid = pid as libc::pid_t;
+
+    unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let mut size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+
+        if libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        ) <= 0
+        {
+            return None;
+        }
+
+        let stat = Stat {
+            state: "S".to_string(),
+            num_threads: info.pti_threadnum as i64,
+            cpu_jiffies: (info.pti_total_user + info.pti_total_system) / 10000,
+        };
+
+        let mem = Mem {
+            rss_bytes: info.pti_resident_size as u64,
+            vsz_bytes: info.pti_virtual_size as u64,
+        };
+
+        Some(Snapshot {
+            stat,
+            mem,
+            limits: vec![],
+            cgroup: None,
+        })
     }
 }

@@ -1,36 +1,10 @@
 //! procs.rs — full host process list for the "Procs" view.
 //!
-//! This is the big-table view: one row per PID on the host, the way
-//! `htop`/`btop`/`btm` show it. On every tick we walk `/proc/*`, read
-//! `/proc/<pid>/stat` (only), and compute CPU% as a delta over the
-//! last refresh interval — same approach as the per-VM tracker in
-//! `main.rs`.
-//!
-//! Memory model: a `Tracker` holds two caches keyed by pid:
-//!
-//! * `prev`   — last (instant, jiffies) sample so we can derive a rate.
-//! * `cache`  — static per-pid info (uid, resolved user, cmdline).
-//!   `cmdline` and `uid` never change after exec, so reading them
-//!   once and reusing them drops 2/3 of the per-tick file I/O on a
-//!   typical host with 300+ pids.
-//!
-//! Pids that disappear between scans are purged from both maps.
-//!
-//! Wins from the cache approach, measured on a laptop with ~420 pids:
-//!
-//! * `fs::read_to_string` calls per tick: **~1260 → ~420** (first
-//!   scan is full; steady state only re-reads `stat`).
-//! * median scan time: **12 ms → 3 ms**.
-//!
-//! RSS is now pulled straight out of `stat` field 24 (pages) times
-//! the system page size, so we no longer touch `/proc/<pid>/status`.
-//!
-//! Status: parsing + sampling + sort/filter are implemented and
-//! covered by unit tests. The Procs view in `main.rs` renders rows
-//! produced by `Tracker::snapshot`, sorted via `sort_rows`, and
-//! filtered via `matches`.
+//! Linux: walks `/proc/*`. macOS: uses `libproc` to list processes.
+//! Memory model: per-pid caches for static info (uid, user, cmdline).
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::time::Instant;
 
@@ -155,6 +129,18 @@ impl Default for Tracker {
 
 impl Tracker {
     pub(crate) fn snapshot(&mut self, passwd: &PasswdCache, clk_tck: u64) -> Vec<ProcessRow> {
+        #[cfg(target_os = "linux")]
+        {
+            self.snapshot_linux(passwd, clk_tck)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.snapshot_macos(passwd, clk_tck)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_linux(&mut self, passwd: &PasswdCache, clk_tck: u64) -> Vec<ProcessRow> {
         let Ok(entries) = fs::read_dir("/proc") else {
             return Vec::new();
         };
@@ -172,16 +158,44 @@ impl Tracker {
             let Some((row, sample)) = self.read_one(pid, passwd, now, clk_tck) else {
                 continue;
             };
-            // `read_one` returns the next-tick Sample with EMA state
-            // already updated; persist it as-is.
             self.prev.insert(pid, sample);
             seen.push(pid);
             rows.push(row);
         }
-        // Both caches must be pruned by the *same* live-pid set.
-        // Without this, `cache` would grow unbounded on a long-running
-        // host that churns short-lived processes (build servers, CI
-        // workers, shell-pipe spam, …).
+        seen.sort_unstable();
+        self.prev.retain(|k, _| seen.binary_search(k).is_ok());
+        self.cache.retain(|k, _| seen.binary_search(k).is_ok());
+        rows
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_macos(&mut self, passwd: &PasswdCache, clk_tck: u64) -> Vec<ProcessRow> {
+        let now = Instant::now();
+        let mut rows = Vec::new();
+        let mut seen: Vec<i32> = Vec::new();
+
+        unsafe {
+            let mut pids: Vec<i32> = vec![0; 1024];
+            let count = libc::proc_listallpids(
+                pids.as_mut_ptr() as *mut libc::c_void,
+                (pids.len() * 4) as i32,
+            );
+            if count <= 0 {
+                return rows;
+            }
+
+            for &pid in pids.iter().take(count as usize) {
+                if pid <= 0 {
+                    continue;
+                }
+                if let Some((row, sample)) = self.read_one_macos(pid, passwd, now, clk_tck) {
+                    self.prev.insert(pid, sample);
+                    seen.push(pid);
+                    rows.push(row);
+                }
+            }
+        }
+
         seen.sort_unstable();
         self.prev.retain(|k, _| seen.binary_search(k).is_ok());
         self.cache.retain(|k, _| seen.binary_search(k).is_ok());
@@ -798,6 +812,118 @@ alice:x:1000:1000::/home/alice:/bin/zsh
             write_bps: None,
             command: format!("cmd{pid}"),
             group: Group::Native,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Tracker {
+    fn read_one_macos(
+        &mut self,
+        pid: i32,
+        passwd: &PasswdCache,
+        now: Instant,
+        clk_tck: u64,
+    ) -> Option<(ProcessRow, Sample)> {
+        use libc::c_void;
+
+        let pid = pid as libc::pid_t;
+
+        unsafe {
+            let mut info: libc::proc_taskinfo = std::mem::zeroed();
+            let mut size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+
+            if libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                &mut info as *mut _ as *mut c_void,
+                size,
+            ) <= 0
+            {
+                return None;
+            }
+
+            let jiffies = (info.pti_total_user + info.pti_total_system) / 10000;
+            let prev = self.prev.get(&pid);
+
+            let cpu_pct = if let Some(p) = prev {
+                if jiffies > p.jiffies {
+                    let delta = jiffies - p.jiffies;
+                    #[allow(clippy::cast_precision_loss)]
+                    let dt = now.duration_since(p.when).as_secs_f64();
+                    if dt > 0.0 {
+                        Some((delta as f64 / dt / clk_tck as f64) * 100.0)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let smoothed_cpu = if let Some(p) = prev {
+                let pct = cpu_pct.unwrap_or(0.0);
+                blend_rate_smoothed(pct, p.smoothed_cpu)
+            } else {
+                cpu_pct.unwrap_or(0.0)
+            };
+
+            let info_cache = if let Some(cached) = self.cache.get(&pid) {
+                cached
+            } else {
+                let uid = info.pti_uid as u32;
+                let user = passwd.lookup(uid);
+
+                let mut pathbuf: [libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize] =
+                    [0; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                libc::proc_pidpath(pid, pathbuf.as_mut_ptr(), pathbuf.len() as u32);
+                let command = if pathbuf[0] == 0 {
+                    format!("[pid:{}]", pid)
+                } else {
+                    std::ffi::CStr::from_ptr(pathbuf.as_ptr())
+                        .to_string_lossy()
+                        .to_string()
+                };
+
+                let static_info = StaticInfo {
+                    uid,
+                    user,
+                    command,
+                    group: Group::Native,
+                };
+                self.cache.insert(pid, static_info.clone());
+                static_info
+            };
+
+            let sample = Sample {
+                when: now,
+                jiffies,
+                smoothed_cpu,
+                read_bytes: None,
+                write_bytes: None,
+                smoothed_read_bps: 0.0,
+                smoothed_write_bps: 0.0,
+            };
+
+            let row = ProcessRow {
+                pid: pid as i32,
+                ppid: info.pti_ppid as i32,
+                uid: info_cache.uid,
+                user: info_cache.user.clone(),
+                state: 'S',
+                cpu_pct,
+                rss_bytes: info.pti_resident_size as u64,
+                threads: info.pti_threadnum as i32,
+                read_bps: None,
+                write_bps: None,
+                command: info_cache.command.clone(),
+                group: info_cache.group,
+            };
+
+            Some((row, sample))
         }
     }
 }

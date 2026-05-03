@@ -7,22 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### CD: manual crates.io publishing
+## [0.21.1]
 
-- **`.github/workflows/release.yml`** — new release workflow (manual trigger
-  only). Repo owner goes to Actions → Release → Run workflow.
-  - Input: git tag (e.g., `v0.21.0`).
-  - Runs: verify → publish → GitHub release.
-  - Publishes to crates.io using `CARGO_REGISTRY_TOKEN` secret.
-  - Creates GitHub release with changelog excerpt.
+### macOS support
 
-### CI: security checks moved to separate workflow
+Cross-platform compilation and basic functionality on macOS. The codebase now compiles and runs on macOS with platform-specific data sources:
 
-- **`.github/workflows/security.yml`** — new dedicated security workflow
-  running in parallel with CI. Contains: `cargo audit`, `cargo deny`,
-  Semgrep SAST. Also adds weekly scheduled scans (Monday 6 AM UTC).
-- **`.github/workflows/ci.yml`** — removed the inline `security` job,
-  kept `check` (Linux + macOS build matrix) focused on build/test.
+- **host.rs** — CPU count, memory, load averages via `sysctl`
+- **proc.rs** — process info via `libproc` (`PROC_PIDTASKINFO`)
+- **procs.rs** — process list via `proc_listallpids`
+- **Linux-only modules** — battery, disk, net, temp, gpu, elf return empty data on macOS (full implementations deferred)
+
+CI now includes macOS builds (allowing failures as the implementation is basic).
+
+### Platform abstraction
+
+- Moved `rustix` to Linux-only dependencies
+- Added `libc` for macOS system calls
+- Added `#[cfg(target_os = "macos")]` guards throughout
+- Updated module documentation to note platform differences
 
 ## [0.21.0]
 
@@ -43,6 +46,29 @@ implementations:
 Linux retains full functionality; macOS stubs return empty data for now.
 
 ## [0.20.1]
+=======
+## [0.21.1]
+
+### macOS support
+
+Cross-platform compilation and basic functionality on macOS. The codebase now compiles and runs on macOS with platform-specific data sources:
+
+- **host.rs** — CPU count, memory, load averages via `sysctl`
+- **proc.rs** — process info via `libproc` (`PROC_PIDTASKINFO`)
+- **procs.rs** — process list via `proc_listallpids`
+- **Linux-only modules** — battery, disk, net, temp, gpu, elf return empty data on macOS (full implementations deferred)
+
+CI now includes macOS builds (allowing failures as the implementation is basic).
+
+### Platform abstraction
+
+- Moved `rustix` to Linux-only dependencies
+- Added `libc` for macOS system calls
+- Added `#[cfg(target_os = "macos")]` guards throughout
+- Updated module documentation to note platform differences
+
+## [0.20.1] — 2026-04-26
+>>>>>>> 0.21.1
 
 ### crates.io release prep
 

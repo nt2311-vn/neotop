@@ -71,3 +71,88 @@ jobs:
 
       - name: cargo build (release)
         run: cargo build --release --locked
+
+  # Supply-chain + SAST + advisory scan. Runs in parallel with
+  # `check` — independent failures don't block each other.
+  #
+  # *Why no valgrind?* The codebase has zero `unsafe` blocks
+  # (`rg unsafe src/` returns nothing). Without `unsafe`, Rust's
+  # ownership model rules out the use-after-free, double-free, and
+  # raw-pointer leak classes valgrind exists to catch. Running it
+  # over `cargo test` mostly produces noise from libstd's allocator
+  # caching and libnvml's dlopen path. The Rust-native equivalents
+  # that *do* find things in this codebase — `cargo audit`,
+  # `cargo deny`, and (for any future `unsafe` we add) `cargo miri`
+  # — are wired up below. If we ever introduce raw FFI of our own,
+  # add a separate `miri` job at that point.
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for cargo-audit to create a check run
+      checks: write
+      # Required for Semgrep's SARIF upload to the security tab on
+      # public repos. Harmless on private repos that disable it.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bust the cache when the lockfile or deny config moves —
+          # both directly affect the audit / deny verdicts.
+          shared-key: security
+          key: ${{ hashFiles('Cargo.lock', 'deny.toml') }}
+
+      # cargo-audit — the canonical RustSec advisory DB scan.
+      # Free, no auth, runs on every push. Hard-fails on advisory
+      # matches that aren't waived; warnings (e.g. unsound deps
+      # without a CVE) flow through and surface in the log.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # cargo-deny — supply-chain policy: licenses, duplicate
+      # versions, banned crates, sources, advisories. Stricter
+      # than audit. Configured in `deny.toml` at the repo root.
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+      # Semgrep SAST — Rust + secrets + general security-audit
+      # rule packs. No token required for the OSS rule packs;
+      # bring-your-own-token via SEMGREP_APP_TOKEN unlocks the
+      # Semgrep Cloud dashboard. We hard-fail on findings so a
+      # `eval()`-grade smell can't sneak in.
+      - name: semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/rust
+            p/security-audit
+            p/secrets
+        env:
+          # Optional — only set in repo secrets if you've
+          # connected to Semgrep Cloud. Action runs fine without.
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      # No Snyk step. Snyk does not support Rust:
+      #   * They removed `snyk/actions/rust@master` from their
+      #     Supported Actions in 2024 (only Node, Python, Ruby,
+      #     Go, Maven, Gradle, PHP, .NET, etc. remain).
+      #   * The CLI itself errors with "Could not detect package
+      #     manager for file: Cargo.lock" — there is no Cargo
+      #     plugin.
+      # `cargo audit` above already covers the same advisory DB
+      # Snyk would, and `cargo deny` covers the license / dup-dep
+      # surface their Open Source product would. The CodeQL and
+      # Scorecard workflows in this repo cover SAST and supply-
+      # chain best-practices respectively. Snyk would add zero
+      # coverage for this codebase.

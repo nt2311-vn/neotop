@@ -1,12 +1,8 @@
-//! battery.rs — laptop battery readout from `/sys/class/power_supply/`.
+//! battery.rs — battery status from `/sys/class/power_supply`.
 //!
-//! We scan `/sys/class/power_supply/*` looking for entries whose
-//! `type` is `Battery`. Name varies by vendor (`BAT0`, `BAT1`, `CMB0`,
-//! etc), so we iterate rather than hard-coding. Missing files / empty
-//! directory → `None`, rendered as a blank cell in the UI.
-//!
-//! Kernel docs: <https://www.kernel.org/doc/html/latest/power/power_supply_class.html>
+//! macOS: not implemented (returns empty).
 
+#[cfg(target_os = "linux")]
 use std::fs;
 
 #[derive(Debug, Clone)]
@@ -26,55 +22,63 @@ pub(crate) struct Battery {
 }
 
 pub(crate) fn snapshot() -> Vec<Battery> {
-    let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
 
-    for e in entries.flatten() {
-        let path = e.path();
-        // Only power supplies of type "Battery". USB-C chargers, main
-        // AC, etc all live here too — skip them.
-        let kind = fs::read_to_string(path.join("type"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if kind != "Battery" {
-            continue;
+        for e in entries.flatten() {
+            let path = e.path();
+            let kind = fs::read_to_string(path.join("type"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if kind != "Battery" {
+                continue;
+            }
+
+            let Some(name) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(percent) = fs::read_to_string(path.join("capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+            else {
+                continue;
+            };
+            let status = fs::read_to_string(path.join("status"))
+                .ok()
+                .map_or_else(|| "Unknown".into(), |s| s.trim().to_string());
+            #[allow(clippy::cast_precision_loss)]
+            let watts = fs::read_to_string(path.join("power_now"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|uw| uw as f64 / 1_000_000.0);
+
+            out.push(Battery {
+                name,
+                percent,
+                status,
+                watts,
+            });
         }
-
-        let Some(name) = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Some(percent) = fs::read_to_string(path.join("capacity"))
-            .ok()
-            .and_then(|s| parse_capacity(&s))
-        else {
-            continue;
-        };
-        let status = fs::read_to_string(path.join("status"))
-            .ok()
-            .map_or_else(|| "Unknown".into(), |s| s.trim().to_string());
-        let watts = fs::read_to_string(path.join("power_now"))
-            .ok()
-            .and_then(|s| parse_power_now_watts(&s));
-
-        out.push(Battery {
-            name,
-            percent,
-            status,
-            watts,
-        });
+        out
     }
-    out
+    #[cfg(target_os = "macos")]
+    {
+        Vec::new()
+    }
 }
 
 /// `capacity` sysfs file holds an integer 0..=100. We trim whitespace
 /// because the file ends in a newline.
+#[allow(dead_code)]
 pub(crate) fn parse_capacity(raw: &str) -> Option<u8> {
     raw.trim().parse::<u8>().ok()
 }
@@ -82,6 +86,7 @@ pub(crate) fn parse_capacity(raw: &str) -> Option<u8> {
 /// `power_now` is in microwatts; some drivers expose it as negative
 /// while charging, some as positive. We keep the sign so the UI can
 /// distinguish draw vs charge.
+#[allow(dead_code)]
 pub(crate) fn parse_power_now_watts(raw: &str) -> Option<f64> {
     let uw: i64 = raw.trim().parse().ok()?;
     #[allow(clippy::cast_precision_loss)]
