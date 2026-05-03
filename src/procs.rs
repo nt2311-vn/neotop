@@ -744,15 +744,15 @@ mod tests {
     #[test]
     fn passwd_cache_parses_typical_file() {
         let raw = "\
-root:x:0:0:root:/root:/bin/bash
-daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
-short:line
-alice:x:1000:1000::/home/alice:/bin/zsh
+user0:x:0:0:root:/root:/bin/bash
+user1:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+user2:line
+user3:x:1000:1000::/home/alice:/bin/zsh
 ";
         let cache = PasswdCache::parse(raw);
-        assert_eq!(cache.lookup(0), "root");
-        assert_eq!(cache.lookup(1), "daemon");
-        assert_eq!(cache.lookup(1000), "alice");
+        assert_eq!(cache.lookup(0), "user0");
+        assert_eq!(cache.lookup(1), "user1");
+        assert_eq!(cache.lookup(1000), "user3");
         // The "short:line" entry has only 2 fields — silently skipped.
         // Unknown uids fall back to "uid=N".
         assert_eq!(cache.lookup(9999), "uid=9999");

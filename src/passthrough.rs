@@ -369,13 +369,12 @@ mod tests {
         // PCI sysfs files have the literal "0x10de\n" form. Robust
         // against trailing newline, missing 0x prefix, and parse
         // failures (returns 0).
-        let tmp = std::env::temp_dir().join("neotop_pci_vendor_test");
-        std::fs::write(&tmp, "0x10de\n").unwrap();
-        assert_eq!(read_hex16(tmp.to_str().unwrap()), 0x10de);
-        std::fs::write(&tmp, "8086").unwrap();
-        assert_eq!(read_hex16(tmp.to_str().unwrap()), 0x8086);
-        std::fs::write(&tmp, "garbage").unwrap();
-        assert_eq!(read_hex16(tmp.to_str().unwrap()), 0);
-        let _ = std::fs::remove_file(&tmp);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "0x10de\n").unwrap();
+        assert_eq!(read_hex16(tmp.path().to_str().unwrap()), 0x10de);
+        std::fs::write(tmp.path(), "8086").unwrap();
+        assert_eq!(read_hex16(tmp.path().to_str().unwrap()), 0x8086);
+        std::fs::write(tmp.path(), "garbage").unwrap();
+        assert_eq!(read_hex16(tmp.path().to_str().unwrap()), 0);
     }
 }
