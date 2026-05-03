@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0]
+
+### Intel GPU per-engine breakdown
+
+New `i915-pmu` feature (default-on) adds per-engine utilisation
+percentages for Intel iGPUs via `perf_event_open(2)`.
+
+- **Engines shown**: `rcs` (3D/compute), `bcs` (blitter), `vcs` (video
+  codec), `vecs` (video enhancement) — only engines present on the
+  specific GPU model are displayed.
+- **Derivative math**: counter values are nanoseconds the engine was busy;
+  busy% = `Δbusy_ns / Δwall_ns × 100`, same formula `intel_gpu_top` uses.
+- **Graceful fallback**: requires `CAP_PERFMON` (Linux ≥ 5.8) or root.
+  When denied, the GPU line shows `+CAP_PERFMON for engines` instead.
+  When the i915 driver is absent, the code path is skipped silently.
+- Display: inline after the overall GPU busy% gauge —
+  `Intel HD 630  ⣿⣿ 45%  ▕████░░░░▏  [ rcs:45%  bcs: 1%  vcs:28% ]`
+- New dependency: `libc = "0.2"` added to Linux targets (was macOS-only).
+- New feature flag: `i915-pmu` (included in `default`).
+
+### SMT / NUMA grouping in the CPU spectrum
+
+New `topology` module reads `/sys/devices/system/cpu/cpu*/topology/` once
+per slow tick and groups the per-core spectrum accordingly.
+
+- **SMT siblings adjacent**: logical CPUs sharing a physical core are
+  placed in consecutive rows so HT pairs are visually grouped.
+- **NUMA separators**: when multiple NUMA nodes are present a dim
+  `── NUMA N ──` line is inserted between node groups.
+- **Graceful fallback**: when sysfs is unavailable (macOS, hotplug before
+  first slow tick, container) the spectrum falls back to linear order.
+- Pure sysfs reads — no `unsafe`, no new deps.
+
+### Tests
+
+5 new unit tests in `topology.rs`:
+
+- `empty_topology_has_no_groups`
+- `smt_siblings_grouped_together`
+- `single_threaded_cores_each_in_own_group`
+- `numa_multi_node_separates_correctly`
+- `single_node_is_not_reported_as_numa`
+
+189 tests passing total.
+
 ## [0.23.0]
 
 ### Theming system
@@ -108,30 +153,7 @@ implementations:
 
 Linux retains full functionality; macOS stubs return empty data for now.
 
-## [0.20.1]
-=======
-## [0.21.1]
-
-### macOS support
-
-Cross-platform compilation and basic functionality on macOS. The codebase now compiles and runs on macOS with platform-specific data sources:
-
-- **host.rs** — CPU count, memory, load averages via `sysctl`
-- **proc.rs** — process info via `libproc` (`PROC_PIDTASKINFO`)
-- **procs.rs** — process list via `proc_listallpids`
-- **Linux-only modules** — battery, disk, net, temp, gpu, elf return empty data on macOS (full implementations deferred)
-
-CI now includes macOS builds (allowing failures as the implementation is basic).
-
-### Platform abstraction
-
-- Moved `rustix` to Linux-only dependencies
-- Added `libc` for macOS system calls
-- Added `#[cfg(target_os = "macos")]` guards throughout
-- Updated module documentation to note platform differences
-
 ## [0.20.1] — 2026-04-26
->>>>>>> 0.21.1
 
 ### crates.io release prep
 

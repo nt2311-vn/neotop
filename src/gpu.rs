@@ -3,8 +3,28 @@
 
 use std::collections::HashMap;
 use std::fs;
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+/// Per-engine utilisation percentages for Intel i915 GPUs.
+///
+/// Each engine variant is `None` when absent on this GPU model
+/// (e.g. GT1 iGPUs have no video engines).  `CapDenied` is returned
+/// when `perf_event_open` was refused — the caller shows a hint.
+#[derive(Debug, Clone)]
+pub(crate) enum IntelEngines {
+    /// `perf_event_open` was denied; `CAP_PERFMON` or root is needed.
+    CapDenied,
+    /// Successfully-read engine utilisation percentages.
+    Busy {
+        rcs: Option<f64>,  // Render Command Streamer (3D / compute)
+        bcs: Option<f64>,  // Blitter Command Streamer
+        vcs: Option<f64>,  // Video Codec Streamer
+        vecs: Option<f64>, // Video Enhancement Command Streamer
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpuVendor {
@@ -68,6 +88,9 @@ pub(crate) struct Gpu {
     /// behaviour for those.
     #[allow(dead_code)]
     pub(crate) pci_addr: Option<String>,
+    /// Per-engine breakdown for Intel i915 GPUs.  `None` for all
+    /// non-Intel cards and when the `i915-pmu` feature is disabled.
+    pub(crate) intel_engines: Option<IntelEngines>,
 }
 
 impl Gpu {
@@ -86,6 +109,13 @@ impl Gpu {
     /// don't waste a sparkline column on them.
     pub(crate) fn has_busy_data(&self) -> bool {
         self.busy_pct.is_some()
+    }
+}
+
+impl Gpu {
+    #[allow(dead_code)]
+    pub(crate) fn has_intel_engines(&self) -> bool {
+        matches!(&self.intel_engines, Some(IntelEngines::Busy { .. }))
     }
 }
 
@@ -138,6 +168,8 @@ pub(crate) struct Tracker {
     #[cfg(feature = "nvml")]
     nvml: NvmlState,
     intel_state: HashMap<String, IntelSample>,
+    #[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+    intel_pmu: IntelPmuTracker,
 }
 
 /// Per-Intel-card sample for RC6 derivative. Tiny (24 B) so the
@@ -164,6 +196,8 @@ impl Tracker {
             #[cfg(feature = "nvml")]
             self.merge_nvml(&mut out);
             self.merge_intel(&mut out);
+            #[cfg(feature = "i915-pmu")]
+            self.intel_pmu.merge(&mut out);
             out
         }
         #[cfg(target_os = "macos")]
@@ -307,6 +341,7 @@ fn read_one(dev: &Path) -> Option<Gpu> {
             vram_total: 0,
             power_watts: None,
             pci_addr,
+            intel_engines: None,
         }),
     }
 }
@@ -364,6 +399,7 @@ fn read_nvml_device(dev: &nvml_wrapper::Device<'_>, pci_addr: Option<String>) ->
         vram_total,
         power_watts,
         pci_addr,
+        intel_engines: None,
     }
 }
 
@@ -427,6 +463,7 @@ fn read_amd(dev: &Path, name: String, pci_addr: Option<String>) -> Gpu {
         vram_total,
         power_watts,
         pci_addr,
+        intel_engines: None,
     }
 }
 
@@ -596,6 +633,242 @@ fn parse_amd_for_test(
         vram_total,
         power_watts,
         pci_addr: None,
+        intel_engines: None,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Intel i915 PMU per-engine counters (Linux + i915-pmu feature)
+// -----------------------------------------------------------------------------
+
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+struct EngineCounter {
+    name: &'static str,
+    fd: OwnedFd,
+    prev_count: u64,
+    prev_when: Instant,
+}
+
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+impl std::fmt::Debug for EngineCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EngineCounter {{ name: {:?} }}", self.name)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+#[derive(Debug, Default)]
+struct IntelPmuTracker {
+    counters: Vec<EngineCounter>,
+    cap_failed: bool,
+    initialized: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+impl IntelPmuTracker {
+    #[allow(clippy::similar_names)] // rcs/bcs/vcs/vecs are standard GPU engine acronyms
+    fn merge(&mut self, gpus: &mut [Gpu]) {
+        let has_intel = gpus.iter().any(|g| g.vendor == GpuVendor::Intel);
+        if !has_intel {
+            return;
+        }
+        if !self.initialized {
+            self.try_init();
+        }
+        if self.cap_failed {
+            for g in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Intel) {
+                g.intel_engines = Some(IntelEngines::CapDenied);
+            }
+            return;
+        }
+        if self.counters.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let (mut rcs, mut bcs) = (None::<f64>, None::<f64>);
+        // vcs/vecs are GPU engine acronyms; similar names are intentional.
+        #[allow(clippy::similar_names)]
+        let (mut vcs, mut vecs) = (None::<f64>, None::<f64>);
+        for counter in &mut self.counters {
+            let Some(count) = read_engine_count(&counter.fd) else {
+                counter.prev_when = now;
+                continue;
+            };
+            let elapsed_ns = now.duration_since(counter.prev_when).as_nanos();
+            if elapsed_ns > 0 && count >= counter.prev_count {
+                let delta = count - counter.prev_count;
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (delta as f64 / elapsed_ns as f64 * 100.0).clamp(0.0, 100.0);
+                match counter.name {
+                    "rcs" => rcs = Some(pct),
+                    "bcs" => bcs = Some(pct),
+                    "vcs" => vcs = Some(pct),
+                    "vecs" => vecs = Some(pct),
+                    _ => {}
+                }
+            }
+            counter.prev_count = count;
+            counter.prev_when = now;
+        }
+        let engines = IntelEngines::Busy {
+            rcs,
+            bcs,
+            vcs,
+            vecs,
+        };
+        for g in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Intel) {
+            g.intel_engines = Some(engines.clone());
+        }
+    }
+
+    fn try_init(&mut self) {
+        self.initialized = true;
+        let Some(pmu_type) = read_i915_pmu_type() else {
+            return; // no i915 driver
+        };
+        let engines: &[(&str, &str)] = &[
+            ("rcs", "rcs0-busy"),
+            ("bcs", "bcs0-busy"),
+            ("vcs", "vcs0-busy"),
+            ("vecs", "vecs0-busy"),
+        ];
+        let now = Instant::now();
+        let mut opened_any = false;
+        for (name, event_file) in engines {
+            let Some(config) = read_i915_event_config(event_file) else {
+                continue;
+            };
+            if let Some(fd) = open_engine_fd(pmu_type, config) {
+                let count = read_engine_count(&fd).unwrap_or(0);
+                self.counters.push(EngineCounter {
+                    name,
+                    fd,
+                    prev_count: count,
+                    prev_when: now,
+                });
+                opened_any = true;
+            } else {
+                // EPERM: CAP_PERFMON required; mark and stop trying.
+                self.cap_failed = true;
+                self.counters.clear();
+                return;
+            }
+        }
+        if !opened_any {
+            // i915 type exists but no events enumerated (unusual).
+            self.counters.clear();
+        }
+    }
+}
+
+/// Read the i915 PMU type from sysfs.
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+fn read_i915_pmu_type() -> Option<u32> {
+    read_trim(Path::new("/sys/bus/event_source/devices/i915/type"))?
+        .parse()
+        .ok()
+}
+
+/// Parse `config=0x15` or `config=21` from an event descriptor file.
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+fn read_i915_event_config(event: &str) -> Option<u64> {
+    let path = format!("/sys/bus/event_source/devices/i915/events/{event}");
+    let s = read_trim(Path::new(&path))?;
+    let val = s.strip_prefix("config=")?;
+    if let Some(hex) = val.strip_prefix("0x").or_else(|| val.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        val.parse().ok()
+    }
+}
+
+/// Minimal `perf_event_attr` layout — only the fields we use.
+/// The kernel reads `size` to know how many bytes to interpret;
+/// everything beyond `config` is zero and uses the kernel's defaults
+/// (count, no sampling, no format flags).
+/// Layout matches `struct perf_event_attr` in `<linux/perf_event.h>`.
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+#[repr(C)]
+struct PerfEventAttr {
+    type_: u32,
+    size: u32,
+    config: u64,
+    /// `sample_period` / `sample_freq` union — unused, zero.
+    _sample: u64,
+    sample_type: u64,
+    read_format: u64,
+    /// Packed bitfield (`disabled`, `inherit`, …) — zero = defaults.
+    _flags: u64,
+    /// `wakeup_events` / `wakeup_watermark` union — unused, zero.
+    _wakeup: u32,
+    bp_type: u32,
+    config1: u64,
+    config2: u64,
+    branch_sample_type: u64,
+    sample_regs_user: u64,
+    sample_stack_user: u32,
+    clockid: i32,
+    sample_regs_intr: u64,
+    aux_watermark: u32,
+    sample_max_stack: u16,
+    _reserved2: u16,
+    aux_sample_size: u32,
+    _reserved3: u32,
+    sig_data: u64,
+    config3: u64,
+}
+
+/// Open a perf event counter for an `i915_pmu` engine.
+/// Returns `None` on permission denial or any other failure.
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+#[allow(unsafe_code)]
+fn open_engine_fd(pmu_type: u32, config: u64) -> Option<OwnedFd> {
+    // SAFETY: `PerfEventAttr` is a `#[repr(C)]` struct with no padding
+    // invariants; zeroing it is safe and produces the "use all defaults"
+    // state the kernel accepts.  We only set the fields we need.
+    let mut attr: PerfEventAttr = unsafe { std::mem::zeroed() };
+    attr.type_ = pmu_type;
+    attr.size = u32::try_from(std::mem::size_of::<PerfEventAttr>()).unwrap_or(136);
+    attr.config = config;
+
+    // SAFETY: `perf_event_open(2)` is a well-known Linux syscall.
+    // `pid = -1` + `cpu = 0` selects system-wide counting on CPU 0;
+    // for device PMUs (i915_pmu) `cpu` must be >= 0 even for system-wide
+    // mode.  `group_fd = -1` means standalone counter.  `flags = 0`.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_perf_event_open,
+            std::ptr::addr_of!(attr) as libc::c_long,
+            -1_i64, // pid: system-wide
+            0_i64,  // cpu: must be \u2265 0 for device PMUs
+            -1_i64, // group_fd
+            0_i64,  // flags
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a valid non-negative file descriptor just returned
+    // by `perf_event_open`.  We exclusively own it from this point.
+    // fd is the return value of a syscall — it's guaranteed to fit in i32
+    // when >= 0 (Linux file descriptors are signed 32-bit integers).
+    #[allow(clippy::cast_possible_truncation)]
+    Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// Read the current 64-bit counter value from a perf fd.
+#[cfg(all(target_os = "linux", feature = "i915-pmu"))]
+#[allow(unsafe_code)]
+fn read_engine_count(fd: &OwnedFd) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    // SAFETY: `fd` is a valid perf file descriptor.  A bare `read(2)` with
+    // no `PERF_FORMAT_*` flags in the attr returns exactly 8 bytes: the
+    // 64-bit accumulated event count (nanoseconds for i915_pmu busy events).
+    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+    if n == 8 {
+        Some(u64::from_ne_bytes(buf))
+    } else {
+        None
     }
 }
 
@@ -744,6 +1017,7 @@ mod tests {
                 vram_total: 0,
                 power_watts: None,
                 pci_addr: None,
+                intel_engines: None,
             },
             // No backend — no busy data — must not skew the average.
             Gpu {
@@ -754,6 +1028,7 @@ mod tests {
                 vram_total: 0,
                 power_watts: None,
                 pci_addr: None,
+                intel_engines: None,
             },
             Gpu {
                 vendor: GpuVendor::Amd,
@@ -763,6 +1038,7 @@ mod tests {
                 vram_total: 0,
                 power_watts: None,
                 pci_addr: None,
+                intel_engines: None,
             },
         ];
         // Average over the two AMD cards = 45%.
@@ -779,6 +1055,7 @@ mod tests {
             vram_total: 0,
             power_watts: None,
             pci_addr: None,
+            intel_engines: None,
         }];
         assert_eq!(aggregate_busy_pct(&gpus), None);
     }

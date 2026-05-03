@@ -27,6 +27,7 @@ mod proc;
 mod procs;
 mod temp;
 mod theme;
+mod topology;
 #[cfg(target_os = "linux")]
 mod vcpus;
 #[cfg(target_os = "linux")]
@@ -435,6 +436,7 @@ struct App {
     gpu_tracker: gpu::Tracker,
     gpus: Vec<gpu::Gpu>,
     host_history: HostHistory,
+    cpu_topology: topology::CpuTopology,
 
     // Per-vCPU tracker; only snapshot for the *selected* VM each
     // tick so a host with 50+ guests doesn't melt /proc.
@@ -547,6 +549,7 @@ impl App {
             gpu_tracker,
             gpus,
             host_history: HostHistory::default(),
+            cpu_topology: topology::CpuTopology::read(),
             vcpu_tracker: vcpus::Tracker::new(clk_tck),
             selected_vcpus: Vec::new(),
             kvm_tracker: kvm::Tracker::new(),
@@ -608,6 +611,7 @@ impl App {
             self.batteries = battery::snapshot();
             self.disks = self.disk_tracker.snapshot(&mut self.errors);
             self.gpus = self.gpu_tracker.snapshot();
+            self.cpu_topology = topology::CpuTopology::read();
             self.container_names.refresh_if_stale(Instant::now());
             // Drop kvm-tracker entries for VMs that have exited
             // since the last slow tick. Only sees the freshly
@@ -1631,6 +1635,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
                 &app.host_history.per_core,
                 &app.host_info.per_core_pct,
                 &app.theme,
+                &app.cpu_topology,
             );
         } else {
             draw_per_core(f, chunks[2], &app.host_info.per_core_pct, &app.theme);
@@ -1761,6 +1766,7 @@ fn draw_per_core_spectrum(
     rings: &[VecDeque<u64>],
     live: &[f64],
     theme: &theme::Theme,
+    topology: &topology::CpuTopology,
 ) {
     if rings.is_empty() || area.height == 0 || area.width <= SPECTRUM_FIXED_W {
         return;
@@ -1776,31 +1782,96 @@ fn draw_per_core_spectrum(
         return;
     }
 
-    let row_budget = (area.height as usize).saturating_sub(1);
-    let rows_needed = rings.len().div_ceil(cols);
-    let rows = row_budget.min(rows_needed);
+    // Build an ordered list of logical CPU indices to render.
+    // When topology is available, use NUMA-ordered SMT groups so
+    // siblings are adjacent and NUMA boundaries are marked.
+    // Fall back to linear order when topology has no data or the
+    // ring count doesn't match (e.g., hotplug, first tick).
+    let numa_groups = topology.numa_groups();
+    let use_topology = !numa_groups.is_empty() && topology.len() == rings.len();
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows + 1);
-    for r in 0..rows {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for c in 0..cols {
-            let i = c * rows_needed + r;
-            if i >= rings.len() {
-                break;
+    let row_budget = (area.height as usize).saturating_sub(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if use_topology {
+        let is_numa = topology.is_numa();
+        let mut rows_used = 0usize;
+        'outer: for (node_idx, (node_id, smt_groups)) in numa_groups.iter().enumerate() {
+            // NUMA separator before every node except the first.
+            if is_numa && node_idx > 0 && rows_used < row_budget {
+                let sep = format!(" \u{2500}\u{2500} NUMA {node_id} \u{2500}\u{2500}");
+                lines.push(Line::from(Span::styled(
+                    sep,
+                    Style::default().fg(theme.label),
+                )));
+                rows_used += 1;
             }
-            if c > 0 {
-                spans.push(Span::raw(" "));
+            // Flatten SMT groups: each group may have 1 (no HT) or 2+ logical CPUs.
+            let flat: Vec<(usize, usize)> = smt_groups
+                .iter()
+                .flat_map(|group| {
+                    group
+                        .iter()
+                        .enumerate()
+                        .map(|(sib_idx, &cpu)| (cpu, sib_idx))
+                })
+                .collect();
+            let rows_needed = flat.len().div_ceil(cols);
+            let rows_here = row_budget.saturating_sub(rows_used).min(rows_needed);
+            for r in 0..rows_here {
+                if rows_used >= row_budget {
+                    break 'outer;
+                }
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for c in 0..cols {
+                    let idx = c * rows_needed + r;
+                    let Some(&(cpu, _sib)) = flat.get(idx) else {
+                        break;
+                    };
+                    if cpu >= rings.len() {
+                        break;
+                    }
+                    if c > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.extend(spectrum_row_spans(
+                        cpu,
+                        &rings[cpu],
+                        live.get(cpu).copied(),
+                        spark_w,
+                        theme,
+                    ));
+                }
+                lines.push(Line::from(spans));
+                rows_used += 1;
             }
-            spans.extend(spectrum_row_spans(
-                i,
-                &rings[i],
-                live.get(i).copied(),
-                spark_w,
-                theme,
-            ));
         }
-        lines.push(Line::from(spans));
+    } else {
+        // Linear fallback (same as before topology was added).
+        let rows_needed = rings.len().div_ceil(cols);
+        let rows = row_budget.min(rows_needed);
+        for r in 0..rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for c in 0..cols {
+                let i = c * rows_needed + r;
+                if i >= rings.len() {
+                    break;
+                }
+                if c > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.extend(spectrum_row_spans(
+                    i,
+                    &rings[i],
+                    live.get(i).copied(),
+                    spark_w,
+                    theme,
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
     }
+
     lines.push(spectrum_axis_row(spark_w, theme));
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -2715,6 +2786,7 @@ const GPU_GAUGE_CELLS: usize = 8;
 /// cards are shown by name with a `(driver pending)` tag so the
 /// user knows the hardware *is* recognised — the metrics just
 /// aren't wired up in this neotop yet.
+#[allow(clippy::too_many_lines)]
 fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory, theme: &theme::Theme) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
         vec![Span::styled(" gpu ", Style::default().fg(theme.label))];
@@ -2798,7 +2870,36 @@ fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory, theme: &theme::Theme)
         if let Some(w) = g.power_watts {
             spans.push(Span::raw(format!(" {w:.1}W")));
         }
-        if !g.has_busy_data() && g.vram_total == 0 {
+        // Per-engine breakdown (Intel i915 only, requires CAP_PERFMON).
+        match &g.intel_engines {
+            Some(gpu::IntelEngines::Busy {
+                rcs,
+                bcs,
+                vcs,
+                vecs,
+            }) => {
+                spans.push(Span::styled(" [", Style::default().fg(theme.label)));
+                for (label, val) in [("rcs", rcs), ("bcs", bcs), ("vcs", vcs), ("vecs", vecs)] {
+                    if let Some(p) = val {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let pi = p.round() as i64;
+                        spans.push(Span::styled(
+                            format!(" {label}:{pi:>2}%"),
+                            Style::default().fg(cpu_load_color(*p, theme)),
+                        ));
+                    }
+                }
+                spans.push(Span::styled(" ]", Style::default().fg(theme.label)));
+            }
+            Some(gpu::IntelEngines::CapDenied) => {
+                spans.push(Span::styled(
+                    " (+CAP_PERFMON for engines)",
+                    Style::default().fg(theme.label),
+                ));
+            }
+            None => {}
+        }
+        if !g.has_busy_data() && g.vram_total == 0 && g.intel_engines.is_none() {
             // No backend wired up yet for this vendor.
             spans.push(Span::styled(
                 " (driver pending)",
@@ -4268,6 +4369,7 @@ mod tests {
             vram_total: 0,
             power_watts: None,
             pci_addr: None,
+            intel_engines: None,
         }];
         assert_eq!(host_overview_rows(&one_gpu), 4);
     }
