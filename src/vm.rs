@@ -1,8 +1,9 @@
-//! vm.rs — hypervisor / VM detection from `/proc/<pid>/cmdline`.
+//! vm.rs — hypervisor / VM detection from process command lines.
 //!
 //! Pure parser. Given the joined argv string (the form `procs.rs`
 //! caches as `ProcessRow.command`), recognise QEMU / KVM,
-//! Firecracker, Cloud Hypervisor, crosvm, and lkvm; pull out a
+//! Firecracker, Cloud Hypervisor, crosvm, lkvm (Linux) and
+//! `VMware` Fusion, `Parallels`, `VirtualBox` (macOS); pull out a
 //! human-readable VM name, vCPU count, and memory cap.
 //!
 //! Phase 1 of the VM-support plan. Per-vCPU threads, KVM exit
@@ -16,6 +17,9 @@ pub(crate) enum Hypervisor {
     CloudHypervisor,
     Crosvm,
     Lkvm,
+    VMware,
+    Parallels,
+    VirtualBox,
 }
 
 impl Hypervisor {
@@ -26,6 +30,9 @@ impl Hypervisor {
             Self::CloudHypervisor => "cloud-hv",
             Self::Crosvm => "crosvm",
             Self::Lkvm => "lkvm",
+            Self::VMware => "vmware",
+            Self::Parallels => "parallels",
+            Self::VirtualBox => "virtualbox",
         }
     }
 }
@@ -90,6 +97,12 @@ fn classify_bin(bin: &str) -> Option<Hypervisor> {
         Some(Hypervisor::Crosvm)
     } else if bin == "lkvm" || bin == "vmm" {
         Some(Hypervisor::Lkvm)
+    } else if bin.contains("vmware") || bin == "vmware-vmx" {
+        Some(Hypervisor::VMware)
+    } else if bin.contains("prl") || bin == "prl_vm_app" {
+        Some(Hypervisor::Parallels)
+    } else if bin.contains("vbox") || bin == "VirtualBoxVM" {
+        Some(Hypervisor::VirtualBox)
     } else {
         None
     }
@@ -104,6 +117,7 @@ fn parse_name(command: &str, hv: Hypervisor) -> Option<String> {
         Hypervisor::Qemu => "-name",
         Hypervisor::CloudHypervisor | Hypervisor::Crosvm | Hypervisor::Lkvm => "--name",
         Hypervisor::Firecracker => "--id",
+        Hypervisor::VMware | Hypervisor::Parallels | Hypervisor::VirtualBox => return None,
     };
     let mut it = toks.iter();
     while let Some(tok) = it.next() {
@@ -186,7 +200,10 @@ fn parse_vcpus(command: &str, hv: Hypervisor) -> Option<u32> {
         Hypervisor::CloudHypervisor => find_kv(&toks, "--cpus", "boot"),
         Hypervisor::Crosvm => find_flag_u32(&toks, "--cpus"),
         Hypervisor::Lkvm => find_flag_u32(&toks, "--cpus").or_else(|| find_flag_u32(&toks, "-c")),
-        Hypervisor::Firecracker => None,
+        Hypervisor::Firecracker
+        | Hypervisor::VMware
+        | Hypervisor::Parallels
+        | Hypervisor::VirtualBox => None,
     }
 }
 
@@ -235,7 +252,10 @@ fn parse_memory(command: &str, hv: Hypervisor) -> Option<u64> {
         Hypervisor::Lkvm => {
             find_flag_u64_mb(&toks, "--mem").or_else(|| find_flag_u64_mb(&toks, "-m"))
         }
-        Hypervisor::Firecracker => None,
+        Hypervisor::Firecracker
+        | Hypervisor::VMware
+        | Hypervisor::Parallels
+        | Hypervisor::VirtualBox => None,
     }
 }
 

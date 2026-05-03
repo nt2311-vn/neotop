@@ -156,6 +156,7 @@ pub(crate) fn parse_vcpu_index(comm: &str, hv: Hypervisor) -> Option<u32> {
             let rest = s.strip_prefix("crosvm_vcpu")?;
             rest.parse().ok()
         }
+        Hypervisor::VMware | Hypervisor::Parallels | Hypervisor::VirtualBox => None,
     }
 }
 
