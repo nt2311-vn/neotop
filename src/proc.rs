@@ -355,6 +355,10 @@ fn snapshot_macos(pid: i64) -> Option<Snapshot> {
 
     let pid = pid as libc::pid_t;
 
+    // SAFETY: `proc_pidinfo` with `PROC_PIDTASKINFO` is a read-only kernel
+    // query. We pass a zeroed `proc_taskinfo` of the correct size; the
+    // kernel writes at most `size` bytes. Return value ≤ 0 means the pid
+    // is gone or we lack permission — we return None.
     unsafe {
         let mut info: libc::proc_taskinfo = std::mem::zeroed();
         let mut size = std::mem::size_of::<libc::proc_taskinfo>() as i32;

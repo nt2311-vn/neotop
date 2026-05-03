@@ -174,6 +174,10 @@ impl Tracker {
         let mut rows = Vec::new();
         let mut seen: Vec<i32> = Vec::new();
 
+        // SAFETY: `proc_listallpids` writes at most `(size/4)` pid entries
+        // into the buffer. We allocate 1024 × i32 and pass `len*4` as the
+        // byte-size argument. The returned `count` is the number of valid
+        // entries; we iterate only up to that count.
         unsafe {
             let mut pids: Vec<i32> = vec![0; 1024];
             let count = libc::proc_listallpids(
@@ -829,6 +833,9 @@ impl Tracker {
 
         let pid = pid as libc::pid_t;
 
+        // SAFETY: same rationale as `snapshot_macos` in proc.rs —
+        // `proc_pidinfo` is a read-only kernel query with a correctly-sized
+        // output buffer; return ≤ 0 means pid gone / no permission.
         unsafe {
             let mut info: libc::proc_taskinfo = std::mem::zeroed();
             let mut size = std::mem::size_of::<libc::proc_taskinfo>() as i32;

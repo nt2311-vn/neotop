@@ -423,6 +423,9 @@ mod macos {
     const CTL_VM: i32 = 2;
     const VM_LOADAVG: i32 = 2;
 
+    /// SAFETY: `sysctl` is a well-documented POSIX syscall. We pass a
+    /// valid single-element MIB, a valid writable pointer with correct
+    /// size, and null/0 for the new-value arguments (read-only query).
     unsafe fn sysctl_int(name: i32) -> i32 {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::size_t;
@@ -438,6 +441,7 @@ mod macos {
         value
     }
 
+    /// SAFETY: Same rationale as `sysctl_int`; output buffer sized for `u64`.
     unsafe fn sysctl_u64(name: i32) -> u64 {
         let mut value: u64 = 0;
         let mut len = std::mem::size_of::<u64>() as libc::size_t;
@@ -453,6 +457,9 @@ mod macos {
         value
     }
 
+    /// SAFETY: Two-pass `sysctl`: first call with null output to get the
+    /// buffer size, second call with a correctly-sized `Vec<u8>`. The
+    /// MIB slice is borrowed for the call duration only.
     unsafe fn sysctl_str(mib: &[i32]) -> String {
         let mut len: libc::size_t = 0;
         libc::sysctl(
@@ -479,14 +486,17 @@ mod macos {
     }
 
     pub(crate) fn read_cpu_count_macos() -> usize {
+        // SAFETY: delegates to `sysctl_int` — see its SAFETY comment.
         unsafe { sysctl_int(HW_NCPU) as usize }
     }
 
     pub(crate) fn read_mem_total_macos() -> u64 {
+        // SAFETY: delegates to `sysctl_u64` — see its SAFETY comment.
         unsafe { sysctl_u64(HW_MEMSIZE) }
     }
 
     pub(crate) fn read_loadavg_macos() -> (f64, f64, f64) {
+        // SAFETY: `sysctl` with a fixed-size stack array; MIB and size are correct.
         unsafe {
             let mut load: [libc::c_double; 3] = [0.0; 3];
             let mut len = std::mem::size_of_val(&load) as libc::size_t;
@@ -504,6 +514,7 @@ mod macos {
     }
 
     pub(crate) fn read_kernel_macos() -> String {
+        // SAFETY: delegates to `sysctl_str` — see its SAFETY comment.
         unsafe {
             let os_type = sysctl_str(&[CTL_KERN, KERN_OSTYPE]);
             let os_release = sysctl_str(&[CTL_KERN, KERN_OSRELEASE]);
@@ -512,6 +523,7 @@ mod macos {
     }
 
     pub(crate) fn read_cpu_model_macos() -> String {
+        // SAFETY: two-pass `sysctl` with a correctly-sized `Vec<u8>` buffer.
         unsafe {
             let mut len: libc::size_t = 0;
             let mib = [CTL_HW, 0x10000002u32 as i32]; // HW_MACHINE
