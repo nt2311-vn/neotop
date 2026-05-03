@@ -1,12 +1,12 @@
 [package]
 name = "neotop"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/nt2311-vn/neotop"
 homepage = "https://github.com/nt2311-vn/neotop"
-description = "Cross-platform TUI for host metrics, processes, GPU activity, containers, and KVM virtual machines"
+description = "Linux-first terminal system monitor: per-core CPU spectrum with SMT/NUMA, NVIDIA/AMD/Intel GPU dashboards with i915 per-engine breakdown, KVM hypervisor insight, container/runtime process grouping, Catppuccin themes"
 authors = ["nt2311"]
 keywords = ["tui", "monitor", "process", "gpu", "kvm"]
 categories = ["command-line-utilities", "os::linux-apis", "visualization"]
@@ -50,13 +50,15 @@ tempfile = "3"
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "0.38", features = ["param", "process"] }
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
 [features]
-default = ["nvml"]
+default = ["nvml", "i915-pmu"]
 nvml = ["dep:nvml-wrapper"]
+i915-pmu = []
 
 [lints.rust]
 unsafe_code = "warn"
