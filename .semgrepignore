@@ -1,9 +1,9 @@
 # macOS FFI - unsafe blocks required for sysctl/libproc calls
-# These are necessary FFI calls with validated inputs, documented as safe
-src/host.rs:482-536  # macOS sysctl FFI
-src/proc.rs:352-392  # macOS libproc FFI
-src/procs.rs:171-187  # macOS proc_listallpids FFI
-src/procs.rs:821-931  # macOS proc_pidinfo FFI
+# Each block has a SAFETY comment documenting why it's sound.
+src/host.rs:490-545  # macOS sysctl FFI (read_cpu_count/mem/loadavg/kernel/model)
+src/proc.rs:362-396  # macOS libproc FFI (proc_pidinfo)
+src/procs.rs:181-203  # macOS proc_listallpids FFI
+src/procs.rs:839-938  # macOS proc_pidinfo FFI (read_one_macos)
 
-# CLI argument parsing - not security-critical
-src/main.rs:67  # std::env::args() for refresh rate parsing
+# CLI argument parsing - not security-critical (refresh-rate flag only)
+src/main.rs:67  # std::env::args() for --refresh-ms parsing

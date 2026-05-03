@@ -90,8 +90,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required for cargo-audit to create a check run
-      checks: write
       # Required for Semgrep's SARIF upload to the security tab on
       # public repos. Harmless on private repos that disable it.
       security-events: write
@@ -110,13 +108,14 @@ jobs:
           key: ${{ hashFiles('Cargo.lock', 'deny.toml') }}
 
       # cargo-audit — the canonical RustSec advisory DB scan.
-      # Free, no auth, runs on every push. Hard-fails on advisory
-      # matches that aren't waived; warnings (e.g. unsound deps
-      # without a CVE) flow through and surface in the log.
+      # Runs directly (not via rustsec/audit-check action) to avoid
+      # the action's GITHUB_TOKEN check-run permission issue.
+      # Ignored advisories are waived in deny.toml; we pass the
+      # same IDs here so audit doesn't warn on known transitive deps.
       - name: cargo audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit
+          cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0002
 
       # cargo-deny — supply-chain policy: licenses, duplicate
       # versions, banned crates, sources, advisories. Stricter

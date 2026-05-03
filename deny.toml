@@ -25,12 +25,13 @@
 # Subset: `cargo deny check advisories licenses bans sources`
 
 [graph]
-# Match the platforms we actually build for. Skipping
-# Windows/macOS-only deps from the analysis keeps the report
-# focused on the Linux supply chain that ships.
+# Match the platforms we actually build for. Both Linux and macOS
+# are first-class targets now.
 targets = [
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
 ]
 
 # -----------------------------------------------------------------------------

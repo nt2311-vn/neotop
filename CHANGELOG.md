@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security & quality
+
+- Added `SAFETY` comments to all `unsafe` blocks (macOS FFI: sysctl, libproc, proc_listallpids)
+- Updated `.semgrepignore` line ranges after SAFETY comments shifted source lines
+- Added macOS targets to `deny.toml` graph analysis (`x86_64-apple-darwin`, `aarch64-apple-darwin`)
+- Replaced `rustsec/audit-check` action with direct `cargo audit` call to fix GITHUB_TOKEN check-run permission error
+- Added `--ignore` flags for known transitive advisories (RUSTSEC-2024-0436, RUSTSEC-2026-0002) already waived in `deny.toml`
+
 ## [0.22.0]
 
 ### macOS support improvements
