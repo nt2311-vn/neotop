@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0]
+
+### Theming system
+
+Full semantic colour palette with built-in presets and per-colour overrides via
+`~/.config/neotop/config.toml`. All hardcoded `Color::` literals in draw
+functions are gone — every colour is now read from a `Theme` struct.
+
+- **Default theme: Catppuccin Mocha** — high-contrast dark palette.
+  CPU load ramp uses Peach (idle→mid) and Red (high) instead of
+  the old ANSI Yellow/Red so the gradient reads better on true-colour
+  terminals. Sparklines, memory bar, group bands, and key badges all
+  use the Mocha colour wheel (Blue, Mauve, Teal, Sky, Green, Pink).
+- **Built-in presets**: `Dark` (Catppuccin Mocha), `Light`, `Monokai`, `Tty`
+  (ANSI-safe 16-colour fallback for low-colour SSH sessions).
+- **`T` keybinding** cycles through presets at runtime without restart.
+- **`--config <path>`** CLI flag overrides the default config location.
+- **TOML overrides**: any individual colour can be overridden in
+  `~/.config/neotop/config.toml`:
+
+  ```toml
+  theme = "dark"
+  [colors]
+  cpu_high = "255,100,100"   # RGB tuple
+  spark_mem = "#cba6f7"      # hex
+  label = "i240"             # 256-colour indexed
+  ```
+
+- **Windows support dropped.** neotop is Linux-first. macOS support
+  remains in progress; Windows will not be pursued.
+- **Dependencies added**: `toml 0.8`, `serde` (derive), `dirs 6`.
+
 ### Security & quality
 
 - Added `SAFETY` comments to all `unsafe` blocks (macOS FFI: sysctl, libproc, proc_listallpids)
