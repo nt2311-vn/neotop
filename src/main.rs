@@ -1,23 +1,34 @@
-//! neotop — Linux TUI for host metrics, processes, and GPU activity.
+//! neotop — Cross-platform TUI for host metrics, processes, and GPU activity.
 //!
 //! Per-core CPU spectrum, NVIDIA + AMD GPU charts, container /
 //! runtime / system / native process grouping. See README for
 //! controls and architecture.
+//!
+//! Platform-specific modules are conditionally compiled:
+//! - Linux: full feature set including KVM VM monitoring
+//! - macOS: process monitoring (VM features disabled)
 
 mod battery;
 mod disk;
+#[cfg(target_os = "linux")]
+mod elf;
+#[cfg(target_os = "macos")]
 mod elf;
 mod errors;
 mod gpu;
 mod groups;
 mod host;
+#[cfg(target_os = "linux")]
 mod kvm;
 mod net;
+#[cfg(target_os = "linux")]
 mod passthrough;
 mod proc;
 mod procs;
 mod temp;
+#[cfg(target_os = "linux")]
 mod vcpus;
+#[cfg(target_os = "linux")]
 mod vm;
 
 use std::collections::{HashMap, VecDeque};

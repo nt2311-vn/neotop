@@ -373,10 +373,11 @@ dependencies = [
 
 [[package]]
 name = "neotop"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "crossterm 0.29.0",
+ "libc",
  "nvml-wrapper",
  "ratatui",
  "rustix 0.38.44",

@@ -1,12 +1,12 @@
 [package]
 name = "neotop"
-version = "0.20.1"
+version = "0.21.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/nt2311-vn/neotop"
 homepage = "https://github.com/nt2311-vn/neotop"
-description = "Linux TUI for host metrics, processes, GPU activity, containers, and KVM virtual machines"
+description = "Cross-platform TUI for host metrics, processes, GPU activity, containers, and KVM virtual machines"
 authors = ["nt2311"]
 keywords = ["tui", "monitor", "process", "gpu", "kvm"]
 categories = ["command-line-utilities", "os::linux-apis", "visualization"]
@@ -32,14 +32,21 @@ path = "src/main.rs"
 ratatui = "0.29"
 crossterm = "0.29"
 anyhow = "1"
-rustix = { version = "0.38", features = ["param", "process"] }
+
 # Optional: NVIDIA management library bindings. The crate dlopens
-# libnvidia-ml.so at runtime (NOT linked at build time), so the
-# binary builds fine on machines without the NVIDIA driver and
-# only "lights up" when the library is present. Init failures fall
+# libnvidia-ml.so / libnvidia-ml.dylib at runtime (NOT linked at build
+# time), so the binary builds fine on machines without the NVIDIA driver
+# and only "lights up" when the library is present. Init failures fall
 # back gracefully to the existing detect-only behaviour for NVIDIA
-# cards.
+# cards. Works on Linux and macOS.
 nvml-wrapper = { version = "0.12", optional = true }
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "0.38", features = ["param", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["nvml"]
