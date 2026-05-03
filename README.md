@@ -178,14 +178,13 @@ Items in progress:
 
 Items still open:
 
-- [ ] Themes / TOML config
 - [ ] Per-engine Intel GPU breakdown (rcs / bcs / vcs / vecs) — needs `CAP_PERFMON` and `i915_pmu` perf events
 - [ ] SMT / NUMA grouping in the spectrum view
-- [ ] Windows port
 
 Recently shipped (see [`CHANGELOG.md`](CHANGELOG.md) for the full
 history):
 
+- [x] Themes / TOML config — Catppuccin Mocha default, `T` to cycle, `--config` to override (`v0.23.0`)
 - [x] Intel iGPU busy% via RC6 residency (`v0.19.0`)
 - [x] KVM exit counters + per-VM CPU sparkline (`v0.16.0` / `v0.18.0`)
 - [x] VFIO + vhost + tap passthrough discovery (`v0.18.0`)

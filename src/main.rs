@@ -26,6 +26,7 @@ mod passthrough;
 mod proc;
 mod procs;
 mod temp;
+mod theme;
 #[cfg(target_os = "linux")]
 mod vcpus;
 #[cfg(target_os = "linux")]
@@ -57,12 +58,15 @@ use ratatui::Terminal;
 
 struct Args {
     refresh: Duration,
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl Args {
     fn parse() -> Result<Self> {
         // 1 Hz default; `+` / `-` retune at runtime down to 50 ms.
         let mut refresh_ms: u64 = 1000;
+
+        let mut config_path: Option<std::path::PathBuf> = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -78,12 +82,18 @@ impl Args {
                     print_help();
                     std::process::exit(0);
                 }
+                "--config" => {
+                    config_path = Some(std::path::PathBuf::from(
+                        it.next().context("--config requires a path")?,
+                    ));
+                }
                 other => anyhow::bail!("unknown arg: {other}"),
             }
         }
 
         Ok(Self {
             refresh: Duration::from_millis(refresh_ms),
+            config_path,
         })
     }
 }
@@ -93,7 +103,7 @@ fn print_help() {
         "neotop — Linux TUI for host metrics, processes, and GPU activity\n\
          \n\
          USAGE:\n    \
-             neotop [--refresh-ms <n>]\n\
+             neotop [--refresh-ms <n>] [--config <path>]\n\
          \n\
          CONTROLS:\n    \
              q            quit\n    \
@@ -110,7 +120,8 @@ fn print_help() {
              H            toggle per-core CPU spectrum\n    \
              /            enter filter mode\n    \
              K            SIGTERM selected pid (confirmed)\n    \
-             Ctrl-K       SIGKILL selected pid (confirmed)"
+             Ctrl-K       SIGKILL selected pid (confirmed)\n    \
+             T            cycle theme (dark/light/monokai/tty)"
     );
 }
 
@@ -327,7 +338,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, args.refresh);
+    let result = run(&mut terminal, args.refresh, args.config_path.as_deref());
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -470,6 +481,10 @@ struct App {
 
     // Non-fatal parser/IO errors surfaced in the footer.
     errors: errors::ErrorRing,
+
+    // Theme
+    theme: theme::Theme,
+    theme_preset: theme::ThemePreset,
 }
 
 const MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -480,7 +495,7 @@ const MAX_REFRESH: Duration = Duration::from_secs(5);
 const SLOW_TICK_EVERY: u32 = 4;
 
 impl App {
-    fn new(refresh: Duration) -> Self {
+    fn new(refresh: Duration, config_path: Option<&std::path::Path>) -> Self {
         let clk_tck = proc::clk_tck();
         let mut net_tracker = net::Tracker::default();
         let mut procs_tracker = procs::Tracker::default();
@@ -499,6 +514,8 @@ impl App {
         let mut gpu_tracker = gpu::Tracker::default();
         let gpus = gpu_tracker.snapshot();
         let procs_all = procs_tracker.snapshot(&passwd, clk_tck);
+
+        let (theme, theme_preset) = theme::load(config_path);
 
         let mut procs_table = TableState::default();
         let procs_visible = compute_visible_flat(&procs_all, procs::SortBy::Cpu, "");
@@ -545,6 +562,8 @@ impl App {
             smoothed_host_cpu: None,
             perf: PerfTracker::default(),
             errors,
+            theme,
+            theme_preset,
         }
     }
 
@@ -1218,8 +1237,12 @@ fn sum_rss(rows: &[procs::ProcessRow], idxs: &[usize]) -> u64 {
         .sum()
 }
 
-fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, refresh: Duration) -> Result<()> {
-    let mut app = App::new(refresh);
+fn run<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    refresh: Duration,
+    config_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut app = App::new(refresh, config_path);
 
     loop {
         // Drain queued input then redraw once — collapses a burst
@@ -1362,6 +1385,12 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
         KeyCode::Char('K') if app.selected_proc().is_some() => {
             app.input = InputMode::Confirm(KillSig::Term);
         }
+        // T cycles theme: dark → light → monokai → tty → dark.
+        KeyCode::Char('T') => {
+            let next = app.theme_preset.next();
+            app.theme = next.colors();
+            app.theme_preset = next;
+        }
         _ => {}
     }
 }
@@ -1440,18 +1469,18 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     draw_main(f, app);
     // Help overlay paints last so it sits on top of the table.
     if matches!(app.input, InputMode::Help) {
-        draw_help_overlay(f, &app.host_info);
+        draw_help_overlay(f, &app.host_info, &app.theme);
     }
 }
 
 /// Centered keybindings popup. Carries the static "about this
 /// machine" block (kernel + CPU model).
-fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
+fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo, theme: &theme::Theme) {
     let area = centered_rect(64, 28, f.area());
     f.render_widget(Clear, area);
 
-    let dim = Style::default().fg(Color::DarkGray);
-    let kb = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let dim = Style::default().fg(theme.label);
+    let kb = Style::default().fg(theme.badge_fg).bg(theme.filter_bg);
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -1514,7 +1543,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
         Line::from(Span::styled(
             "  press ? / Esc / q / Enter to close",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme.label)
                 .add_modifier(Modifier::ITALIC),
         )),
     ];
@@ -1522,8 +1551,8 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " neotop · keybindings ",
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(theme.badge_fg)
+            .bg(theme.badge_bg)
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -1592,6 +1621,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.disks,
         &app.gpus,
         &app.host_history,
+        &app.theme,
     );
     if percore_h > 0 {
         if app.per_core_spectrum {
@@ -1600,13 +1630,14 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
                 chunks[2],
                 &app.host_history.per_core,
                 &app.host_info.per_core_pct,
+                &app.theme,
             );
         } else {
-            draw_per_core(f, chunks[2], &app.host_info.per_core_pct);
+            draw_per_core(f, chunks[2], &app.host_info.per_core_pct, &app.theme);
         }
     }
     if mem_bar_h > 0 {
-        draw_mem_bar(f, chunks[3], &app.host_info);
+        draw_mem_bar(f, chunks[3], &app.host_info, &app.theme);
     }
     // Per-VM CPU sparkline preempts the host one when a VM is
     // selected (Phase 5). `vm_cpu_history` is empty otherwise, so
@@ -1629,6 +1660,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.host_history,
         &app.ifaces,
         &app.gpus,
+        &app.theme,
         vm_overlay,
     );
 
@@ -1653,6 +1685,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
             app.kvm_tracker.is_available(),
             app.selected_passthrough.as_ref(),
             &app.ifaces,
+            &app.theme,
         );
     } else {
         draw_proc_table(f, body, app);
@@ -1727,6 +1760,7 @@ fn draw_per_core_spectrum(
     area: Rect,
     rings: &[VecDeque<u64>],
     live: &[f64],
+    theme: &theme::Theme,
 ) {
     if rings.is_empty() || area.height == 0 || area.width <= SPECTRUM_FIXED_W {
         return;
@@ -1762,11 +1796,12 @@ fn draw_per_core_spectrum(
                 &rings[i],
                 live.get(i).copied(),
                 spark_w,
+                theme,
             ));
         }
         lines.push(Line::from(spans));
     }
-    lines.push(spectrum_axis_row(spark_w));
+    lines.push(spectrum_axis_row(spark_w, theme));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1789,8 +1824,9 @@ fn spectrum_row(
     ring: &VecDeque<u64>,
     live_pct: Option<f64>,
     spark_w: usize,
+    theme: &theme::Theme,
 ) -> Line<'static> {
-    Line::from(spectrum_row_spans(core_idx, ring, live_pct, spark_w))
+    Line::from(spectrum_row_spans(core_idx, ring, live_pct, spark_w, theme))
 }
 
 fn spectrum_row_spans(
@@ -1798,11 +1834,12 @@ fn spectrum_row_spans(
     ring: &VecDeque<u64>,
     live_pct: Option<f64>,
     spark_w: usize,
+    theme: &theme::Theme,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(spark_w + 8);
     spans.push(Span::styled(
         format!(" c{core_idx:<2} "),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.label),
     ));
 
     // Sparkline. Take the most recent `spark_w` samples and left-pad
@@ -1819,7 +1856,7 @@ fn spectrum_row_spans(
         let pct = v as f64;
         spans.push(Span::styled(
             bar_glyph(pct).to_string(),
-            Style::default().fg(cpu_load_color(pct)),
+            Style::default().fg(cpu_load_color(pct, theme)),
         ));
     }
 
@@ -1828,7 +1865,7 @@ fn spectrum_row_spans(
     // ring just got resized and `live` lags by a tick.
     #[allow(clippy::cast_precision_loss)]
     let cur = live_pct.unwrap_or_else(|| ring.back().copied().unwrap_or(0) as f64);
-    let cur_color = cpu_load_color(cur);
+    let cur_color = cpu_load_color(cur, theme);
     spans.push(Span::styled(
         format!("  {cur:>3.0}% "),
         Style::default().fg(cur_color),
@@ -1838,12 +1875,17 @@ fn spectrum_row_spans(
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         "▕".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.label),
     ));
-    spans.extend(gauge_cells(cur, SPECTRUM_GAUGE_CELLS as usize, cur_color));
+    spans.extend(gauge_cells(
+        cur,
+        SPECTRUM_GAUGE_CELLS as usize,
+        cur_color,
+        theme.gauge_empty,
+    ));
     spans.push(Span::styled(
         "▏".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.label),
     ));
     spans
 }
@@ -1852,8 +1894,8 @@ fn spectrum_row_spans(
 /// sparkline width in samples (= seconds, since we tick at 1 Hz).
 /// Under the label column we leave whitespace so the axis sits
 /// flush with the start of the sparkline.
-fn spectrum_axis_row(spark_w: usize) -> Line<'static> {
-    let style = Style::default().fg(Color::DarkGray);
+fn spectrum_axis_row(spark_w: usize, theme: &theme::Theme) -> Line<'static> {
+    let style = Style::default().fg(theme.label);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
     // 5 spaces under the label column.
     spans.push(Span::raw(" ".repeat(SPECTRUM_LABEL_W as usize)));
@@ -1872,7 +1914,12 @@ fn spectrum_axis_row(spark_w: usize) -> Line<'static> {
 /// `fill_color`, empties in `DarkGray`. Returns the cells as spans
 /// (no surrounding brackets — those are emitted at the call site so
 /// the caller can colour them independently).
-fn gauge_cells(pct: f64, cells: usize, fill_color: Color) -> Vec<Span<'static>> {
+fn gauge_cells(
+    pct: f64,
+    cells: usize,
+    fill_color: Color,
+    empty_color: Color,
+) -> Vec<Span<'static>> {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -1882,10 +1929,7 @@ fn gauge_cells(pct: f64, cells: usize, fill_color: Color) -> Vec<Span<'static>> 
     let filled = filled.min(cells);
     vec![
         Span::styled("█".repeat(filled), Style::default().fg(fill_color)),
-        Span::styled(
-            "░".repeat(cells - filled),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("░".repeat(cells - filled), Style::default().fg(empty_color)),
     ]
 }
 
@@ -1895,19 +1939,11 @@ fn gauge_cells(pct: f64, cells: usize, fill_color: Color) -> Vec<Span<'static>> 
 /// background and the eye is drawn to active cores. Same upper
 /// breakpoints as `cpu_glyph_color` so the rest of the UI keeps
 /// one mental model.
-fn cpu_load_color(pct: f64) -> Color {
-    if pct >= 80.0 {
-        Color::Red
-    } else if pct >= 50.0 {
-        Color::Yellow
-    } else if pct >= 20.0 {
-        Color::Green
-    } else {
-        Color::DarkGray
-    }
+fn cpu_load_color(pct: f64, theme: &theme::Theme) -> Color {
+    theme.cpu_load_color(pct)
 }
 
-fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
+fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64], theme: &theme::Theme) {
     let per_row = (area.width / PERCORE_CELL_W).max(1) as usize;
     let max_cells = per_row.saturating_mul(PERCORE_MAX_ROWS as usize);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1915,10 +1951,10 @@ fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64]) {
 
     for (i, &pct) in percore.iter().take(max_cells).enumerate() {
         let bar = bar_glyph(pct);
-        let color = cpu_glyph_color(pct);
+        let color = cpu_glyph_color(pct, theme);
         spans.push(Span::styled(
             format!(" c{i:<2} "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.label),
         ));
         spans.push(Span::styled(bar.to_string(), Style::default().fg(color)));
         spans.push(Span::styled(
@@ -1951,13 +1987,14 @@ fn draw_proc_detail(
     kvm_available: bool,
     passthrough: Option<&passthrough::Passthrough>,
     ifaces: &[net::Iface],
+    theme: &theme::Theme,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" detail ");
     let Some(pid) = pid else {
         f.render_widget(Paragraph::new("(no process selected)").block(block), area);
         return;
     };
-    let label = Style::default().fg(Color::DarkGray);
+    let label = Style::default().fg(theme.label);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if let Some(r) = row {
@@ -2022,7 +2059,7 @@ fn draw_proc_detail(
     if let Some(snap) = proc::snapshot(pid) {
         lines.push(kv("VSZ", proc::human_bytes(snap.mem.vsz_bytes), label));
         if let Some(cg) = &snap.cgroup {
-            lines.push(section("── cgroup ──"));
+            lines.push(section("── cgroup ──", label));
             lines.push(kv("path", ellipsize(&cg.path, 38), label));
             lines.push(kv("mem.cur", proc::human_bytes(cg.memory_current), label));
             let max = if cg.memory_max == u64::MAX {
@@ -2037,7 +2074,7 @@ fn draw_proc_detail(
         for w in want {
             if let Some(l) = snap.limits.iter().find(|l| l.name == w) {
                 if !header_pushed {
-                    lines.push(section("── rlimits ──"));
+                    lines.push(section("── rlimits ──", label));
                     header_pushed = true;
                 }
                 let soft = proc::format_limit_value(&l.soft, &l.unit);
@@ -2053,7 +2090,7 @@ fn draw_proc_detail(
     }
 
     if !vcpus.is_empty() {
-        push_vcpu_lines(&mut lines, vcpus, label);
+        push_vcpu_lines(&mut lines, vcpus, label, theme);
     }
 
     // KVM exit-rate block: only relevant when the selected row is
@@ -2119,13 +2156,18 @@ fn vm_mean_cpu_pct(vcpus: &[vcpus::VcpuStat]) -> f64 {
 /// index, host tid, CPU% (color-ramped), and an inline 8-cell
 /// gauge that mirrors the per-core spectrum so guest hot vCPUs
 /// jump out the same way host hot cores do.
-fn push_vcpu_lines(lines: &mut Vec<Line<'static>>, vcpus: &[vcpus::VcpuStat], label: Style) {
-    lines.push(section("── vcpus ──"));
+fn push_vcpu_lines(
+    lines: &mut Vec<Line<'static>>,
+    vcpus: &[vcpus::VcpuStat],
+    label: Style,
+    theme: &theme::Theme,
+) {
+    lines.push(section("── vcpus ──", label));
     for v in vcpus {
         let pct = v
             .cpu_pct
             .map_or_else(|| "—".to_string(), |p| format!("{p:>5.1}%"));
-        let color = v.cpu_pct.map_or(Color::DarkGray, cpu_load_color);
+        let color = v.cpu_pct.map_or(theme.label, |p| cpu_load_color(p, theme));
         let key = format!("cpu{}", v.index);
         let mut spans = vec![
             Span::styled(format!("  {key:<8}"), label),
@@ -2136,12 +2178,12 @@ fn push_vcpu_lines(lines: &mut Vec<Line<'static>>, vcpus: &[vcpus::VcpuStat], la
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 "▕".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
-            spans.extend(gauge_cells(p, 8, color));
+            spans.extend(gauge_cells(p, 8, color, theme.gauge_empty));
             spans.push(Span::styled(
                 "▏".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
         }
         lines.push(Line::from(spans));
@@ -2159,7 +2201,7 @@ fn push_kvm_lines(
     available: bool,
     label: Style,
 ) {
-    lines.push(section("── kvm exits ──"));
+    lines.push(section("── kvm exits ──", label));
     if !available {
         lines.push(Line::from(Span::styled(
             "  (run as root for /sys/kernel/debug/kvm)",
@@ -2192,7 +2234,7 @@ fn push_passthrough_lines(
     label: Style,
 ) {
     if !p.vfio_groups.is_empty() || !p.vhost.is_empty() {
-        lines.push(section("── devices ──"));
+        lines.push(section("── devices ──", label));
         for group in &p.vfio_groups {
             // Empty device list (rare — group existed in /dev/vfio
             // but iommu_groups was unreadable) still earns a line so
@@ -2224,7 +2266,7 @@ fn push_passthrough_lines(
     }
 
     if !p.taps.is_empty() {
-        lines.push(section("── network ──"));
+        lines.push(section("── network ──", label));
         for tap in &p.taps {
             // Pull live rx / tx from the existing `net::Tracker`
             // snapshot — no extra syscalls. Foreign or freshly-up
@@ -2308,7 +2350,7 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
 /// surface buffers + cached at all. Giving it a dedicated full-width
 /// row turns memory composition from an afterthought into a chart
 /// you can read in one glance.
-fn draw_mem_bar(f: &mut ratatui::Frame<'_>, area: Rect, h: &host::HostInfo) {
+fn draw_mem_bar(f: &mut ratatui::Frame<'_>, area: Rect, h: &host::HostInfo, theme: &theme::Theme) {
     if h.mem_total_bytes == 0 || area.width < 20 {
         return;
     }
@@ -2343,15 +2385,27 @@ fn draw_mem_bar(f: &mut ratatui::Frame<'_>, area: Rect, h: &host::HostInfo) {
     // — no readout above it. Narrow segments degrade to label-only
     // then to bare fill; the title carries only the totals.
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
-    spans.push(seg("used", used, Color::Red, used_w));
-    spans.push(seg("buf", buffers, Color::Blue, buffers_w));
-    spans.push(seg("cache", cached, Color::Cyan, cached_w));
-    spans.push(seg("free", free, Color::DarkGray, free_w));
+    spans.push(seg("used", used, theme.mem_used, theme.badge_fg, used_w));
+    spans.push(seg(
+        "buf",
+        buffers,
+        theme.mem_buffers,
+        theme.badge_fg,
+        buffers_w,
+    ));
+    spans.push(seg(
+        "cache",
+        cached,
+        theme.mem_cached,
+        theme.badge_fg,
+        cached_w,
+    ));
+    spans.push(seg("free", free, theme.mem_free, theme.badge_fg, free_w));
 
     let title = format!(" memory · {} total ", proc::human_bytes(total));
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+        .title(Span::styled(title, Style::default().fg(theme.label)));
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
@@ -2372,7 +2426,7 @@ fn scale(n: u64, total: u64, bar_w: u64) -> u64 {
 /// fits: `" used 14.0 GiB "` → `" used "` → solid fill. The byte
 /// count lives *inside* the segment so the bar replaces the
 /// title-row readout entirely.
-fn seg(label: &str, bytes: u64, bg: Color, width: u64) -> Span<'static> {
+fn seg(label: &str, bytes: u64, bg: Color, fg: Color, width: u64) -> Span<'static> {
     let w = usize::try_from(width).unwrap_or(0);
     if w == 0 {
         return Span::raw("");
@@ -2385,7 +2439,7 @@ fn seg(label: &str, bytes: u64, bg: Color, width: u64) -> Span<'static> {
     } else {
         " ".repeat(w)
     };
-    Span::styled(content, Style::default().fg(Color::Black).bg(bg))
+    Span::styled(content, Style::default().fg(fg).bg(bg))
 }
 
 /// Pad `s` with spaces to fill `w` cells, keeping `s` centered.
@@ -2410,6 +2464,7 @@ fn draw_host_history(
     h: &HostHistory,
     ifaces: &[net::Iface],
     gpus: &[gpu::Gpu],
+    theme: &theme::Theme,
     vm_cpu_overlay: Option<(String, &VecDeque<u64>)>,
 ) {
     let show_gpu = !h.gpu.is_empty();
@@ -2468,7 +2523,7 @@ fn draw_host_history(
             .block(Block::default().borders(Borders::ALL).title(cpu_title))
             .data(&cpu_data)
             .max(100)
-            .style(Style::default().fg(Color::Green)),
+            .style(Style::default().fg(theme.spark_cpu)),
         cols[0],
     );
     f.render_widget(
@@ -2476,7 +2531,7 @@ fn draw_host_history(
             .block(Block::default().borders(Borders::ALL).title(mem_title))
             .data(&mem_data)
             .max(100)
-            .style(Style::default().fg(Color::Magenta)),
+            .style(Style::default().fg(theme.spark_mem)),
         cols[1],
     );
     // Auto-scale net sparklines to the rolling max so small bursts
@@ -2489,7 +2544,7 @@ fn draw_host_history(
             .block(Block::default().borders(Borders::ALL).title(down_title))
             .data(&down_data)
             .max(down_max)
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(theme.spark_net_down)),
         cols[2],
     );
     f.render_widget(
@@ -2497,7 +2552,7 @@ fn draw_host_history(
             .block(Block::default().borders(Borders::ALL).title(up_title))
             .data(&up_data)
             .max(up_max)
-            .style(Style::default().fg(Color::Yellow)),
+            .style(Style::default().fg(theme.spark_net_up)),
         cols[3],
     );
 
@@ -2514,7 +2569,7 @@ fn draw_host_history(
                 .block(Block::default().borders(Borders::ALL).title(gpu_title))
                 .data(&gpu_data)
                 .max(100)
-                .style(Style::default().fg(Color::LightRed)),
+                .style(Style::default().fg(theme.spark_gpu)),
             cols[next],
         );
         next += 1;
@@ -2528,7 +2583,7 @@ fn draw_host_history(
                 .block(Block::default().borders(Borders::ALL).title(vram_title))
                 .data(&vram_data)
                 .max(100)
-                .style(Style::default().fg(Color::LightMagenta)),
+                .style(Style::default().fg(theme.spark_vram)),
             cols[next],
         );
     }
@@ -2566,12 +2621,12 @@ fn total_net_rates(ifaces: &[net::Iface]) -> (u64, u64) {
 /// frozen the live tick. Bright enough that you can't miss it;
 /// deliberately *not* a popup, because pausing should leave the
 /// table fully readable.
-fn paused_badge() -> Span<'static> {
+fn paused_badge(theme: &theme::Theme) -> Span<'static> {
     Span::styled(
         "  [PAUSED — space to resume] ",
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
+            .fg(theme.badge_fg)
+            .bg(theme.filter_bg)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2589,8 +2644,8 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled(
             " neotop ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
@@ -2600,7 +2655,7 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )),
     ];
     if app.paused {
-        title.push(paused_badge());
+        title.push(paused_badge(&app.theme));
     }
     f.render_widget(Paragraph::new(Line::from(title)), area);
 }
@@ -2623,18 +2678,19 @@ fn draw_host(
     disks: &[disk::Disk],
     gpus: &[gpu::Gpu],
     history: &HostHistory,
+    theme: &theme::Theme,
 ) {
     // Three tight lines by default. A fourth GPU line appears only
     // when at least one card was discovered under `/sys/class/drm`,
     // so machines without a discrete GPU don't pay a row of screen
     // real estate for nothing.
     let mut lines = vec![
-        host_line1(h, batteries),
-        host_line_net_temp(ifaces, temps),
-        host_line4(disks, history),
+        host_line1(h, batteries, theme),
+        host_line_net_temp(ifaces, temps, theme),
+        host_line4(disks, history, theme),
     ];
     if !gpus.is_empty() {
-        lines.push(host_line_gpu(gpus, history));
+        lines.push(host_line_gpu(gpus, history, theme));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -2659,21 +2715,21 @@ const GPU_GAUGE_CELLS: usize = 8;
 /// cards are shown by name with a `(driver pending)` tag so the
 /// user knows the hardware *is* recognised — the metrics just
 /// aren't wired up in this neotop yet.
-fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
+fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory, theme: &theme::Theme) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
-        vec![Span::styled(" gpu ", Style::default().fg(Color::DarkGray))];
+        vec![Span::styled(" gpu ", Style::default().fg(theme.label))];
     for (i, g) in gpus.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("   "));
         }
         spans.push(Span::styled(
             g.name.clone(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.gpu_name),
         ));
         if let Some(busy) = g.busy_pct {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let busy_int = busy.round() as i64;
-            let busy_color = gpu_busy_color(busy);
+            let busy_color = gpu_busy_color(busy, theme);
             // Inline braille mini-chart: last ~16 s of busy% so the
             // panel reads as a chart, not a single instant snapshot.
             if let Some(ring) = history.gpu_busy_per_card.get(&gpu_key(g)) {
@@ -2694,12 +2750,17 @@ fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 "▕".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
-            spans.extend(gauge_cells(busy, GPU_GAUGE_CELLS, busy_color));
+            spans.extend(gauge_cells(
+                busy,
+                GPU_GAUGE_CELLS,
+                busy_color,
+                theme.gauge_empty,
+            ));
             spans.push(Span::styled(
                 "▏".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
         }
         if g.vram_total > 0 {
@@ -2716,16 +2777,21 @@ fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
             // in chart form. A card 95 % full of VRAM is a
             // pre-OOM signal you can spot from across the room.
             if let Some(vram_pct) = g.vram_pct() {
-                let vram_color = cpu_load_color(vram_pct);
+                let vram_color = cpu_load_color(vram_pct, theme);
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     "▕".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.label),
                 ));
-                spans.extend(gauge_cells(vram_pct, GPU_GAUGE_CELLS, vram_color));
+                spans.extend(gauge_cells(
+                    vram_pct,
+                    GPU_GAUGE_CELLS,
+                    vram_color,
+                    theme.gauge_empty,
+                ));
                 spans.push(Span::styled(
                     "▏".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.label),
                 ));
             }
         }
@@ -2736,7 +2802,7 @@ fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
             // No backend wired up yet for this vendor.
             spans.push(Span::styled(
                 " (driver pending)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
         }
     }
@@ -2745,17 +2811,15 @@ fn host_line_gpu(gpus: &[gpu::Gpu], history: &HostHistory) -> Line<'static> {
 
 /// Same green/yellow/red ramp the per-core CPU grid uses, so the
 /// user reads the GPU number with the same eye they read CPU.
-fn gpu_busy_color(busy: f64) -> Color {
-    if busy >= 80.0 {
-        Color::Red
-    } else if busy >= 50.0 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
+fn gpu_busy_color(busy: f64, theme: &theme::Theme) -> Color {
+    theme.gpu_busy_color(busy)
 }
 
-fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'static> {
+fn host_line1(
+    h: &host::HostInfo,
+    batteries: &[battery::Battery],
+    theme: &theme::Theme,
+) -> Line<'static> {
     let cpu_pct = h
         .cpu_pct
         .map_or_else(|| "—".to_string(), |p| format!("{p:>4.1}%"));
@@ -2764,9 +2828,9 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
-        Span::styled("CPU", Style::default().fg(Color::DarkGray)),
+        Span::styled("CPU", Style::default().fg(theme.label)),
         Span::raw(format!(" {cpu_pct}  ")),
-        Span::styled("MEM", Style::default().fg(Color::DarkGray)),
+        Span::styled("MEM", Style::default().fg(theme.label)),
         Span::raw(format!(
             " {}/{} ({mem_pct:>4.1}%)  ",
             proc::human_bytes(mem_used),
@@ -2784,14 +2848,8 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
         let swap_used = h.swap_total_bytes.saturating_sub(h.swap_free_bytes);
         #[allow(clippy::cast_precision_loss)]
         let swap_pct = (swap_used as f64 / h.swap_total_bytes as f64) * 100.0;
-        let swap_color = if swap_pct >= 50.0 {
-            Color::Red
-        } else if swap_pct >= 10.0 {
-            Color::Yellow
-        } else {
-            Color::Reset
-        };
-        spans.push(Span::styled("swap", Style::default().fg(Color::DarkGray)));
+        let swap_color = theme.swap_color(swap_pct);
+        spans.push(Span::styled("swap", Style::default().fg(theme.label)));
         spans.push(Span::raw(format!(
             " {}/{} (",
             proc::human_bytes(swap_used),
@@ -2809,7 +2867,7 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
     // low) or a sustained one (all three high). Showing only the
     // 1-minute number was hiding half the signal.
     spans.extend([
-        Span::styled("load", Style::default().fg(Color::DarkGray)),
+        Span::styled("load", Style::default().fg(theme.label)),
         Span::raw(format!(
             " {:.2} {:.2} {:.2}",
             h.loadavg_1, h.loadavg_5, h.loadavg_15,
@@ -2817,12 +2875,12 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
     ]);
     if !batteries.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled("bat", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled("bat", Style::default().fg(theme.label)));
         for b in batteries {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("{}%", b.percent),
-                Style::default().fg(battery_color(b)),
+                Style::default().fg(battery_color(b, theme)),
             ));
             spans.push(Span::raw(format!(" {}", short_bat_status(&b.status))));
             if let Some(w) = b.watts {
@@ -2835,9 +2893,13 @@ fn host_line1(h: &host::HostInfo, batteries: &[battery::Battery]) -> Line<'stati
     Line::from(spans)
 }
 
-fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'static> {
+fn host_line_net_temp(
+    ifaces: &[net::Iface],
+    temps: &[temp::Reading],
+    theme: &theme::Theme,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
-        vec![Span::styled(" net ", Style::default().fg(Color::DarkGray))];
+        vec![Span::styled(" net ", Style::default().fg(theme.label))];
     if ifaces.is_empty() {
         spans.push(Span::raw("—"));
     } else {
@@ -2847,7 +2909,7 @@ fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'s
             }
             spans.push(Span::styled(
                 iface.name.clone(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.spark_net_down),
             ));
             spans.push(Span::raw(format!(
                 " ↓{} ↑{}",
@@ -2857,7 +2919,7 @@ fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'s
         }
     }
     spans.push(Span::raw("   "));
-    spans.push(Span::styled("temp ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("temp ", Style::default().fg(theme.label)));
 
     // Prefer "informative" sensors (CPU / GPU / NVMe / battery) and
     // drop noisy chipset / ACPI readings unless they're actually hot.
@@ -2877,13 +2939,13 @@ fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'s
                 spans.push(Span::raw("  "));
             }
             let color = match temp::severity(r.celsius) {
-                temp::Severity::Cool => Color::Green,
-                temp::Severity::Warm => Color::Yellow,
-                temp::Severity::Hot => Color::Red,
+                temp::Severity::Cool => theme.battery_good,
+                temp::Severity::Warm => theme.battery_mid,
+                temp::Severity::Hot => theme.battery_low,
             };
             spans.push(Span::styled(
                 compact_temp_label(&r.label).to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.label),
             ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
@@ -2895,9 +2957,9 @@ fn host_line_net_temp(ifaces: &[net::Iface], temps: &[temp::Reading]) -> Line<'s
     Line::from(spans)
 }
 
-fn host_line4(disks: &[disk::Disk], history: &HostHistory) -> Line<'static> {
+fn host_line4(disks: &[disk::Disk], history: &HostHistory, theme: &theme::Theme) -> Line<'static> {
     let mut spans: Vec<Span<'static>> =
-        vec![Span::styled(" disk ", Style::default().fg(Color::DarkGray))];
+        vec![Span::styled(" disk ", Style::default().fg(theme.label))];
     let picks = disk::highlights(disks, 3);
     if picks.is_empty() {
         spans.push(Span::raw("—"));
@@ -2909,7 +2971,7 @@ fn host_line4(disks: &[disk::Disk], history: &HostHistory) -> Line<'static> {
         }
         spans.push(Span::styled(
             d.name.clone(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.gpu_name),
         ));
         // Inline braille mini-chart of total throughput. y-axis
         // auto-scales to this disk's own peak in the window so a
@@ -2919,9 +2981,9 @@ fn host_line4(disks: &[disk::Disk], history: &HostHistory) -> Line<'static> {
             let series: Vec<u64> = ring.iter().copied().collect();
             let max = series.iter().copied().max().unwrap_or(0).max(1);
             let color = match d.util_pct {
-                Some(u) if u >= 80.0 => Color::Red,
-                Some(u) if u >= 50.0 => Color::Yellow,
-                _ => Color::Green,
+                Some(u) if u >= 80.0 => theme.cpu_high,
+                Some(u) if u >= 50.0 => theme.cpu_mid,
+                _ => theme.cpu_low,
             };
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
@@ -2938,11 +3000,11 @@ fn host_line4(disks: &[disk::Disk], history: &HostHistory) -> Line<'static> {
             // Highlight saturated devices — same yellow/red thresholds
             // we use for CPU% to keep the eye-trained palette consistent.
             let color = if util >= 80.0 {
-                Color::Red
+                theme.cpu_high
             } else if util >= 50.0 {
-                Color::Yellow
+                theme.cpu_mid
             } else {
-                Color::DarkGray
+                theme.perf_ok
             };
             spans.push(Span::styled(
                 format!(" {util:>3.0}%"),
@@ -3002,39 +3064,20 @@ fn io_rate_detail(bps: Option<u64>) -> String {
     }
 }
 
-fn cpu_glyph_color(pct: f64) -> Color {
-    if pct >= 80.0 {
-        Color::Red
-    } else if pct >= 50.0 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
+fn cpu_glyph_color(pct: f64, theme: &theme::Theme) -> Color {
+    theme.cpu_load_color(pct)
 }
 
 /// Header colour by group band: Cyan for Container (the workload
 /// the developer explicitly started), Yellow for language Runtime
 /// (the daemon they actively launched), `DarkGray` for System and
 /// Native so they sit in the visual background of the panel.
-fn group_band_color(band: groups::GroupBand) -> Color {
-    match band {
-        groups::GroupBand::Container => Color::Cyan,
-        groups::GroupBand::Vm => Color::LightBlue,
-        groups::GroupBand::Runtime => Color::Yellow,
-        groups::GroupBand::System | groups::GroupBand::Native => Color::DarkGray,
-    }
+fn group_band_color(band: groups::GroupBand, theme: &theme::Theme) -> Color {
+    theme.group_band_color(band)
 }
 
-fn battery_color(b: &battery::Battery) -> Color {
-    if b.status == "Charging" || b.status == "Full" {
-        Color::Green
-    } else if b.percent < 15 {
-        Color::Red
-    } else if b.percent < 35 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
+fn battery_color(b: &battery::Battery, theme: &theme::Theme) -> Color {
+    theme.battery_color(b)
 }
 
 fn short_bat_status(s: &str) -> &'static str {
@@ -3125,13 +3168,19 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         errors::Severity::Info => format!(" \u{2139} {}: {} ", e.source, e.message),
     });
     let err_style = err_entry.map_or_else(
-        || Style::default().fg(Color::Black).bg(Color::Red),
+        || {
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.err_warn_bg)
+        },
         |e| match e.severity {
             errors::Severity::Warn => Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.err_warn_bg)
                 .add_modifier(Modifier::BOLD),
-            errors::Severity::Info => Style::default().fg(Color::Black).bg(Color::Yellow),
+            errors::Severity::Info => Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.err_info_bg),
         },
     );
     let err_w = err_text
@@ -3167,30 +3216,30 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let p = &app.perf.perf;
-    let scan_color = ms_color(p.scan_ms);
-    let render_color = ms_color(p.render_ms);
+    let scan_color = ms_color(p.scan_ms, &app.theme);
+    let render_color = ms_color(p.render_ms, &app.theme);
     let cpu = p
         .own_cpu_pct
         .map_or_else(|| "—".to_string(), |v| format!("{v:.1}%"));
     let line = Line::from(vec![
-        Span::styled("scan ", Style::default().fg(Color::DarkGray)),
+        Span::styled("scan ", Style::default().fg(app.theme.label)),
         Span::styled(
             format!("{:.1}ms", p.scan_ms),
             Style::default().fg(scan_color),
         ),
         Span::raw(" "),
-        Span::styled("render ", Style::default().fg(Color::DarkGray)),
+        Span::styled("render ", Style::default().fg(app.theme.label)),
         Span::styled(
             format!("{:.1}ms", p.render_ms),
             Style::default().fg(render_color),
         ),
         Span::raw(" "),
-        Span::styled("own ", Style::default().fg(Color::DarkGray)),
+        Span::styled("own ", Style::default().fg(app.theme.label)),
         Span::raw(proc::human_bytes(p.own_rss_bytes)),
         Span::raw(" "),
         Span::raw(cpu),
         Span::raw(" "),
-        Span::styled("tick ", Style::default().fg(Color::DarkGray)),
+        Span::styled("tick ", Style::default().fg(app.theme.label)),
         Span::raw(format!(
             "{:.0}/{}ms",
             p.refresh_actual_ms,
@@ -3200,14 +3249,8 @@ fn draw_perf(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line).alignment(Alignment::Right), area);
 }
 
-fn ms_color(ms: f64) -> Color {
-    if ms >= 100.0 {
-        Color::Red
-    } else if ms >= 20.0 {
-        Color::Yellow
-    } else {
-        Color::DarkGray
-    }
+fn ms_color(ms: f64, theme: &theme::Theme) -> Color {
+    theme.ms_color(ms)
 }
 
 // Per-mode footer prompts plus the Normal-mode shortcut line is
@@ -3223,7 +3266,9 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let line = Line::from(vec![
                 Span::styled(
                     " filter ",
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.filter_bg),
                 ),
                 Span::raw(" "),
                 Span::styled(
@@ -3232,9 +3277,19 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 ),
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
                 Span::raw("   "),
-                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.highlight_bg),
+                ),
                 Span::raw(" apply   "),
-                Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.highlight_bg),
+                ),
                 Span::raw(" clear"),
             ]);
             f.render_widget(Paragraph::new(line), area);
@@ -3253,12 +3308,24 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {} ", sig.label()),
-                    Style::default().fg(Color::White).bg(Color::Red),
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.err_warn_bg),
                 ),
                 Span::raw(format!(" {target}   ")),
-                Span::styled(" y ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::styled(
+                    " y ",
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.highlight_bg),
+                ),
                 Span::raw(" confirm   "),
-                Span::styled(" any ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::styled(
+                    " any ",
+                    Style::default()
+                        .fg(app.theme.badge_fg)
+                        .bg(app.theme.highlight_bg),
+                ),
                 Span::raw(" cancel"),
             ]);
             f.render_widget(Paragraph::new(line), area);
@@ -3277,42 +3344,97 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         " spectrum"
     };
     let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " q ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" quit  "),
-        Span::styled(" ? ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " ? ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" help  "),
-        Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " j/k ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" nav  "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " r ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" refresh  "),
-        Span::styled(" H ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " H ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(format!("{h_label}  ")),
     ];
     spans.extend([
-        Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " s ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" sort  "),
-        Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " t ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" tree  "),
-        Span::styled(" g ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " g ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" group  "),
-        Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " / ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" filter  "),
-        Span::styled(" K ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " K ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" SIGTERM  "),
-        Span::styled(" ^K ", Style::default().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(
+            " ^K ",
+            Style::default()
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.highlight_bg),
+        ),
         Span::raw(" SIGKILL"),
     ]);
     if !app.procs_filter.is_empty() {
         spans.push(Span::raw("    "));
         spans.push(Span::styled(
             "filter:",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.label),
         ));
         spans.push(Span::styled(
             format!(" {} ", app.procs_filter),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .fg(app.theme.badge_fg)
+                .bg(app.theme.filter_bg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -3340,7 +3462,7 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             // left blank so the eye instantly separates them from
             // process rows.
             if let Some(h) = &pr.header {
-                let band_color = group_band_color(h.band);
+                let band_color = group_band_color(h.band, &app.theme);
                 let cpu_text = format!("{:>5.1}", h.total_cpu);
                 let rss_text = proc::human_bytes(h.total_rss);
                 let banner = format!("▼ {label}  ({n})", label = h.label, n = h.count);
@@ -3373,8 +3495,9 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             let cpu = r
                 .cpu_pct
                 .map_or_else(|| "—".to_string(), |p| format!("{p:.1}"));
-            let cpu_style = Style::default().fg(cpu_glyph_color(r.cpu_pct.unwrap_or(0.0)));
-            let state_style = proc_state_style(r.state);
+            let cpu_style =
+                Style::default().fg(cpu_glyph_color(r.cpu_pct.unwrap_or(0.0), &app.theme));
+            let state_style = proc_state_style(r.state, &app.theme);
             // In tree mode the COMMAND cell is prefixed with the
             // glyph chain ('│ ├─', '└─', etc); group mode uses two
             // leading spaces; flat mode prefix is empty.
@@ -3434,7 +3557,7 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(app.theme.highlight_bg)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -3444,19 +3567,15 @@ fn draw_proc_table(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         area,
         app.procs_visible.len(),
         app.procs_table.selected().unwrap_or(0),
+        &app.theme,
     );
 }
 
-fn proc_state_style(c: char) -> Style {
+fn proc_state_style(c: char, theme: &theme::Theme) -> Style {
+    let color = theme.proc_state_color(c);
     match c {
-        'R' => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        'D' => Style::default().fg(Color::Red),
-        'Z' => Style::default().fg(Color::Magenta),
-        'T' | 't' => Style::default().fg(Color::Yellow),
-        'I' => Style::default().fg(Color::DarkGray),
-        _ => Style::default().fg(Color::Gray),
+        'R' => Style::default().fg(color).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(color),
     }
 }
 
@@ -3473,7 +3592,13 @@ fn truncate_lossy(s: &str, max: usize) -> String {
 ///
 /// Drawn *after* the table so it overlays the right border. We use the
 /// border row directly as the track so the table loses no inner width.
-fn draw_scrollbar(f: &mut ratatui::Frame<'_>, area: Rect, total: usize, selected: usize) {
+fn draw_scrollbar(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    total: usize,
+    selected: usize,
+    theme: &theme::Theme,
+) {
     // Subtract 2: one for the table header row, one for the bottom
     // border. The remaining height is roughly the visible row count.
     let visible_rows = area.height.saturating_sub(2) as usize;
@@ -3486,7 +3611,7 @@ fn draw_scrollbar(f: &mut ratatui::Frame<'_>, area: Rect, total: usize, selected
         .end_symbol(None)
         .track_symbol(None)
         .thumb_symbol("\u{2588}")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(theme.label));
     // Inset by 1 so we don't clobber the corner glyphs of the block.
     let inner = Rect {
         x: area.x,
@@ -3497,8 +3622,8 @@ fn draw_scrollbar(f: &mut ratatui::Frame<'_>, area: Rect, total: usize, selected
     f.render_stateful_widget(bar, inner, &mut state);
 }
 
-fn section(label: &'static str) -> Line<'static> {
-    Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)))
+fn section(label: &'static str, style: Style) -> Line<'static> {
+    Line::from(Span::styled(label, style))
 }
 
 fn ellipsize(s: &str, max: usize) -> String {
@@ -4010,38 +4135,42 @@ mod tests {
 
     #[test]
     fn cpu_load_color_steps() {
-        // Four-stop ramp shared by sparkline cells, live %, and
-        // gauge fill. Idle (≤19 %) is dark grey so quiet cores
-        // recede; the upper breakpoints match cpu_glyph_color.
-        assert!(matches!(cpu_load_color(0.0), Color::DarkGray));
-        assert!(matches!(cpu_load_color(19.0), Color::DarkGray));
-        assert!(matches!(cpu_load_color(20.0), Color::Green));
-        assert!(matches!(cpu_load_color(49.0), Color::Green));
-        assert!(matches!(cpu_load_color(50.0), Color::Yellow));
-        assert!(matches!(cpu_load_color(79.0), Color::Yellow));
-        assert!(matches!(cpu_load_color(80.0), Color::Red));
-        assert!(matches!(cpu_load_color(100.0), Color::Red));
+        // Four-stop ramp: idle → low → mid → high.
+        // Colour values come from the Dark (Catppuccin Mocha) preset.
+        let t = theme::ThemePreset::Dark.colors();
+        let idle = cpu_load_color(0.0, &t);
+        let low = cpu_load_color(20.0, &t);
+        let mid = cpu_load_color(50.0, &t);
+        let high = cpu_load_color(80.0, &t);
+        assert_eq!(idle, t.cpu_idle);
+        assert_eq!(cpu_load_color(19.0, &t), t.cpu_idle);
+        assert_eq!(low, t.cpu_low);
+        assert_eq!(cpu_load_color(49.0, &t), t.cpu_low);
+        assert_eq!(mid, t.cpu_mid);
+        assert_eq!(cpu_load_color(79.0, &t), t.cpu_mid);
+        assert_eq!(high, t.cpu_high);
+        assert_eq!(cpu_load_color(100.0, &t), t.cpu_high);
     }
 
     #[test]
     fn gauge_cells_round_to_nearest() {
         // 0% empty.
-        let s = gauge_cells(0.0, 10, Color::Green);
+        let s = gauge_cells(0.0, 10, Color::Green, Color::DarkGray);
         let total: usize = s.iter().map(|sp| sp.content.chars().count()).sum();
         assert_eq!(total, 10);
         assert_eq!(s[0].content.as_ref(), "");
         // 50% gives exactly 5 filled out of 10.
-        let s = gauge_cells(50.0, 10, Color::Green);
+        let s = gauge_cells(50.0, 10, Color::Green, Color::DarkGray);
         assert_eq!(s[0].content.chars().count(), 5);
         assert_eq!(s[1].content.chars().count(), 5);
         // 100% fully filled, no empties.
-        let s = gauge_cells(100.0, 10, Color::Red);
+        let s = gauge_cells(100.0, 10, Color::Red, Color::DarkGray);
         assert_eq!(s[0].content.chars().count(), 10);
         assert_eq!(s[1].content.as_ref(), "");
         // Out-of-range values clamp rather than panic.
-        let s = gauge_cells(-50.0, 8, Color::Green);
+        let s = gauge_cells(-50.0, 8, Color::Green, Color::DarkGray);
         assert_eq!(s[0].content.as_ref(), "");
-        let s = gauge_cells(150.0, 8, Color::Red);
+        let s = gauge_cells(150.0, 8, Color::Red, Color::DarkGray);
         assert_eq!(s[0].content.chars().count(), 8);
     }
 
@@ -4054,7 +4183,8 @@ mod tests {
         for v in [10, 20, 30, 40, 50] {
             ring.push_back(v);
         }
-        let line = spectrum_row(0, &ring, Some(50.0), 10);
+        let t = theme::ThemePreset::Dark.colors();
+        let line = spectrum_row(0, &ring, Some(50.0), 10, &t);
         // First span is the label; spans 1..=5 should be the
         // five blank pad cells before the bar glyphs start.
         let pads: usize = line
@@ -4072,7 +4202,8 @@ mod tests {
         // Axis row layout: 5 spaces (label column) + "-Ns " + dashes
         // + " now". The total visible width past the label must
         // equal the sparkline width so the tick lines up.
-        let line = spectrum_axis_row(40);
+        let t = theme::ThemePreset::Dark.colors();
+        let line = spectrum_axis_row(40, &t);
         let visible_after_label: usize = line
             .spans
             .iter()
@@ -4081,7 +4212,7 @@ mod tests {
             .sum();
         assert_eq!(visible_after_label, 40);
         // Empty sparkline still renders without panicking.
-        let line = spectrum_axis_row(0);
+        let line = spectrum_axis_row(0, &t);
         assert!(!line.spans.is_empty());
     }
 
