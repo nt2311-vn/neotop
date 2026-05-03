@@ -1,15 +1,10 @@
-//! net.rs — per-interface RX/TX byte rates from `/proc/net/dev`.
-//!
-//! We sample cumulative byte counts on each scan and turn them into a
-//! rate by dividing the delta by the wall-clock time since the last
-//! sample. First scan has no delta — `rx_rate`/`tx_rate` are `None`.
-//!
-//! Loopback and docker bridges are filtered out by default; they
-//! aren't informative for a "is anything talking to the outside"
-//! glance.
+//! net.rs — per-interface RX/TX byte rates.
+//! Linux: `/proc/net/dev`. macOS: not implemented (returns empty).
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use crate::errors::ErrorRing;
@@ -39,21 +34,28 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
-    /// Take a fresh snapshot; `prev` is updated for the next call.
     pub(crate) fn snapshot(&mut self, errors: &mut ErrorRing) -> Vec<Iface> {
-        let raw = match fs::read_to_string("/proc/net/dev") {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push("net", format!("/proc/net/dev: {e}"));
-                return Vec::new();
-            }
-        };
-        self.snapshot_from_str(&raw, Instant::now())
+        #[cfg(target_os = "linux")]
+        {
+            let raw = match fs::read_to_string("/proc/net/dev") {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push("net", format!("/proc/net/dev: {e}"));
+                    return Vec::new();
+                }
+            };
+            self.snapshot_from_str(&raw, Instant::now())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Vec::new()
+        }
     }
 
     /// Test seam: same logic as `snapshot`, but takes the raw file
     /// content + a clock value so callers can verify rate computation
     /// without touching the real filesystem.
+    #[cfg(target_os = "linux")]
     pub(crate) fn snapshot_from_str(&mut self, raw: &str, now: Instant) -> Vec<Iface> {
         let mut ifaces = Vec::new();
         let mut seen: Vec<String> = Vec::new();

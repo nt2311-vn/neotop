@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1]
+
+### macOS support
+
+Cross-platform compilation and basic functionality on macOS. The codebase now compiles and runs on macOS with platform-specific data sources:
+
+- **host.rs** — CPU count, memory, load averages via `sysctl`
+- **proc.rs** — process info via `libproc` (`PROC_PIDTASKINFO`)
+- **procs.rs** — process list via `proc_listallpids`
+- **Linux-only modules** — battery, disk, net, temp, gpu, elf return empty data on macOS (full implementations deferred)
+
+CI now includes macOS builds (allowing failures as the implementation is basic).
+
+### Platform abstraction
+
+- Moved `rustix` to Linux-only dependencies
+- Added `libc` for macOS system calls
+- Added `#[cfg(target_os = "macos")]` guards throughout
+- Updated module documentation to note platform differences
+
 ## [0.20.1] — 2026-04-26
 
 ### crates.io release prep

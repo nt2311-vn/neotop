@@ -1,40 +1,5 @@
 //! gpu.rs — discrete + integrated GPU stats.
-//!
-//! Two parallel data sources:
-//!
-//! * **sysfs** (`/sys/class/drm/card*`) — universal vendor probe and
-//!   the AMD metrics backend. Free, no extra deps, no privileges.
-//! * **NVML** (NVIDIA Management Library, via the `nvml-wrapper`
-//!   crate, gated behind the default-on `nvml` feature) — real
-//!   metrics for NVIDIA cards. The crate dlopens
-//!   `libnvidia-ml.so` at runtime, so the binary builds and runs
-//!   on machines without the NVIDIA driver; init failure just
-//!   leaves NVIDIA cards in detect-only mode.
-//!
-//! Snapshot algorithm:
-//!   1. Walk sysfs, produce a `Gpu` for every `cardN`. AMD cards
-//!      get full metrics; NVIDIA / Intel start as "pending".
-//!   2. If NVML is initialised, build a PCI-bus → device-index
-//!      map from NVML's view, then for every sysfs NVIDIA card
-//!      look up its PCI address and replace the entry with the
-//!      NVML record (real busy %, VRAM, watts).
-//!   3. NVIDIA cards present in sysfs but missing from NVML
-//!      (proprietary driver loaded but the card was hot-disabled,
-//!      runtime PM suspended) stay as detect-only.
-//!
-//! Intel `i915` cards get a coarse busy% computed from the RC6
-//! residency counter under `/sys/class/drm/card*/gt/gt0/`. RC6 is
-//! the deepest GPU power-save state — when the engine is idle and
-//! has nothing queued, time accrues there. Subtract its delta from
-//! the wall-clock delta and you have an approximate busy %. It's
-//! the same fallback `intel_gpu_top` uses when it can't open
-//! `i915_pmu` perf events (which require `CAP_PERFMON` and the
-//! `perf_event_open` syscall — out of scope for an observe-only
-//! tool). Per-engine breakdown (rcs / bcs / vcs / vecs) and power
-//! draw stay deferred for the same reason.
-//!
-//! All probes are best-effort: a card that disappears mid-scan
-//! (eGPU unplug, runtime PM) is silently skipped, never panics.
+//! Linux: sysfs + NVML. macOS: NVML only (returns empty if unavailable).
 
 use std::collections::HashMap;
 use std::fs;
@@ -193,11 +158,18 @@ impl Tracker {
     // the call site stable across feature combinations.
     #[cfg_attr(not(feature = "nvml"), allow(clippy::unused_self))]
     pub(crate) fn snapshot(&mut self) -> Vec<Gpu> {
-        let mut out = scan_sysfs_cards();
-        #[cfg(feature = "nvml")]
-        self.merge_nvml(&mut out);
-        self.merge_intel(&mut out);
-        out
+        #[cfg(target_os = "linux")]
+        {
+            let mut out = scan_sysfs_cards();
+            #[cfg(feature = "nvml")]
+            self.merge_nvml(&mut out);
+            self.merge_intel(&mut out);
+            out
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Vec::new()
+        }
     }
 
     /// For every Intel sysfs card, read RC6 residency and convert

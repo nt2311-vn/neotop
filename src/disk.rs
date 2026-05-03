@@ -1,31 +1,10 @@
-//! disk.rs — per-device read/write throughput + utilisation from
-//! `/proc/diskstats`.
-//!
-//! Same shape as `net::Tracker`: a `Tracker` keeps the previous
-//! sample for each device so two snapshots compute a rate.
-//!
-//! `/proc/diskstats` line format (kernel ≥4.18):
-//!
-//! ```text
-//! major minor name
-//!   reads_completed reads_merged sectors_read time_reading_ms
-//!   writes_completed writes_merged sectors_written time_writing_ms
-//!   io_in_progress time_io_ms time_io_weighted_ms
-//!   discards_completed discards_merged sectors_discarded time_discarding_ms
-//!   flushes_completed time_flushing_ms
-//! ```
-//!
-//! We use:
-//! - `sectors_read`   (col 5, parts[2]) → bytes via `* 512`
-//! - `sectors_written` (col 9, parts[6]) → bytes via `* 512`
-//! - `time_io_ms`      (col 12, parts[9]) → utilisation %
-//!
-//! Devices are filtered to physical disks only; partitions, loop
-//! devices, ramdisks, and device-mapper virtuals are ignored. `btm`
-//! and `iostat` do the same — they're noise for a top-level view.
+//! disk.rs — per-device read/write throughput + utilisation.
+//! Linux: `/proc/diskstats`. macOS: not implemented (returns empty).
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use crate::errors::ErrorRing;
@@ -64,14 +43,21 @@ pub(crate) struct Tracker {
 
 impl Tracker {
     pub(crate) fn snapshot(&mut self, errors: &mut ErrorRing) -> Vec<Disk> {
-        let raw = match fs::read_to_string("/proc/diskstats") {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push("disk", format!("/proc/diskstats: {e}"));
-                return Vec::new();
-            }
-        };
-        self.snapshot_from_str(&raw, Instant::now())
+        #[cfg(target_os = "linux")]
+        {
+            let raw = match fs::read_to_string("/proc/diskstats") {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push("disk", format!("/proc/diskstats: {e}"));
+                    return Vec::new();
+                }
+            };
+            self.snapshot_from_str(&raw, Instant::now())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Vec::new()
+        }
     }
 
     /// Test seam: same logic as `snapshot` but takes the raw file

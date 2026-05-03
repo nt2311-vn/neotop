@@ -1,38 +1,9 @@
-//! elf.rs — minimal ELF section parser used to fingerprint Go and
-//! Rust binaries from `/proc/<pid>/exe`.
-//!
-//! The classifier in `groups.rs` reads `/proc/<pid>/cmdline` and
-//! `/proc/<pid>/cgroup` only — that's enough to tag containers and
-//! interpreter-based runtimes (Java, Node, Python, …) where the
-//! interpreter's name leaks into argv0. Statically-linked Go and
-//! Rust binaries don't expose the runtime through argv0: a
-//! `go build`-produced binary is named after the target and
-//! contains no other clue. Without ELF inspection both languages
-//! collapse into the catch-all `Native` bucket.
-//!
-//! What we look for, by section name in the section-header string
-//! table:
-//!
-//! * **Go**: `.note.go.buildid` (every modern `go build` writes
-//!   one), `.gopclntab` (PC→line table — present even when the
-//!   build-id note is stripped), `.gosymtab`.
-//! * **Rust**: any `.rodata*` / `.rdata` section that contains the
-//!   substring `library/std/src/` (the path embedded in panic
-//!   location strings — every Rust binary that links libstd carries
-//!   it). Falls back to the symbol-table prefix `_R` (v0 mangling)
-//!   when the binary isn't stripped.
-//!
-//! Cost: section-header table + name table is typically a few KB.
-//! For the Rust-content fallback we cap reads at 8 MiB of rodata
-//! per pid, and the result is cached for the lifetime of the pid
-//! by `procs::Tracker`. Steady-state cost is zero.
-//!
-//! Why hand-roll instead of pulling in `goblin` / `object`? Both
-//! crates do far more than we need (relocations, DWARF, parsing
-//! every section type) and would add 100 KB to the binary. We need
-//! ELF64 LE only — that's 60 lines of safe Rust.
+//! elf.rs — ELF section parser for Go/Rust detection.
+//! Linux: reads ELF from `/proc/<pid>/exe`. macOS: not implemented (returns None).
 
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -52,6 +23,7 @@ const MAX_SHTAB_BYTES: u64 = 1024 * 1024;
 /// built with, if we can prove it. Returns `None` for any error
 /// (file unreadable, not ELF, 32-bit, big-endian, malformed) — the
 /// caller treats all of those as "no upgrade, stay Native".
+#[cfg(target_os = "linux")]
 pub(crate) fn detect_native_lang(exe_path: &Path) -> Option<Lang> {
     let mut f = File::open(exe_path).ok()?;
     let mut hdr = [0u8; 64];
@@ -292,4 +264,9 @@ mod tests {
         let p = Path::new("/etc/hostname");
         assert!(detect_native_lang(p).is_none());
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_native_lang(_exe_path: &Path) -> Option<Lang> {
+    None
 }

@@ -66,6 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Required for cargo-audit to create a check run
+      checks: write
       # Required for Semgrep's SARIF upload to the security tab on
       # public repos. Harmless on private repos that disable it.
       security-events: write

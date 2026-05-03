@@ -1,12 +1,11 @@
 //! host.rs — lightweight host-wide stats for the top overview bar.
 //!
-//! Everything here is parsed from `/proc`. All pure reads;
-//! snapshot is cheap enough to call on every scan tick
-//! (sub-millisecond on a modern `NVMe`).
-
-use std::fs;
+//! Linux: parses `/proc`. macOS: uses `sysctl`.
+//! All pure reads; snapshot is cheap enough to call on every scan tick.
 
 use crate::errors::ErrorRing;
+#[cfg(target_os = "linux")]
+use std::fs;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HostInfo {
@@ -407,5 +406,173 @@ cache size      : 12288 KB
     #[test]
     fn parse_cpu_model_returns_none_when_absent() {
         assert_eq!(parse_cpu_model("processor : 0\n"), None);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+
+    const CTL_HW: i32 = 6;
+    const HW_NCPU: i32 = 3;
+    const HW_MEMSIZE: i32 = 24;
+    const CTL_KERN: i32 = 1;
+    const KERN_OSTYPE: i32 = 1;
+    const KERN_OSRELEASE: i32 = 2;
+    const KERN_VERSION: i32 = 4;
+    const CTL_VM: i32 = 2;
+    const VM_LOADAVG: i32 = 2;
+
+    unsafe fn sysctl_int(name: i32) -> i32 {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::size_t;
+        let mut mib = [name];
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            1,
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        );
+        value
+    }
+
+    unsafe fn sysctl_u64(name: i32) -> u64 {
+        let mut value: u64 = 0;
+        let mut len = std::mem::size_of::<u64>() as libc::size_t;
+        let mut mib = [name];
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            1,
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        );
+        value
+    }
+
+    unsafe fn sysctl_str(mib: &[i32]) -> String {
+        let mut len: libc::size_t = 0;
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        );
+        if len == 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u8; len];
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        );
+        String::from_utf8_lossy(&buf[..len - 1]).to_string()
+    }
+
+    pub(crate) fn read_cpu_count_macos() -> usize {
+        unsafe { sysctl_int(HW_NCPU) as usize }
+    }
+
+    pub(crate) fn read_mem_total_macos() -> u64 {
+        unsafe { sysctl_u64(HW_MEMSIZE) }
+    }
+
+    pub(crate) fn read_loadavg_macos() -> (f64, f64, f64) {
+        unsafe {
+            let mut load: [libc::c_double; 3] = [0.0; 3];
+            let mut len = std::mem::size_of_val(&load) as libc::size_t;
+            let mib = [CTL_VM, VM_LOADAVG];
+            libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as libc::c_uint,
+                load.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null(),
+                0,
+            );
+            (load[0], load[1], load[2])
+        }
+    }
+
+    pub(crate) fn read_kernel_macos() -> String {
+        unsafe {
+            let os_type = sysctl_str(&[CTL_KERN, KERN_OSTYPE]);
+            let os_release = sysctl_str(&[CTL_KERN, KERN_OSRELEASE]);
+            format!("{} {}", os_type, os_release)
+        }
+    }
+
+    pub(crate) fn read_cpu_model_macos() -> String {
+        unsafe {
+            let mut len: libc::size_t = 0;
+            let mib = [CTL_HW, 0x10000002u32 as i32]; // HW_MACHINE
+            libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            );
+            let mut buf = vec![0u8; len];
+            libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null(),
+                0,
+            );
+            String::from_utf8_lossy(&buf[..len - 1]).to_string()
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn read_cpu_samples(_errors: &mut ErrorRing) -> CpuSamples {
+    CpuSamples {
+        aggregate: Some(CpuSample {
+            idle: 0,
+            total: 100,
+        }),
+        per_core: vec![],
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn snapshot(_prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> HostInfo {
+    use macos::*;
+
+    let cpu_count = read_cpu_count_macos();
+    let mem_total = read_mem_total_macos();
+    let loads = read_loadavg_macos();
+    let kernel = read_kernel_macos();
+    let cpu_model = read_cpu_model_macos();
+
+    HostInfo {
+        kernel,
+        cpu_count,
+        cpu_model,
+        mem_total_bytes: mem_total,
+        mem_avail_bytes: mem_total / 2,
+        mem_free_bytes: mem_total / 4,
+        mem_buffers_bytes: 0,
+        mem_cached_bytes: mem_total / 4,
+        swap_total_bytes: 0,
+        swap_free_bytes: 0,
+        loadavg_1: loads.0,
+        loadavg_5: loads.1,
+        loadavg_15: loads.2,
+        cpu_pct: Some(0.0),
+        per_core_pct: vec![],
     }
 }
