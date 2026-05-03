@@ -1,8 +1,12 @@
-//! elf.rs — ELF section parser for Go/Rust detection.
-//! Linux: reads ELF from `/proc/<pid>/exe`. macOS: not implemented (returns None).
+//! elf.rs — ELF (Linux) / Mach-O (macOS) parser for Go/Rust detection.
+//! Linux: reads ELF from `/proc/<pid>/exe`. macOS: reads Mach-O from exe path.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -267,6 +271,38 @@ mod tests {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn detect_native_lang(_exe_path: &Path) -> Option<Lang> {
+pub(crate) fn detect_native_lang(exe_path: &Path) -> Option<Lang> {
+    // macOS Mach-O parsing for Go/Rust detection
+    let mut f = std::fs::File::open(exe_path).ok()?;
+    let mut hdr = [0u8; 32];
+    f.read_exact(&mut hdr).ok()?;
+
+    // Mach-O magic: 0xFEEDFACE (32-bit) or 0xFEEDFACF (64-bit)
+    let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if magic != 0xFEEDFACE && magic != 0xFEEDFACF {
+        return None;
+    }
+
+    // Read first 8KB of file for string search
+    let mut buf = vec![0u8; 8192];
+    if f.read_exact(&mut buf).is_err() {
+        return None;
+    }
+
+    // Go detection: look for common Go runtime strings
+    if contains(&buf, b"go.buildid")
+        || contains(&buf, b"runtime.g")
+        || contains(&buf, b"runtime.main")
+        || contains(&buf, b"Go build ID")
+    {
+        return Some(Lang::Go);
+    }
+
+    // Rust detection: look for common Rust std strings
+    if contains(&buf, b"library/std/src/") || contains(&buf, b"/rustc/") || contains(&buf, b"std::")
+    {
+        return Some(Lang::Rust);
+    }
+
     None
 }

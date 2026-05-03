@@ -1,5 +1,5 @@
 //! temp.rs — hwmon temperature readout.
-//! Linux: `/sys/class/hwmon`. macOS: not implemented (returns empty).
+//! Linux: `/sys/class/hwmon`. macOS: requires `IOKit` (not implemented).
 
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]

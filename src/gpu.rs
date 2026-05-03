@@ -1,5 +1,5 @@
-//! gpu.rs — discrete + integrated GPU stats.
-//! Linux: sysfs + NVML. macOS: NVML only (returns empty if unavailable).
+//! gpu.rs — GPU detection and activity reporting.
+//! Linux: `/sys/class/drm` + NVML. macOS: requires IOKit/Metal (not implemented).
 
 use std::collections::HashMap;
 use std::fs;

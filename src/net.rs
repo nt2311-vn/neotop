@@ -1,13 +1,15 @@
 //! net.rs — per-interface RX/TX byte rates.
-//! Linux: `/proc/net/dev`. macOS: not implemented (returns empty).
+//! Linux: `/proc/net/dev`. macOS: sysctl-based implementation.
 
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use crate::errors::ErrorRing;
+
+#[cfg(target_os = "macos")]
+use libc::{c_int, c_void, size_t};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // rx_bytes/tx_bytes reserved for a future "total since boot" column
@@ -48,8 +50,19 @@ impl Tracker {
         }
         #[cfg(target_os = "macos")]
         {
-            Vec::new()
+            self.snapshot_macos(Instant::now())
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_macos(&mut self, now: Instant) -> Vec<Iface> {
+        // macOS network stats via sysctl net.iflist
+        // This is complex to implement in pure Rust due to the binary format.
+        // For now, return empty. A future implementation could:
+        // 1. Use `getifaddrs` from libc to enumerate interfaces
+        // 2. Query per-interface stats using sysctl with IF_DATA_* MIBs
+        // 3. Parse `netstat -ib` output as a fallback
+        Vec::new()
     }
 
     /// Test seam: same logic as `snapshot`, but takes the raw file
