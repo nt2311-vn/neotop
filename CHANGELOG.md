@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.1] — 2026-04-26
+### CD: manual crates.io publishing
+
+- **`.github/workflows/release.yml`** — new release workflow (manual trigger
+  only). Repo owner goes to Actions → Release → Run workflow.
+  - Input: git tag (e.g., `v0.21.0`).
+  - Runs: verify → publish → GitHub release.
+  - Publishes to crates.io using `CARGO_REGISTRY_TOKEN` secret.
+  - Creates GitHub release with changelog excerpt.
+
+### CI: security checks moved to separate workflow
+
+- **`.github/workflows/security.yml`** — new dedicated security workflow
+  running in parallel with CI. Contains: `cargo audit`, `cargo deny`,
+  Semgrep SAST. Also adds weekly scheduled scans (Monday 6 AM UTC).
+- **`.github/workflows/ci.yml`** — removed the inline `security` job,
+  kept `check` (Linux + macOS build matrix) focused on build/test.
+
+## [0.21.0]
+
+### macOS support foundation
+
+Cross-platform compilation infrastructure. The codebase now compiles on
+macOS (verified in CI), with platform-specific modules providing OS-native
+implementations:
+
+- **Platform abstraction**: Modules conditionally compiled for Linux vs macOS:
+  - Linux-only: `kvm`, `passthrough`, `vm`, `vcpus` (KVM has no macOS equivalent)
+  - Cross-platform: `host`, `procs`, `gpu`, `net`, `disk`, `temp`, `battery`
+- **CI**: New `check-macos` job verifies the build on `macos-latest` runner.
+  Marked `continue-on-error: true` while stubs are being implemented.
+- **Dependencies**: `rustix` moved to Linux-specific; `libc` added for macOS.
+- **Documentation**: README updated to reflect cross-platform status.
+
+Linux retains full functionality; macOS stubs return empty data for now.
+
+## [0.20.1]
 
 ### crates.io release prep
 
@@ -101,7 +136,7 @@ CodeQL run.
 (176 tests) all clean. `actionlint` clean on the two patched
 workflows.
 
-## [0.20.0] — 2026-04-26
+## [0.20.0]
 
 ### Public-repo hardening — CODEOWNERS + CodeQL + Scorecard + Dependabot
 
@@ -255,7 +290,7 @@ case → 80%), the over-report clamp (RC6 delta exceeds wallclock
 delta → 0%), and the skip-on-counter-reset / zero-window guards.
 176 tests passing total.
 
-## [0.18.1] — 2026-04-26
+## [0.18.1]
 
 ### CI green again
 
@@ -353,7 +388,7 @@ GitHub Actions jobs which had drifted on two fronts:
 No behavior change. 166 tests still pass. CI matrix updated to
 test `stable + 1.88` instead of `stable + 1.80`.
 
-## [0.17.0] — 2026-04-26
+## [0.17.0]
 
 ### Group view: per-app sub-buckets inside the runtime band
 
@@ -401,7 +436,7 @@ compiled-language argv0 basename, the empty-app fallback, and a
 regression test confirming two distinct Rust binaries produce
 different `sort_key`s (the bug this commit fixes).
 
-## [0.16.0] — 2026-04-26
+## [0.16.0]
 
 ### VM Phase 3 — KVM exit counters
 
@@ -549,7 +584,7 @@ When a VM PID is selected, the detail pane now shows a
 6 unit tests pin the comm-pattern parser for all five hypervisors
 plus a "rejects unrelated threads" case.
 
-## [0.14.0] — 2026-04-25
+## [0.14.0]
 
 ### Group view sorts by aggregate CPU / MEM
 
@@ -1211,7 +1246,7 @@ power draw, all 1 Hz alongside the rest.
 - Themes / TOML config.
 - macOS / Windows ports.
 
-## [0.8.0] — 2026-04-25
+## [0.8.0]
 
 The "charts worth a thousand words" release. The user asked for
 GPU metrics and for charts that surface what `htop`, `btm`, and
@@ -1284,7 +1319,7 @@ GPU metrics and for charts that surface what `htop`, `btm`, and
 - Per-core CPU heatmap (cores × time grid) — the other "thousand
   words" chart left on the whiteboard.
 
-## [0.7.0] — 2026-04-25
+## [0.7.0]
 
 The "refined product" release. The user reported `neotop` "feels
 like a chart bitcoin or something" — too fast to read — and asked
@@ -1622,7 +1657,7 @@ replaced with sensible defaults and three new host-level signals.
   shape, `snapshot_from_str` rate computation, `highlights`
   ordering, and `human_rate` formatting.
 
-## [0.1.0] — 2026-04-25
+## [0.1.0]
 
 The first daily-driver release. neotop now passes the bar laid out in
 `PLAN.md`: a responsive quit, host signals at a glance, a process view

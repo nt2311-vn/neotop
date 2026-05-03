@@ -1,0 +1,100 @@
+name: release
+
+# Manual trigger only — only repo owners can deploy to crates.io.
+# Go to Actions → Release → Run workflow, select a tag.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.21.0)'
+        required: true
+        type: string
+
+# Sequential releases — don't cancel in-progress, just queue.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Run full test suite before publishing.
+  # Tags can be pushed from any branch, so we verify here.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --locked
+
+  # Publish to crates.io using API token.
+  # Set CARGO_REGISTRY_TOKEN in repo secrets.
+  publish:
+    name: publish-to-crates-io
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: cargo publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Create GitHub release with auto-generated notes.
+  github-release:
+    name: github-release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Extract version from input
+        id: get_version
+        run: echo "VERSION=${{ github.event.inputs.tag }}" | sed 's/^v//' >> "$GITHUB_OUTPUT"
+
+      # Extract changelog section for this version.
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          # Find the section for this version in CHANGELOG.md
+          awk "/^## \\[$VERSION\\]/ {found=1; next} /^## \\[/ {found=0} found" CHANGELOG.md > RELEASE_NOTES.md || true
+          # If empty, use generic message
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "See CHANGELOG.md for release notes." > RELEASE_NOTES.md
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
