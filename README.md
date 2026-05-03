@@ -7,8 +7,9 @@
 [![CodeQL](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml/badge.svg)](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
-A Linux terminal observer for **host metrics, processes, GPU
-activity, containers, and KVM virtual machines**. Designed to
+A cross-platform terminal observer for **host metrics, processes, GPU
+activity, containers, and KVM virtual machines**. Linux fully supported;
+macOS support actively in development. Designed to
 fill the gaps generic monitors (`htop`, `btop`, `btm`) leave open:
 per-core CPU spectrum charts, NVIDIA + AMD + Intel GPU activity
 (busy %, VRAM, watts), per-VM CPU sparklines with vCPU pinning
@@ -32,11 +33,7 @@ grouping by container / language runtime / system / native.
  ▼ native              (1843)      0.0%   nil
 ```
 
-**Linux only**, for now. Reads `/proc`, `/sys/class/hwmon`,
-`/sys/class/power_supply`, `/sys/class/drm`, and `/sys/fs/cgroup`
-directly — the same files `lm_sensors`, `nvidia-smi`, etc. read.
-macOS and Windows would need per-OS modules; PRs welcome — the
-codebase is split one module per data source.
+**Linux fully supported; macOS support in progress.** The Linux implementation reads `/proc`, `/sys/class/hwmon`, `/sys/class/power_supply`, `/sys/class/drm`, and `/sys/fs/cgroup` directly — the same files `lm_sensors`, `nvidia-smi`, etc. read. macOS uses `sysctl` and `mach` APIs; the abstraction layer compiles on both platforms, with data source modules providing platform-specific implementations.
 
 ## Install
 
@@ -175,12 +172,16 @@ Apache-2.0. See [`LICENSE`](LICENSE) for the full text.
 
 ## Roadmap
 
+Items in progress:
+
+- [x] macOS support — platform abstraction layer implemented, data sources in progress
+
 Items still open:
 
 - [ ] Themes / TOML config
 - [ ] Per-engine Intel GPU breakdown (rcs / bcs / vcs / vecs) — needs `CAP_PERFMON` and `i915_pmu` perf events
 - [ ] SMT / NUMA grouping in the spectrum view
-- [ ] macOS / Windows ports (per-OS modules)
+- [ ] Windows port
 
 Recently shipped (see [`CHANGELOG.md`](CHANGELOG.md) for the full
 history):
