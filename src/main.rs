@@ -18,19 +18,15 @@ mod errors;
 mod gpu;
 mod groups;
 mod host;
-#[cfg(target_os = "linux")]
 mod kvm;
 mod net;
-#[cfg(target_os = "linux")]
 mod passthrough;
 mod proc;
 mod procs;
 mod temp;
 mod theme;
 mod topology;
-#[cfg(target_os = "linux")]
 mod vcpus;
-#[cfg(target_os = "linux")]
 mod vm;
 
 use std::collections::{HashMap, VecDeque};
@@ -127,6 +123,7 @@ fn print_help() {
 }
 
 /// 60 samples × 1 s tick = last minute of CPU / MEM / NET / GPU history.
+#[cfg(target_os = "linux")]
 const CPU_HISTORY_CAP: usize = 60;
 
 /// Host-level history rings feeding the sparklines. `cpu`, `mem`,
