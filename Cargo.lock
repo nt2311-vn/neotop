@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "neotop"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "anyhow",
  "crossterm 0.29.0",
