@@ -206,6 +206,7 @@ impl Tracker {
         rows
     }
 
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_lines)]
     fn read_one(
         &mut self,
@@ -417,6 +418,7 @@ fn blend_rate(
 /// numbers `iotop` displays. Returns `(None, None)` when the file
 /// isn't readable: typical for processes owned by other users without
 /// `CAP_SYS_PTRACE`, and for kernel threads.
+#[cfg(target_os = "linux")]
 fn read_io_bytes(base: &str) -> (Option<u64>, Option<u64>) {
     let Ok(raw) = fs::read_to_string(format!("{base}/io")) else {
         return (None, None);
@@ -438,6 +440,7 @@ fn read_io_bytes(base: &str) -> (Option<u64>, Option<u64>) {
 /// to the task's real uid, so a single `stat(2)` is enough. Falls
 /// back to 0 (treated as root by the passwd cache) on any error —
 /// the pid probably just exited.
+#[cfg(target_os = "linux")]
 fn uid_from_proc_dir(base: &str) -> u32 {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(base).map_or(0, |m| m.uid())

@@ -9,8 +9,11 @@
 //! Only run for the *selected* VM each tick; scanning every VM
 //! every tick would balloon I/O on hosts running 50+ guests.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use crate::vm::Hypervisor;
@@ -22,18 +25,25 @@ pub(crate) struct VcpuStat {
     pub(crate) cpu_pct: Option<f64>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
     prev: HashMap<i32, Sample>,
     clk_tck: u64,
 }
 
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default)]
+pub(crate) struct Tracker;
+
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     when: Instant,
     jiffies: u64,
 }
 
+#[cfg(target_os = "linux")]
 impl Tracker {
     pub(crate) fn new(clk_tck: u64) -> Self {
         Self {
@@ -107,7 +117,18 @@ impl Tracker {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl Tracker {
+    pub(crate) fn new(_clk_tck: u64) -> Self {
+        Self
+    }
+    pub(crate) fn snapshot(&mut self, _pid: i32, _hv: Hypervisor) -> Vec<VcpuStat> {
+        Vec::new()
+    }
+}
+
 /// Read `/proc/<pid>/task/<tid>/comm`. Trims trailing newline.
+#[cfg(target_os = "linux")]
 fn read_comm(pid: i32, tid: i32) -> Option<String> {
     let raw = fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok()?;
     Some(raw.trim_end_matches('\n').to_string())
@@ -116,6 +137,7 @@ fn read_comm(pid: i32, tid: i32) -> Option<String> {
 /// Read `utime + stime` from `/proc/<pid>/task/<tid>/stat`. Same
 /// format as `/proc/<pid>/stat`; we split *after* the last `)`
 /// because `comm` itself can contain whitespace or parens.
+#[cfg(target_os = "linux")]
 fn read_thread_jiffies(pid: i32, tid: i32) -> Option<u64> {
     let raw = fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
     let rparen = raw.rfind(')')?;

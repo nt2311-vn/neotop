@@ -94,6 +94,7 @@ pub(crate) fn snapshot(pid: i64) -> Option<Snapshot> {
 // /proc/<pid>/cgroup  +  /sys/fs/cgroup/<path>/memory.{current,max}
 // -----------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn read_cgroup(pid: i64) -> Option<Cgroup> {
     let raw = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     // cgroup v2 line: `0::<path>`. v1 lines look like `<id>:<ctrl>:<path>`.
@@ -135,6 +136,7 @@ fn read_cgroup(pid: i64) -> Option<Cgroup> {
 // /proc/<pid>/stat
 // -----------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn read_stat(pid: i64) -> Option<Stat> {
     let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
 
@@ -177,6 +179,7 @@ fn read_stat(pid: i64) -> Option<Stat> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn describe_state(c: char) -> String {
     let name = match c {
         'R' => "running",
@@ -196,6 +199,7 @@ fn describe_state(c: char) -> String {
 // /proc/<pid>/status  (for VmRSS / VmSize)
 // -----------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn read_mem(pid: i64) -> Option<Mem> {
     let raw = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     Some(Mem {
@@ -204,6 +208,7 @@ fn read_mem(pid: i64) -> Option<Mem> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn kb_line(status: &str, key: &str) -> Option<u64> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix(key) {
@@ -218,6 +223,7 @@ fn kb_line(status: &str, key: &str) -> Option<u64> {
 // /proc/<pid>/limits  (fixed-column table)
 // -----------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn read_limits(pid: i64) -> Option<Vec<LimitRow>> {
     let raw = fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
     let mut lines = raw.lines();
@@ -281,6 +287,7 @@ pub(crate) fn human_bytes(n: u64) -> String {
 
 /// Cumulative `utime + stime` in clock ticks for *this* process. Used
 /// by the perf footer to compute its own CPU%.
+#[cfg(target_os = "linux")]
 pub(crate) fn self_jiffies() -> Option<u64> {
     let raw = fs::read_to_string("/proc/self/stat").ok()?;
     let rparen = raw.rfind(')')?;
@@ -294,9 +301,20 @@ pub(crate) fn self_jiffies() -> Option<u64> {
 /// `VmRSS` for the current process, in bytes. Returns `None` if the
 /// field is missing — should never happen on Linux but the parser is
 /// robust to it.
+#[cfg(target_os = "linux")]
 pub(crate) fn self_rss_bytes() -> Option<u64> {
     let raw = fs::read_to_string("/proc/self/status").ok()?;
     kb_line(&raw, "VmRSS:")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn self_jiffies() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn self_rss_bytes() -> Option<u64> {
+    None
 }
 
 /// Compact limit value: "unlimited" stays short; pure numbers get byte

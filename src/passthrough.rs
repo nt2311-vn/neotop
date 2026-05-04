@@ -26,7 +26,9 @@
 //! contract. The existing `net::Iface` byte-rate is already a good
 //! proxy for "is the guest's NIC busy".
 
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 /// Snapshot of everything passthrough-related for one VM PID.
@@ -120,6 +122,7 @@ impl VhostKind {
 /// (`readlink`) plus a constant amount of work per unique device,
 /// so a VM with 5 VFIO devices and 2 NICs costs maybe 30 syscalls
 /// total — easily affordable on a 1 Hz selection refresh.
+#[cfg(target_os = "linux")]
 pub(crate) fn snapshot(pid: i32) -> Passthrough {
     let fd_dir = format!("/proc/{pid}/fd");
     let Ok(entries) = fs::read_dir(&fd_dir) else {
@@ -199,6 +202,12 @@ pub(crate) fn snapshot(pid: i32) -> Passthrough {
 /// `/proc/<pid>/fdinfo/<fd>` holds key:value lines. Tap fds carry
 /// `iff:<ifname>`. Returns `None` when the file is gone (race) or
 /// the line is missing (unlikely on a real tun fd).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn snapshot(_pid: i32) -> Passthrough {
+    Passthrough::default()
+}
+
+#[cfg(target_os = "linux")]
 fn read_tap_name_from_fdinfo(path: &str) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     for line in raw.lines() {
@@ -216,6 +225,7 @@ fn read_tap_name_from_fdinfo(path: &str) -> Option<String> {
 /// kernel exposes the group's members as symlinks under
 /// `/sys/kernel/iommu_groups/<N>/devices/`; the link names are the
 /// PCI BDFs themselves.
+#[cfg(target_os = "linux")]
 fn read_iommu_group_devices(group_id: u32) -> Vec<PciDevice> {
     let dir = format!("/sys/kernel/iommu_groups/{group_id}/devices");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -234,6 +244,7 @@ fn read_iommu_group_devices(group_id: u32) -> Vec<PciDevice> {
     devices
 }
 
+#[cfg(target_os = "linux")]
 fn read_pci_device(bdf: &str) -> PciDevice {
     let base = format!("/sys/bus/pci/devices/{bdf}");
     let vendor = read_hex16(&format!("{base}/vendor"));
@@ -250,12 +261,14 @@ fn read_pci_device(bdf: &str) -> PciDevice {
 
 /// Read a `0xABCD\n` hex file to a `u16`; returns 0 on any error.
 /// PCI sysfs entries are always exactly that shape.
+#[cfg(target_os = "linux")]
 fn read_hex16(path: &str) -> u16 {
     let raw = fs::read_to_string(Path::new(path)).unwrap_or_default();
     let s = raw.trim().trim_start_matches("0x");
     u16::from_str_radix(s, 16).unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn read_hex32(path: &str) -> u32 {
     let raw = fs::read_to_string(Path::new(path)).unwrap_or_default();
     let s = raw.trim().trim_start_matches("0x");

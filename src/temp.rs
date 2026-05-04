@@ -1,12 +1,12 @@
 //! temp.rs — hwmon temperature readout.
 //! Linux: `/sys/class/hwmon`. macOS: requires `IOKit` (not implemented).
 
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
 use std::sync::mpsc;
 #[cfg(target_os = "linux")]
 use std::thread;
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 /// takes <1 ms. The threshold only catches genuinely broken cases
 /// like `acpitz` on HP/Dell laptops where a single read costs
 /// hundreds of milliseconds.
+#[cfg(target_os = "linux")]
 const SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub(crate) struct Reading {
 /// Adaptive temperature scanner. Holds the set of hwmon device
 /// paths that have been observed to scan slowly (see module-level
 /// comment); skips them on every subsequent call.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
     parked: HashSet<PathBuf>,
@@ -52,6 +54,7 @@ pub(crate) struct ScanReport {
     pub(crate) errors: Vec<(&'static str, String)>,
 }
 
+#[cfg(target_os = "linux")]
 impl Tracker {
     /// Single hwmon walk. Returns readings plus collected errors
     /// (parked-sensor notifications, missing `/sys/class/hwmon`,
@@ -223,6 +226,7 @@ impl TempWorker {
 /// individual sensors are silent — sysfs entries can disappear
 /// (e.g. an `NVMe` is yanked) and we don't want to spam the error
 /// ring for races.
+#[cfg(target_os = "linux")]
 fn scan_one_hwmon(hwmon_path: &std::path::Path, out: &mut Vec<Reading>) {
     let group = read_trim(&hwmon_path.join("name")).unwrap_or_else(|| "?".into());
     let Ok(files) = fs::read_dir(hwmon_path) else {
@@ -301,6 +305,7 @@ fn group_of(label: &str) -> &str {
     label.split_whitespace().next().unwrap_or(label)
 }
 
+#[cfg(target_os = "linux")]
 fn read_trim(path: &std::path::Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -385,6 +390,7 @@ mod tests {
         assert_eq!(highlights(&readings, 0).len(), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn temp_worker_initial_readings_are_empty_until_first_poll() {
         // The worker starts with an empty cache. After spawn() but
@@ -396,6 +402,7 @@ mod tests {
         assert!(worker.readings().is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn temp_worker_poll_returns_results_after_request() {
         // Fire a request, then poll until either the worker
@@ -421,6 +428,7 @@ mod tests {
         panic!("temp worker did not respond within 15 s");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn temp_worker_request_is_idempotent_while_in_flight() {
         // Calling request() many times before the worker has
@@ -447,6 +455,7 @@ mod tests {
         assert!(responses <= 1, "expected at most one coalesced response");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tracker_skips_already_parked_paths() {
         // Synthetic test: pre-populate the tracker's parked set with

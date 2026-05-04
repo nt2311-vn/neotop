@@ -29,18 +29,24 @@
 //! the UI falls back to "—". No errors are logged — this is the
 //! expected case for non-root users.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 /// Root of the KVM debugfs tree. Compile-time constant so the
 /// tracker can refuse to do anything when feature-detect fails.
+#[cfg(target_os = "linux")]
 const KVM_ROOT: &str = "/sys/kernel/debug/kvm";
 
 /// Counter files we care about. Each is a tiny single-integer file
 /// in the per-VM directory. Order matches `KvmCounts` field order
 /// so we can index into a fixed-size sample array.
+#[cfg(target_os = "linux")]
 const COUNTER_FILES: [&str; 5] = [
     "exits",
     "mmio_exits",
@@ -75,18 +81,18 @@ pub(crate) struct KvmRates {
     pub(crate) irq_injections: f64,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
-    /// Previous (sample time, counters) per VM pid. Cleared lazily
-    /// when a snapshot can't find the pid's debugfs dir anymore
-    /// (guest rebooted, qemu exited).
     prev: HashMap<i32, (Instant, KvmCounts)>,
-    /// `false` when `/sys/kernel/debug/kvm` isn't readable. Set
-    /// once at construction so the per-tick path is a single bool
-    /// check, not a syscall, on the common non-root case.
     available: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default)]
+pub(crate) struct Tracker;
+
+#[cfg(target_os = "linux")]
 impl Tracker {
     /// Probe for debugfs availability. The check is a single
     /// `read_dir` on `KVM_ROOT` — succeeds when the kernel has
@@ -138,9 +144,24 @@ impl Tracker {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl Tracker {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+    pub(crate) fn is_available(&self) -> bool {
+        false
+    }
+    pub(crate) fn snapshot(&mut self, _pid: i32) -> Option<KvmRates> {
+        None
+    }
+    pub(crate) fn purge_dead(&mut self, _alive_pids: &[i32]) {}
+}
+
 /// Locate the per-VM debugfs directory for `pid`. KVM names them
 /// `<pid>-<inode>`; we match the prefix because `<inode>` rotates
 /// across guest reboots and we don't want to stat every entry.
+#[cfg(target_os = "linux")]
 fn find_vm_dir(pid: i32) -> Option<PathBuf> {
     let entries = fs::read_dir(KVM_ROOT).ok()?;
     let prefix = format!("{pid}-");
@@ -160,6 +181,7 @@ fn find_vm_dir(pid: i32) -> Option<PathBuf> {
 /// missing or unparseable file degrades to 0 for that field rather
 /// than failing the whole snapshot — kernel versions vary in which
 /// counters they expose, and we'd rather show 4-of-5 than nothing.
+#[cfg(target_os = "linux")]
 fn read_counts(dir: &Path) -> Option<KvmCounts> {
     let mut vals = [0u64; COUNTER_FILES.len()];
     let mut any_read = false;

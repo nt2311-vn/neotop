@@ -63,6 +63,7 @@ pub(crate) struct CpuSamples {
     pub(crate) per_core: Vec<CpuSample>,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn read_cpu_samples(errors: &mut ErrorRing) -> CpuSamples {
     match fs::read_to_string("/proc/stat") {
         Ok(r) => parse_cpu_samples(&r),
@@ -135,6 +136,7 @@ fn delta_pct(prev: CpuSample, cur: CpuSample) -> Option<f64> {
     Some(pct)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> HostInfo {
     let cur = read_cpu_samples(errors);
 
@@ -208,28 +210,33 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
 // against canned fixture strings without root or a Linux kernel.
 // -----------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn read_kernel() -> Option<String> {
     fs::read_to_string("/proc/version")
         .ok()
         .and_then(|s| parse_kernel(&s))
 }
 
+#[cfg(target_os = "linux")]
 fn read_cpu_count() -> usize {
     fs::read_to_string("/proc/cpuinfo").map_or(0, |s| parse_cpu_count(&s))
 }
 
+#[cfg(target_os = "linux")]
 fn read_cpu_model() -> Option<String> {
     fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| parse_cpu_model(&s))
 }
 
+#[cfg(target_os = "linux")]
 fn read_meminfo_kb(key: &str) -> Option<u64> {
     fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| parse_meminfo_kb(&s, key))
 }
 
+#[cfg(target_os = "linux")]
 fn read_loadavg() -> Option<(f64, f64, f64)> {
     fs::read_to_string("/proc/loadavg")
         .ok()
