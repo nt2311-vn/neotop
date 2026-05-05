@@ -123,7 +123,6 @@ fn print_help() {
 }
 
 /// 60 samples × 1 s tick = last minute of CPU / MEM / NET / GPU history.
-#[cfg(target_os = "linux")]
 const CPU_HISTORY_CAP: usize = 60;
 
 /// Host-level history rings feeding the sparklines. `cpu`, `mem`,
@@ -371,6 +370,7 @@ impl KillSig {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn signal(self) -> rustix::process::Signal {
         match self {
             Self::Term => rustix::process::Signal::Term,
@@ -1433,6 +1433,12 @@ fn handle_filter_key(app: &mut App, k: crossterm::event::KeyEvent) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn handle_confirm_key(app: &mut App, _k: crossterm::event::KeyEvent, _sig: KillSig) {
+    app.input = InputMode::Normal;
+}
+
+#[cfg(target_os = "linux")]
 fn handle_confirm_key(app: &mut App, k: crossterm::event::KeyEvent, sig: KillSig) {
     match k.code {
         KeyCode::Char('y' | 'Y') => {

@@ -442,7 +442,7 @@ mod macos {
             1,
             &mut value as *mut _ as *mut libc::c_void,
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         );
         value
@@ -458,7 +458,7 @@ mod macos {
             1,
             &mut value as *mut _ as *mut libc::c_void,
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         );
         value
@@ -469,12 +469,13 @@ mod macos {
     /// MIB slice is borrowed for the call duration only.
     unsafe fn sysctl_str(mib: &[i32]) -> String {
         let mut len: libc::size_t = 0;
+        let mib_ptr = mib.as_ptr().cast_mut();
         libc::sysctl(
-            mib.as_ptr(),
+            mib_ptr,
             mib.len() as libc::c_uint,
             std::ptr::null_mut(),
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         );
         if len == 0 {
@@ -482,14 +483,14 @@ mod macos {
         }
         let mut buf = vec![0u8; len];
         libc::sysctl(
-            mib.as_ptr(),
+            mib_ptr,
             mib.len() as libc::c_uint,
             buf.as_mut_ptr() as *mut libc::c_void,
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         );
-        String::from_utf8_lossy(&buf[..len - 1]).to_string()
+        String::from_utf8_lossy(&buf[..len.saturating_sub(1)]).to_string()
     }
 
     pub(crate) fn read_cpu_count_macos() -> usize {
@@ -507,13 +508,13 @@ mod macos {
         unsafe {
             let mut load: [libc::c_double; 3] = [0.0; 3];
             let mut len = std::mem::size_of_val(&load) as libc::size_t;
-            let mib = [CTL_VM, VM_LOADAVG];
+            let mut mib = [CTL_VM, VM_LOADAVG];
             libc::sysctl(
-                mib.as_ptr(),
+                mib.as_mut_ptr(),
                 mib.len() as libc::c_uint,
                 load.as_mut_ptr() as *mut libc::c_void,
                 &mut len,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 0,
             );
             (load[0], load[1], load[2])
@@ -533,25 +534,25 @@ mod macos {
         // SAFETY: two-pass `sysctl` with a correctly-sized `Vec<u8>` buffer.
         unsafe {
             let mut len: libc::size_t = 0;
-            let mib = [CTL_HW, 0x10000002u32 as i32]; // HW_MACHINE
+            let mut mib = [CTL_HW, 0x10000002u32 as i32]; // HW_MACHINE
             libc::sysctl(
-                mib.as_ptr(),
+                mib.as_mut_ptr(),
                 mib.len() as libc::c_uint,
                 std::ptr::null_mut(),
                 &mut len,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 0,
             );
             let mut buf = vec![0u8; len];
             libc::sysctl(
-                mib.as_ptr(),
+                mib.as_mut_ptr(),
                 mib.len() as libc::c_uint,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 &mut len,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 0,
             );
-            String::from_utf8_lossy(&buf[..len - 1]).to_string()
+            String::from_utf8_lossy(&buf[..len.saturating_sub(1)]).to_string()
         }
     }
 }
