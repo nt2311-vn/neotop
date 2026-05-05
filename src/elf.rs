@@ -136,6 +136,7 @@ pub(crate) fn detect_native_lang(exe_path: &Path) -> Option<Lang> {
 /// This is the cheapest signal that holds even after stripping —
 /// the strings are still embedded because panic backtraces need
 /// them. We bail out as soon as we find a hit.
+#[cfg(target_os = "linux")]
 fn rust_in_rodata(f: &mut File, chunks: &[(u64, u64)]) -> bool {
     let mut budget = MAX_RODATA_SCAN;
     for (offset, size) in chunks {
@@ -165,6 +166,7 @@ fn rust_in_rodata(f: &mut File, chunks: &[(u64, u64)]) -> bool {
 /// unstripped binaries (debug builds, packagers that keep symbols),
 /// so stripped release Rust binaries already had to pass through
 /// pass two.
+#[cfg(target_os = "linux")]
 fn rust_in_symtab(f: &mut File, symtab: Option<(u64, u64)>, symstrtab: Option<(u64, u64)>) -> bool {
     let (Some((_, sym_size)), Some((str_off, str_size))) = (symtab, symstrtab) else {
         return false;

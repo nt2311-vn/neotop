@@ -122,8 +122,26 @@ impl Default for Tracker {
         Self {
             prev: HashMap::new(),
             cache: HashMap::new(),
-            page_size: u64::try_from(rustix::param::page_size()).unwrap_or(4096),
+            page_size: page_size_bytes(),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn page_size_bytes() -> u64 {
+    u64::try_from(rustix::param::page_size()).unwrap_or(4096)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn page_size_bytes() -> u64 {
+    // SAFETY: `sysconf` is async-signal-safe and returns a `long`.  A
+    // negative result (error) falls back to 4 KiB, which is the
+    // default page size on every macOS platform we support.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as u64
+    } else {
+        4096
     }
 }
 
@@ -483,7 +501,7 @@ pub(crate) struct PasswdCache {
 
 impl PasswdCache {
     pub(crate) fn load() -> Self {
-        fs::read_to_string("/etc/passwd")
+        std::fs::read_to_string("/etc/passwd")
             .map(|raw| Self::parse(&raw))
             .unwrap_or_default()
     }
@@ -836,76 +854,107 @@ impl Tracker {
 
         let pid = pid as libc::pid_t;
 
-        // SAFETY: same rationale as `snapshot_macos` in proc.rs —
-        // `proc_pidinfo` is a read-only kernel query with a correctly-sized
-        // output buffer; return ≤ 0 means pid gone / no permission.
+        // SAFETY: `proc_pidinfo` is a read-only kernel query.  We pass
+        // a zeroed output buffer of the correct size; the return value
+        // ≤ 0 means the pid is gone or we lack permission.  Two calls:
+        // PROC_PIDTASKINFO for memory + cpu ticks, PROC_PIDTBSDINFO for
+        // uid + ppid (proc_taskinfo does not expose those).
         unsafe {
-            let mut info: libc::proc_taskinfo = std::mem::zeroed();
-            let mut size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
-
+            let mut tinfo: libc::proc_taskinfo = std::mem::zeroed();
+            let tsize = std::mem::size_of::<libc::proc_taskinfo>() as i32;
             if libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDTASKINFO,
                 0,
-                &mut info as *mut _ as *mut c_void,
-                size,
+                std::ptr::addr_of_mut!(tinfo).cast::<c_void>(),
+                tsize,
             ) <= 0
             {
                 return None;
             }
 
-            let jiffies = (info.pti_total_user + info.pti_total_system) / 10000;
-            let prev = self.prev.get(&pid);
+            // Mach absolute-time units → roughly hundreds of ns.  10000 ≈
+            // 1 ms granularity, matching what `top(1)` shows on macOS.
+            let jiffies = (tinfo.pti_total_user + tinfo.pti_total_system) / 10_000;
 
-            let cpu_pct = if let Some(p) = prev {
-                if jiffies > p.jiffies {
-                    let delta = jiffies - p.jiffies;
-                    #[allow(clippy::cast_precision_loss)]
-                    let dt = now.duration_since(p.when).as_secs_f64();
-                    if dt > 0.0 {
-                        Some((delta as f64 / dt / clk_tck as f64) * 100.0)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            let cpu_pct = self.prev.get(&pid).and_then(|p| {
+                if jiffies <= p.jiffies {
+                    return None;
                 }
-            } else {
-                None
+                let delta = jiffies - p.jiffies;
+                let dt = now.duration_since(p.when).as_secs_f64();
+                if dt <= 0.0 {
+                    return None;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (delta as f64 / dt / clk_tck.max(1) as f64) * 100.0;
+                Some(pct)
+            });
+
+            let smoothed_cpu = match self.prev.get(&pid) {
+                Some(p) => ema_blend(p.smoothed_cpu, cpu_pct.unwrap_or(0.0)),
+                None => cpu_pct.unwrap_or(0.0),
             };
 
-            let smoothed_cpu = if let Some(p) = prev {
-                let pct = cpu_pct.unwrap_or(0.0);
-                blend_rate_smoothed(pct, p.smoothed_cpu)
+            let info_cache: StaticInfo = if let Some(cached) = self.cache.get(&pid) {
+                cached.clone()
             } else {
-                cpu_pct.unwrap_or(0.0)
-            };
+                let mut binfo: libc::proc_bsdinfo = std::mem::zeroed();
+                let bsize = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+                let bsd_ok = libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    std::ptr::addr_of_mut!(binfo).cast::<c_void>(),
+                    bsize,
+                ) > 0;
 
-            let info_cache = if let Some(cached) = self.cache.get(&pid) {
-                cached
-            } else {
-                let uid = info.pti_uid as u32;
+                let uid = if bsd_ok { binfo.pbi_uid } else { 0 };
                 let user = passwd.lookup(uid);
 
-                let mut pathbuf: [libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize] =
-                    [0; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-                libc::proc_pidpath(pid, pathbuf.as_mut_ptr(), pathbuf.len() as u32);
+                let mut pathbuf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                libc::proc_pidpath(
+                    pid,
+                    pathbuf.as_mut_ptr().cast::<c_void>(),
+                    pathbuf.len() as u32,
+                );
                 let command = if pathbuf[0] == 0 {
-                    format!("[pid:{}]", pid)
+                    format!("[pid:{pid}]")
                 } else {
-                    std::ffi::CStr::from_ptr(pathbuf.as_ptr())
+                    std::ffi::CStr::from_ptr(pathbuf.as_ptr().cast())
                         .to_string_lossy()
-                        .to_string()
+                        .into_owned()
                 };
+
+                let group = groups::classify_process(&command, None);
 
                 let static_info = StaticInfo {
                     uid,
                     user,
                     command,
-                    group: Group::Native,
+                    group,
                 };
                 self.cache.insert(pid, static_info.clone());
                 static_info
+            };
+
+            // ppid: re-read each tick (cheap, single syscall) — it can
+            // change on `setpgid` / re-parenting to launchd.
+            let ppid: i32 = {
+                let mut binfo: libc::proc_bsdinfo = std::mem::zeroed();
+                let bsize = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+                if libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    std::ptr::addr_of_mut!(binfo).cast::<c_void>(),
+                    bsize,
+                ) > 0
+                {
+                    binfo.pbi_ppid as i32
+                } else {
+                    0
+                }
             };
 
             let sample = Sample {
@@ -920,17 +969,17 @@ impl Tracker {
 
             let row = ProcessRow {
                 pid: pid as i32,
-                ppid: info.pti_ppid as i32,
+                ppid,
                 uid: info_cache.uid,
                 user: info_cache.user.clone(),
                 state: 'S',
                 cpu_pct,
-                rss_bytes: info.pti_resident_size as u64,
-                threads: info.pti_threadnum as i32,
+                rss_bytes: tinfo.pti_resident_size,
+                threads: tinfo.pti_threadnum,
                 read_bps: None,
                 write_bps: None,
                 command: info_cache.command.clone(),
-                group: info_cache.group,
+                group: info_cache.group.clone(),
             };
 
             Some((row, sample))

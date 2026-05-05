@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2] — macOS compile fix (verified)
+
+Patch release: `cargo install neotop` now succeeds on macOS
+(`aarch64-apple-darwin` and `x86_64-apple-darwin`).  Verified by
+cross-compiling with `cargo check --target aarch64-apple-darwin`
+and `cargo clippy --target aarch64-apple-darwin` on Linux CI.
+
+### Fixed
+
+- **`CPU_HISTORY_CAP`**: removed accidental Linux-only gate; it's
+  a plain `usize` constant referenced by cross-platform structs.
+- **`elf.rs`**: gated `rust_in_rodata` and `rust_in_symtab` to
+  Linux (they require `Seek`/`SeekFrom` which only the Linux
+  branch imports).
+- **`procs.rs`**:
+  - `Tracker::default()` no longer pulls `rustix::param::page_size`
+    on macOS; uses `libc::sysconf(_SC_PAGESIZE)` instead.
+  - `PasswdCache::load` uses `std::fs::read_to_string` directly
+    (the crate-level `fs` import is Linux-only).
+  - `read_one_macos` rewritten to use `proc_bsdinfo` (via
+    `PROC_PIDTBSDINFO`) for `uid` / `ppid` — the previous code
+    referenced fields that don't exist on `proc_taskinfo`.  Also
+    fixes `proc_pidpath` pointer cast (`*mut c_void`), borrow
+    issue on `static_info`, and replaces phantom
+    `blend_rate_smoothed` with the existing `ema_blend`.
+- **`host.rs`**: macOS `sysctl` calls now pass `*mut c_void`
+  (via `null_mut`) for `newp` and `*mut i32` (via `cast_mut`)
+  for `mib` — required by Apple's signature.
+- **`main.rs`**: `KillSig::signal` and `handle_confirm_key` (both
+  use `rustix::process`) gated to Linux; macOS gets a no-op
+  `handle_confirm_key` stub so the cross-platform `handle_key`
+  dispatcher still compiles.
+
+### How to verify locally
+
+```sh
+rustup target add aarch64-apple-darwin
+cargo check --target aarch64-apple-darwin
+cargo clippy --target aarch64-apple-darwin
+```
+
+CI (`.github/workflows/ci.yml`) gained a `macos-cross-check` job
+that runs the same commands on every push.
+
+## [0.24.1] — macOS compile fix (initial pass, superseded by 0.24.2)
+
+Initial attempt to gate Linux-only code behind `#[cfg(target_os
+= "linux")]`.  Missed several macOS-specific bugs in the existing
+stub code; **use 0.24.2 instead**.
+
 ## [0.24.0]
 
 ### Intel GPU per-engine breakdown
