@@ -293,6 +293,7 @@ mod tests {
         assert!((r.exits - 0.0).abs() < 1e-9);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tracker_disabled_when_kvm_root_unreadable() {
         // On any host where /sys/kernel/debug/kvm isn't readable
@@ -306,6 +307,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn purge_dead_drops_pids_no_longer_alive() {
         let mut t = Tracker {

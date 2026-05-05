@@ -377,6 +377,7 @@ mod tests {
         assert!(p.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn read_hex16_parses_pci_sysfs_format() {
         // PCI sysfs files have the literal "0x10de\n" form. Robust

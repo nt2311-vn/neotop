@@ -225,6 +225,7 @@ ok:    100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0
         assert!(!skip_iface("enp0s3"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn snapshot_from_str_computes_rates_between_two_samples() {
         let mut t = Tracker::default();
