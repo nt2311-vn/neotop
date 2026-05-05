@@ -123,6 +123,7 @@ fn print_help() {
 }
 
 /// 60 samples × 1 s tick = last minute of CPU / MEM / NET / GPU history.
+#[cfg(target_os = "linux")]
 const CPU_HISTORY_CAP: usize = 60;
 
 /// Host-level history rings feeding the sparklines. `cpu`, `mem`,
