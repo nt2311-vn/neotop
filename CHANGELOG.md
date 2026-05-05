@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.3] — macOS CI fix (truly verified)
+
+Patch on top of 0.24.2.  After publishing 0.24.2 the macOS CI runner
+exposed two more failure modes that local `cargo check` missed
+because they only fire under the strict `RUSTFLAGS="-D warnings"`
+treatment CI applies:
+
+### Fixed
+
+- **Crate-level `unsafe_code` lint**: `Cargo.toml` sets
+  `[lints.rust] unsafe_code = "warn"`, and CI promotes warnings to
+  errors.  macOS support legitimately needs `unsafe` for `sysctl`
+  and `libproc` FFI.  Added a crate-root
+  `#![cfg_attr(not(target_os = "linux"), allow(unsafe_code, ...))]`
+  so the macOS degraded build doesn't trip the lint while Linux
+  keeps the full lint set enforced.
+- **Dead-code on macOS**: the entire `App` struct, draw
+  pipeline, and Linux-only helpers are unreachable on macOS (the
+  `main()` there exits at startup), so they trip
+  `dead_code` / `unused_imports` / `unused_variables` /
+  `unused_mut` under `-D warnings`.  Suppressed under the same
+  crate-level cfg-attr.
+- **Merge accident on `CPU_HISTORY_CAP`**: a back-merge from
+  main re-introduced the over-aggressive `#[cfg(target_os =
+  "linux")]` gate the 0.24.2 fix had removed.  Re-removed.
+- **Test-only Linux-specific surfaces**: `kvm.rs`,
+  `passthrough.rs`, `net.rs` had a few `#[test]` cases that
+  reference Linux-only struct fields / methods.  Each such test is
+  now `#[cfg(target_os = "linux")] #[test]`.
+
+### How CI now blocks regressions
+
+`.github/workflows/ci.yml`:
+
+- `check-macos` runs `cargo build --locked` + `cargo clippy
+  -- -D warnings` on `macos-latest`.  **Blocking** (no
+  `continue-on-error`).
+- `cross-check-darwin` runs the same checks against the
+  `aarch64-apple-darwin` target from a Linux runner — much
+  faster feedback for accidental regressions.
+
+To verify locally before tagging:
+
+```sh
+rustup target add aarch64-apple-darwin
+RUSTFLAGS="-D warnings" cargo clippy --target aarch64-apple-darwin --all-targets --locked -- -D warnings
+just check
+```
+
 ## [0.24.2] — macOS compile fix (verified)
 
 Patch release: `cargo install neotop` now succeeds on macOS
