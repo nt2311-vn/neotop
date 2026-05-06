@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] — process orbit, compact spectrum, Intel iGPU power
+
+Four additive features. No API or config breaks; existing
+`config.toml` files keep working untouched. **207 tests** pass on
+Linux; macOS cross-clippy still clean.
+
+### Added
+
+- **Process orbit chart** in the right-hand detail pane (active on
+  terminal width ≥ 110 and detail pane height ≥ 20). Top-12
+  processes by CPU% project onto an ellipse: angular slot is a
+  stable splitmix64 hash of the PID (so the same daemon lands at
+  the same clock position every tick), radius scales with CPU%,
+  glyph density picks `·` / `•` / `●` from CPU bands, and the
+  green→yellow→red colour ramp matches the per-core gauges. Newly-
+  spawned PIDs render bold for one tick. A 4-row legend below the
+  ring lists each process by **PID + binary basename + CPU% +
+  state char**, so two processes under `/usr/lib/...` no longer
+  collapse to the same string. New module `src/orbit.rs`, +11
+  unit tests.
+- **Per-core spectrum: 4 cols** (was 2). On wide terminals the
+  chart's vertical footprint halves — a 12-thread CPU drops from
+  6 rows to 3. Each per-core sparkline keeps the same fixed
+  label / pct / gauge budget; only the sparkline width shrinks.
+- **SMT-aware spectrum labels** — `c0a` / `c0b` for HT siblings
+  sharing a physical core, bare `c{n}` for single-threaded cores.
+  Format matches `lscpu`. Fits the existing 5-cell label budget
+  (overflows by one cell only on 100+-core SMT hosts). +3 unit
+  tests.
+- **Intel iGPU package power via RAPL** — populates `power_watts`
+  for Intel cards by reading `energy_uj` from the matching
+  `intel-rapl:N:M` `uncore` / `gt` subdomain (same source as
+  `intel_gpu_top`). Lazy domain discovery, graceful EACCES on the
+  common post-CVE-2020-8694 0400 mode, counter-wrap safe.
+  +3 unit tests. *Note: i915 PMU does not expose true per-engine
+  energy; package-level power is the closest available signal.*
+
+### Notes
+
+- The orbit chart and the spectrum 4-col change are pure UI
+  improvements — no new sysfs reads, no new threads.
+- Slow-tick cost added: one top-N selection over `procs_all`
+  (O(n log 12)) and a small PID-set diff per tick.
+
 ## [0.24.3] — macOS CI fix (truly verified)
 
 Patch on top of 0.24.2.  After publishing 0.24.2 the macOS CI runner
@@ -793,6 +837,53 @@ When a VM PID is selected, the detail pane now shows a
 
 6 unit tests pin the comm-pattern parser for all five hypervisors
 plus a "rejects unrelated threads" case.
+
+## [0.15.0]
+
+### Group view: drop misleading native/system aggregates
+
+The `native` and `system` bands no longer emit a synthetic banner row
+with aggregate CPU% / RSS. Those catch-all bands sum every static
+binary and kernel daemon on the host, so the totals dwarfed every real
+workload and read like one giant "native" workload that wasn't
+meaningful. Members of those bands now render as flush-left rows in
+the same band slot the banner would have occupied. Container, VM, and
+Runtime banners are unchanged — those *are* cohesive workloads.
+
+### Go / Rust runtime detection via ELF section probe
+
+`procs::Tracker` now ELF-inspects `/proc/<pid>/exe` when classification
+would otherwise fall through to `Native`, upgrading static Go and Rust
+binaries (which look identical at the cmdline level) into proper
+`Runtime` groups.
+
+- **`Lang::Go`**: detected by `.note.go.buildid` / `.gopclntab` /
+  `.go.buildinfo` section names.
+- **`Lang::Rust`**: detected by searching `.rodata*` for
+  `library/std/src/` or `/rustc/` panic-location strings (survive
+  stripping), with a symbol-table fallback (`_RNv` v0 mangling, legacy
+  `..llvm.` suffix) for unstripped binaries.
+
+The runtime label carries a one-token concurrency-model tag —
+`go [goroutines]`, `rust [async/threads]`, `java [vthreads]`,
+`node [event loop]`, `python [GIL+asyncio]`, `bun [event loop]`,
+`erlang [actors/BEAM]`, etc. — so the user can tell at a glance *how*
+a runtime spends its time, not just which one is running.
+
+New module `elf.rs` (~200 LOC, safe Rust, no new crates) holds the
+ELF64 LE parser. Detection is a one-shot O(K) read amortised across
+the lifetime of the pid, cached alongside cmdline + cgroup in
+`procs::StaticInfo`. Steady-state CPU cost is zero. 8 unit tests cover
+the substring search, the name-table walker, and the I/O failure
+paths.
+
+## [0.14.1]
+
+### Fixed
+
+- Polish on top of 0.14.0: GPU chart layout improvements, broader
+  dashboard layout tuning, and continued scaffolding for the VM
+  support work that lands in 0.15.0 / 0.16.0.
 
 ## [0.14.0]
 
@@ -1930,7 +2021,28 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/nt2311-vn/neotop/compare/v0.24.3...v0.25.0
+[0.24.3]: https://github.com/nt2311-vn/neotop/compare/v0.24.2...v0.24.3
+[0.24.2]: https://github.com/nt2311-vn/neotop/compare/v0.24.1...v0.24.2
+[0.24.1]: https://github.com/nt2311-vn/neotop/compare/v0.24.0...v0.24.1
+[0.24.0]: https://github.com/nt2311-vn/neotop/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/nt2311-vn/neotop/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/nt2311-vn/neotop/compare/v0.21.1...v0.22.0
+[0.21.1]: https://github.com/nt2311-vn/neotop/compare/v0.21.0...v0.21.1
+[0.21.0]: https://github.com/nt2311-vn/neotop/compare/v0.20.1...v0.21.0
+[0.20.1]: https://github.com/nt2311-vn/neotop/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/nt2311-vn/neotop/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/nt2311-vn/neotop/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/nt2311-vn/neotop/compare/v0.18.1...v0.19.0
+[0.18.1]: https://github.com/nt2311-vn/neotop/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/nt2311-vn/neotop/compare/v0.17.1...v0.18.0
+[0.17.1]: https://github.com/nt2311-vn/neotop/compare/v0.17.0...v0.17.1
+[0.17.0]: https://github.com/nt2311-vn/neotop/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/nt2311-vn/neotop/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/nt2311-vn/neotop/compare/v0.14.1...v0.15.0
+[0.14.1]: https://github.com/nt2311-vn/neotop/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/nt2311-vn/neotop/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/nt2311-vn/neotop/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nt2311-vn/neotop/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/nt2311-vn/neotop/compare/v0.10.0...v0.11.0

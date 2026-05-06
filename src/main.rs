@@ -38,6 +38,7 @@ mod groups;
 mod host;
 mod kvm;
 mod net;
+mod orbit;
 mod passthrough;
 mod proc;
 mod procs;
@@ -453,6 +454,16 @@ struct App {
     host_history: HostHistory,
     cpu_topology: topology::CpuTopology,
 
+    /// Top-N processes projected onto the orbit chart shown in the
+    /// detail pane (right column on wide terminals). Rebuilt every
+    /// slow tick from `procs_all` so it shares cadence with the
+    /// other slow trackers.
+    orbit_frame: orbit::OrbitFrame,
+    /// PID set from the previous orbit frame. Diffed against the
+    /// new top-N to populate `orbit_frame.new_pids`, which the
+    /// renderer uses to bold-pulse newly-spawned processes.
+    orbit_prev_pids: std::collections::HashSet<i32>,
+
     // Per-vCPU tracker; only snapshot for the *selected* VM each
     // tick so a host with 50+ guests doesn't melt /proc.
     vcpu_tracker: vcpus::Tracker,
@@ -565,6 +576,8 @@ impl App {
             gpus,
             host_history: HostHistory::default(),
             cpu_topology: topology::CpuTopology::read(),
+            orbit_frame: orbit::OrbitFrame::default(),
+            orbit_prev_pids: std::collections::HashSet::new(),
             vcpu_tracker: vcpus::Tracker::new(clk_tck),
             selected_vcpus: Vec::new(),
             kvm_tracker: kvm::Tracker::new(),
@@ -641,6 +654,12 @@ impl App {
         // sticks to the same process when sort/filter reshuffles.
         let prev_selected_pid = self.selected_proc().map(|r| r.pid);
         self.procs_all = self.procs_tracker.snapshot(&self.passwd, self.clk_tck);
+        // Rebuild the orbit frame off the freshly-snapshotted procs.
+        // Cheap: top-N selection over `procs_all` once per tick,
+        // PID set diff for the bold-pulse.
+        let new_orbit = orbit::OrbitFrame::build(&self.procs_all, &self.orbit_prev_pids);
+        self.orbit_prev_pids = new_orbit.pid_set();
+        self.orbit_frame = new_orbit;
         self.recompute_procs();
         self.reanchor_proc_selection(prev_selected_pid);
         self.clamp_selections();
@@ -1611,6 +1630,7 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = f.area();
     let percore_h = percore_height(
@@ -1700,9 +1720,23 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
             .split(body);
         let selected_pid = app.selected_proc().map(|r| i64::from(r.pid));
         draw_proc_table(f, split[0], app);
+        // Top of the detail column hosts the process-orbit chart;
+        // detail proper sits below. 14 rows = 2 borders + 8 ring
+        // + 4 legend rows; hide the orbit on terminals that can't
+        // spare that plus a usable detail body.
+        let detail_area = if split[1].height >= 20 {
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(14), Constraint::Min(6)])
+                .split(split[1]);
+            draw_proc_orbit(f, v[0], &app.orbit_frame, &app.theme);
+            v[1]
+        } else {
+            split[1]
+        };
         draw_proc_detail(
             f,
-            split[1],
+            detail_area,
             selected_pid,
             app.selected_proc(),
             &app.container_names,
@@ -1781,6 +1815,7 @@ const SPECTRUM_FIXED_W: u16 = SPECTRUM_LABEL_W + SPECTRUM_PCT_W + SPECTRUM_GAUGE
 /// The last row of the panel is reserved for a thin time-axis
 /// tick label (`-Ns ──── now`) so a new user instantly sees the
 /// chart's reach.
+#[allow(clippy::too_many_lines)]
 fn draw_per_core_spectrum(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -1828,13 +1863,21 @@ fn draw_per_core_spectrum(
                 rows_used += 1;
             }
             // Flatten SMT groups: each group may have 1 (no HT) or 2+ logical CPUs.
-            let flat: Vec<(usize, usize)> = smt_groups
+            // The sibling letter is `Some(idx)` only when the group has >1
+            // sibling — single-threaded cores keep the bare `c{n}` label so
+            // the suffix unambiguously means "this share a physical core".
+            let flat: Vec<(usize, Option<u8>)> = smt_groups
                 .iter()
                 .flat_map(|group| {
-                    group
-                        .iter()
-                        .enumerate()
-                        .map(|(sib_idx, &cpu)| (cpu, sib_idx))
+                    let smt = group.len() > 1;
+                    group.iter().enumerate().map(move |(sib_idx, &cpu)| {
+                        let sib = if smt {
+                            Some(u8::try_from(sib_idx).unwrap_or(u8::MAX))
+                        } else {
+                            None
+                        };
+                        (cpu, sib)
+                    })
                 })
                 .collect();
             let rows_needed = flat.len().div_ceil(cols);
@@ -1846,7 +1889,7 @@ fn draw_per_core_spectrum(
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 for c in 0..cols {
                     let idx = c * rows_needed + r;
-                    let Some(&(cpu, _sib)) = flat.get(idx) else {
+                    let Some(&(cpu, sib)) = flat.get(idx) else {
                         break;
                     };
                     if cpu >= rings.len() {
@@ -1857,6 +1900,7 @@ fn draw_per_core_spectrum(
                     }
                     spans.extend(spectrum_row_spans(
                         cpu,
+                        sib,
                         &rings[cpu],
                         live.get(cpu).copied(),
                         spark_w,
@@ -1883,6 +1927,7 @@ fn draw_per_core_spectrum(
                 }
                 spans.extend(spectrum_row_spans(
                     i,
+                    None,
                     &rings[i],
                     live.get(i).copied(),
                     spark_w,
@@ -1900,14 +1945,39 @@ fn draw_per_core_spectrum(
 /// Minimum sparkline width per column when rendering side-by-side.
 const SPECTRUM_MIN_SPARK: u16 = 12;
 
-/// How many cores fit side-by-side at this width (1 or 2).
+/// How many cores fit side-by-side at this width (1..=4).
 fn spectrum_cores_per_row(width: u16, num_cores: usize) -> usize {
     if num_cores <= 1 {
         return 1;
     }
     let one = u32::from(SPECTRUM_FIXED_W) + u32::from(SPECTRUM_MIN_SPARK);
     let fits = u32::from(width) / one.max(1);
-    fits.clamp(1, 2) as usize
+    fits.clamp(1, 4) as usize
+}
+
+/// Build the per-core spectrum row label. Format matches the
+/// `SPECTRUM_LABEL_W = 5` budget the layout was sized for:
+///
+/// - `None` → `" c{n}<2 "` — single-threaded core, e.g. `" c0  "`.
+/// - `Some(0)` / `Some(1)` → `c{n}a` / `c{n}b` — SMT siblings, e.g.
+///   `" c0a "`. Sibling letter `a` is the lowest-numbered logical
+///   CPU in the physical core, `b` the next, etc. Matches `lscpu`.
+///
+/// The inner string is left-padded to 4 chars so 1-digit CPU
+/// numbers ("c0a") and 2-digit ones ("c10a") both fit the 5-cell
+/// budget. 100+ cores with SMT overflow by one cell — accepted as
+/// a vanishing-rare case.
+fn core_label(cpu: usize, sib: Option<u8>) -> String {
+    let inner = match sib {
+        Some(s) => {
+            // Cap at 'z' so a 27-way SMT (impossible on real silicon)
+            // can't go past ASCII letters and corrupt the layout.
+            let letter = (b'a' + s.min(25)) as char;
+            format!("c{cpu}{letter}")
+        }
+        None => format!("c{cpu}"),
+    };
+    format!(" {inner:<4}")
 }
 
 #[cfg(test)]
@@ -1918,11 +1988,14 @@ fn spectrum_row(
     spark_w: usize,
     theme: &theme::Theme,
 ) -> Line<'static> {
-    Line::from(spectrum_row_spans(core_idx, ring, live_pct, spark_w, theme))
+    Line::from(spectrum_row_spans(
+        core_idx, None, ring, live_pct, spark_w, theme,
+    ))
 }
 
 fn spectrum_row_spans(
     core_idx: usize,
+    sib: Option<u8>,
     ring: &VecDeque<u64>,
     live_pct: Option<f64>,
     spark_w: usize,
@@ -1930,7 +2003,7 @@ fn spectrum_row_spans(
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(spark_w + 8);
     spans.push(Span::styled(
-        format!(" c{core_idx:<2} "),
+        core_label(core_idx, sib),
         Style::default().fg(theme.label),
     ));
 
@@ -2059,6 +2132,219 @@ fn draw_per_core(f: &mut ratatui::Frame<'_>, area: Rect, percore: &[f64], theme:
     }
     if !spans.is_empty() {
         lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Process orbit chart — top-N processes painted as dots on an
+/// ellipse. Stable angular slot per PID + CPU-driven radius gives a
+/// "scheduling clock face" that's easier to scan than a flat list:
+/// busy daemons stay put across ticks while transient bursts pop
+/// in and out at their hashed positions. Newly-spawned PIDs render
+/// bold for one tick (the "pulse" mentioned in `orbit.rs`).
+///
+/// Layout inside `area`:
+///
+/// ```text
+/// ┌──── process orbit ─────────────────────────┐
+/// │       · ●                  hot      45%   │
+/// │   ·       •                warm     22%   │
+/// │      12p           •       worker    9%   │
+/// │   ·          ●             init      3%   │
+/// │       •                    bash      1%   │
+/// └────────────────────────────────────────────┘
+/// ```
+/// Fixed-width cells in the legend row layout
+/// `" {pid:>5} {name:<NAME_W} {cpu:>5.1}% {state} "`:
+/// 1 + 5 + 1 + 1 + 6 + 1 + 1 + 1 = 17. The remainder of `area.width`
+/// is given to the command-name column.
+const ORBIT_LEGEND_FIXED_W: usize = 17;
+
+fn draw_proc_orbit(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    frame: &orbit::OrbitFrame,
+    theme: &theme::Theme,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" process orbit · busy = bigger radius ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+
+    // Vertical stack: ring on top, legend below.  Side-by-side
+    // squeezed the legend into ~16 cols, where any non-trivial
+    // command name (`/usr/lib/firefox/firefox`) collapsed onto
+    // the same prefix as every other library-binary process.
+    // Stacking gives the legend the full panel width so PID +
+    // basename + CPU% + state all fit on one row.
+    // Reserve up to 4 rows for the legend (showing top-4 procs);
+    // anything above 7 ring rows is wasted (the ellipse aspect
+    // gets weird taller than ~9 rows at our typical width).
+    let legend_rows = inner.height.saturating_sub(7).clamp(1, 4);
+    let ring_rows = inner.height.saturating_sub(legend_rows);
+    let ring_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: ring_rows,
+    };
+    let legend_area = Rect {
+        x: inner.x,
+        y: inner.y + ring_rows,
+        width: inner.width,
+        height: legend_rows,
+    };
+
+    draw_orbit_ring(f, ring_area, frame, theme);
+    draw_orbit_legend(f, legend_area, frame, theme);
+}
+
+/// Paint the ellipse + centre label into `area`. Each row of the
+/// ring is built as a single `Line` of single-char spans so the
+/// styling per glyph (state colour + optional bold pulse) survives
+/// without requiring buffer-level access.
+#[allow(clippy::too_many_lines)]
+fn draw_orbit_ring(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    frame: &orbit::OrbitFrame,
+    theme: &theme::Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let cells = orbit::compute_glyphs(area.height, area.width, frame);
+    // Bucket cells by row so we paint one Line per row.
+    let mut by_row: Vec<Vec<orbit::Cell>> = vec![Vec::new(); area.height as usize];
+    for cell in cells {
+        if let Some(bucket) = by_row.get_mut(cell.row as usize) {
+            bucket.push(cell);
+        }
+    }
+
+    // Centre label: "{n}p" placed at the midpoint of the ring.
+    let cx = area.width / 2;
+    let cy = area.height / 2;
+    let centre_text = format!("{}p", frame.processes.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    for (r, mut bucket) in by_row.into_iter().enumerate() {
+        bucket.sort_by_key(|c| c.col);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut col: u16 = 0;
+        // Walk the row left-to-right, emitting padding then glyphs.
+        // Multiple cells at the same (row, col) overlay — last one
+        // wins, matching how the eye reads stacked dots.
+        let mut painted = vec![None::<orbit::Cell>; area.width as usize];
+        for cell in bucket {
+            painted[cell.col as usize] = Some(cell);
+        }
+        // Overlay the centre label on its row only when no glyph
+        // already occupies those cells.
+        let r_u16 = u16::try_from(r).unwrap_or(u16::MAX);
+        if r_u16 == cy {
+            let label_half = u16::try_from(centre_text.chars().count() / 2).unwrap_or(0);
+            let start = cx.saturating_sub(label_half);
+            for (i, ch) in centre_text.chars().enumerate() {
+                let target = start as usize + i;
+                if target < painted.len() && painted[target].is_none() {
+                    painted[target] = Some(orbit::Cell {
+                        row: r_u16,
+                        col: u16::try_from(target).unwrap_or(u16::MAX),
+                        ch,
+                        // Sentinel index — renderer below renders
+                        // the label in a dim style rather than a
+                        // proc-state colour.
+                        proc_idx: usize::MAX,
+                    });
+                }
+            }
+        }
+        while col < area.width {
+            if let Some(cell) = painted[col as usize] {
+                let style = if cell.proc_idx == usize::MAX {
+                    Style::default().fg(theme.label)
+                } else if let Some(p) = frame.processes.get(cell.proc_idx) {
+                    // Colour by CPU% intensity, not state. The ring's
+                    // *radius* already encodes load; reinforcing it
+                    // with the same green→yellow→red ramp the gauges
+                    // use elsewhere makes "hot vs cold" jump out
+                    // without the reader needing a state-colour key.
+                    let mut s = Style::default().fg(cpu_load_color(p.cpu_pct, theme));
+                    if frame.new_pids.contains(&p.pid) {
+                        s = s.add_modifier(Modifier::BOLD);
+                    }
+                    s
+                } else {
+                    Style::default().fg(theme.label)
+                };
+                spans.push(Span::styled(cell.ch.to_string(), style));
+            } else {
+                spans.push(Span::raw(" "));
+            }
+            col += 1;
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Tabular legend below the ring — top-N processes with PID,
+/// command basename, CPU%, and a state char.  The previous
+/// side-by-side layout collapsed paths like
+/// `/usr/lib/firefox/firefox` to "usr/lib/" because the legend
+/// only had ~16 cols; stacking under the ring gives every column
+/// breathing room and includes the PID so two processes with the
+/// same basename are still distinguishable.
+fn draw_orbit_legend(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    frame: &orbit::OrbitFrame,
+    theme: &theme::Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let label = Style::default().fg(theme.label);
+    let dim = Style::default().fg(theme.label).add_modifier(Modifier::DIM);
+    let total_w = area.width as usize;
+    let name_w = total_w.saturating_sub(ORBIT_LEGEND_FIXED_W).max(4);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    let visible_rows = (area.height as usize).min(frame.processes.len());
+    for p in frame.processes.iter().take(visible_rows) {
+        let cpu_color = cpu_load_color(p.cpu_pct, theme);
+        let cpu_style = Style::default().fg(cpu_color);
+        let mut state_style = proc_state_style(p.state, theme);
+        if frame.new_pids.contains(&p.pid) {
+            state_style = state_style.add_modifier(Modifier::BOLD);
+        }
+        // Truncate name to name_w with an ellipsis when it doesn't
+        // fit, so "chromium-content-process" reads as "chromium-…"
+        // and never bleeds into the CPU column.
+        let display = if p.name.chars().count() > name_w {
+            let trimmed: String = p.name.chars().take(name_w.saturating_sub(1)).collect();
+            format!("{trimmed}…")
+        } else {
+            p.name.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!("{:>5}", p.pid), dim),
+            Span::raw(" "),
+            Span::styled(format!("{display:<name_w$}"), label),
+            Span::raw(" "),
+            Span::styled(format!("{:>5.1}%", p.cpu_pct), cpu_style),
+            Span::raw(" "),
+            Span::styled(p.state.to_string(), state_style),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(" (no processes)", label)));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -3799,6 +4085,36 @@ mod tests {
     }
 
     #[test]
+    fn core_label_no_smt_matches_legacy_format() {
+        // 1-digit cpu: " c0  " (5 chars).
+        assert_eq!(core_label(0, None), " c0  ");
+        // 2-digit cpu: " c10 " (5 chars).
+        assert_eq!(core_label(10, None), " c10 ");
+        // 3-digit cpu: " c100" (5 chars, no trailing space) — same
+        // overflow behaviour the legacy format had.
+        assert_eq!(core_label(100, None), " c100");
+    }
+
+    #[test]
+    fn core_label_smt_pair_uses_lscpu_style_letters() {
+        // HT pair on cpu 0 + cpu 4: " c0a " / " c4b " when sib=0/1.
+        assert_eq!(core_label(0, Some(0)), " c0a ");
+        assert_eq!(core_label(4, Some(1)), " c4b ");
+        // 2-digit + sib: " c10a" / " c10b" (5 chars, no trailing space).
+        assert_eq!(core_label(10, Some(0)), " c10a");
+        assert_eq!(core_label(10, Some(1)), " c10b");
+    }
+
+    #[test]
+    fn core_label_caps_sibling_index_at_z() {
+        // 26+-way SMT doesn't exist on real silicon, but the cap
+        // protects the layout from runaway non-ASCII characters
+        // even if a buggy /sys lies to us.
+        assert_eq!(core_label(0, Some(25)), " c0z ");
+        assert_eq!(core_label(0, Some(99)), " c0z ");
+    }
+
+    #[test]
     fn tree_orders_parents_then_children_in_pid_order() {
         // init(1) ├─ shell(10) └─ ssh(20)
         // shell(10) ├─ vim(11)   └─ rg(12)
@@ -4181,10 +4497,11 @@ mod tests {
     }
 
     #[test]
-    fn percore_height_spectrum_two_cols_when_wide() {
-        // Wide terminal (200 cols): cores split across 2 columns.
-        // 8 cores → 4 rows + 1 axis = 5 rows.
-        assert_eq!(percore_height(8, 200, 60, true), 5);
+    fn percore_height_spectrum_four_cols_when_wide() {
+        // Wide terminal (200 cols): 200 / (SPECTRUM_FIXED_W +
+        // SPECTRUM_MIN_SPARK = 38) = 5 → clamps to the 4-col cap.
+        // 8 cores / 4 = 2 rows + 1 axis = 3 rows.
+        assert_eq!(percore_height(8, 200, 60, true), 3);
     }
 
     #[test]
@@ -4369,12 +4686,12 @@ mod tests {
     }
 
     #[test]
-    fn percore_height_spectrum_floor_at_four() {
-        // Even on a tiny 6-row terminal, we still try to give the
-        // user 4 rows of spectrum (3 cores + axis) rather than
-        // collapsing into nubs. A one-core "spectrum" is just a
-        // sparkline you can already see in the strip below.
-        assert_eq!(percore_height(8, 200, 6, true), 4);
+    fn percore_height_spectrum_clamped_by_terminal_height() {
+        // Tiny 6-row terminal: dyn_cap = (6/3).max(4) = 4.
+        // 8 cores at 4 cols/row = 2 rows + 1 axis = 3, which is
+        // already below the cap, so the answer is 3 — the cap
+        // would only kick in for taller charts.
+        assert_eq!(percore_height(8, 200, 6, true), 3);
     }
 
     #[test]

@@ -9,28 +9,32 @@
 
 **A Linux-first terminal system monitor that shows what generic tools hide.**
 
-Per-core CPU spectrum with SMT/NUMA grouping, multi-vendor GPU dashboards
-(NVIDIA / AMD / Intel with per-engine `i915_pmu` breakdown), KVM hypervisor
-insight (vCPU pinning, exit counters, VFIO passthrough), developer-aware
-process grouping by container and language runtime, and a fully themeable
-UI (Catppuccin Mocha default, TOML overrides). Single binary, no daemons,
-no config required to start.
+Per-core CPU spectrum with SMT/NUMA grouping (HT siblings show as
+`c0a` / `c0b`, `lscpu`-style), multi-vendor GPU dashboards
+(NVIDIA / AMD / Intel with per-engine `i915_pmu` breakdown and RAPL
+package power), a process **orbit chart** that visualizes the top-12
+busy processes as dots on a stable per-PID ellipse, KVM hypervisor
+insight (vCPU pinning, exit counters, VFIO passthrough), developer-
+aware process grouping by container and language runtime, and a
+fully themeable UI (Catppuccin Mocha default, TOML overrides).
+Single binary, no daemons, no config required to start.
 
 ```text
  CPU  8.3%  MEM 9.1G/15.7G (58%)  load 0.31 0.28 0.22  kernel 6.9.3  Ryzen 7 7840HS
  ── NUMA 0 ─────────────────────────────────────────────────────────────────────────
- c0 ▁▂▃▄▅▄▃▂▁▁▂▃▁ ░░░░░░░░░░░░░░░░░░  8% ▕██░░░░░░░░░░▏  c1 ▁▁▁▁▂▁▁▁  2% ▕░░░░░░▏
- c2 ▇▆▅▄▃▂▁▁▁▁▁▁▁ ░░░░░░░░░░░░░░░░░░  3% ▕█░░░░░░░░░░░▏  c3 ▁▁▁▁▁▁▁▁  1% ▕░░░░░░▏
+ c0a ▁▂▃▄▅▄▃▂▁▁  8% ▕██░░▏  c0b ▁▁▁▁▂▁▁▁  2% ▕░░░░▏  c1a ▇▆▅▄▃▂▁▁  3% ▕█░░░▏
+ c1b ▁▁▁▁▁▁▁▁    1% ▕░░░░▏  c2a ▂▃▄▅▆▅▄▃ 18% ▕███░▏  c2b ▁▁▂▁▁▁▁▁  4% ▕█░░░▏
  ┌─ CPU  8% ─┬─ MEM 58% ─┬─ NET↓ 2.1 MB/s ─┬─ NET↑ 84 KB/s ─┬─ GPU 41% ─┬─VRAM 31%─┐
  │ ▁▂▃▅▆▅▄▃▂ │ ██████▌░░ │ ▁▂▃▁▁▅▆▄▂▁▁▁▁  │ ▁▁▁▁▁▂▁▁▁▁▁▁▁  │ ▂▄▆▅▃▄▅▄▃ │ ▂▂▂▂▂▂▂▂▂ │
  └───────────┴───────────┴─────────────────┴────────────────┴───────────┴──────────┘
  gpu  AMD Radeon 780M ⣾⣷⣶⣤ 41%  ▕█████░░░▏  vram 1.9G/8.5G (22.4%)  ▕██░░░░░░▏
- ▼ docker:caddy          (2)   72.4%   1.1G
- ▼ docker:postgres       (3)    4.1%   512 MB
- ▼ go:caddy [goroutines] (2)   72.4%   1.1G
- ▼ rust:neotop [async]   (1)    0.3%    18 MB
- ▼ system                (51)   1.2%   284 MB
- ▼ native                (1821)  0.0%   nil
+ ┌── procs ──────────────────────────┐ ┌── process orbit · busy = bigger radius ─┐
+ │ ▼ docker:caddy        (2) 72.4%   │ │            ·          ●                │
+ │ ▼ docker:postgres     (3)  4.1%   │ │      ·          12p           •        │
+ │ ▼ rust:neotop [async] (1)  0.3%   │ │            •          ·                │
+ │ ▼ system              (51) 1.2%   │ │ 12345 firefox       45.2% S            │
+ │ ▼ native             (1821) 0.0%  │ │ 67890 chromium      22.1% R            │
+ └───────────────────────────────────┘ └────────────────────────────────────────┘
 ```
 
 Linux fully supported; macOS support in progress.
@@ -218,13 +222,17 @@ Items in progress:
 
 Items still open:
 
-- [ ] Intel GPU per-engine **power draw** (requires `i915_pmu` `freq0-act`
-  / `power1` perf events beyond what `CAP_PERFMON` alone exposes)
-- [ ] SMT / NUMA topology-aware label format (show `c0a`/`c0b` for HT pairs)
 - [ ] macOS: disk, network, GPU, and temperature data sources
+- [ ] Intel GPU **true per-engine** power draw (blocked upstream — i915 PMU
+  only exposes per-engine busy counters, not energy. Package-level
+  power via RAPL is already shipped in `v0.25.0`.)
 
 Recently shipped (see [`CHANGELOG.md`](CHANGELOG.md) for the full history):
 
+- [x] Process orbit chart in the detail pane (top-12 by CPU%, stable per-PID angle, bold-pulse on spawn) (`v0.25.0`)
+- [x] Per-core spectrum: 4 cols max (was 2) — halves the chart's vertical footprint (`v0.25.0`)
+- [x] SMT-aware spectrum labels (`c0a`/`c0b` for HT siblings) (`v0.25.0`)
+- [x] Intel iGPU package-level power draw via RAPL `uncore`/`gt` domain (`v0.25.0`)
 - [x] Intel GPU per-engine breakdown (`rcs`/`bcs`/`vcs`/`vecs`) via `i915_pmu` (`v0.24.0`)
 - [x] SMT / NUMA grouping in the CPU spectrum (`v0.24.0`)
 - [x] Catppuccin Mocha default theme, TOML config, `T` preset cycling (`v0.23.0`)
