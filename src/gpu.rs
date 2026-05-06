@@ -170,6 +170,11 @@ pub(crate) struct Tracker {
     intel_state: HashMap<String, IntelSample>,
     #[cfg(all(target_os = "linux", feature = "i915-pmu"))]
     intel_pmu: IntelPmuTracker,
+    /// RAPL power state for the iGPU "uncore"/"gt" domain. Lazy:
+    /// `Uninit` until the first `merge_intel` finds an Intel card,
+    /// then promoted to `Ready(path, prev)` or `Unavailable` (no
+    /// matching domain or `energy_uj` unreadable post-CVE-2020-8694).
+    intel_rapl: IntelRapl,
 }
 
 /// Per-Intel-card sample for RC6 derivative. Tiny (24 B) so the
@@ -181,6 +186,29 @@ struct IntelSample {
     /// driver load. Read from
     /// `/sys/class/drm/card*/gt/gt0/rc6_residency_ms`.
     rc6_ms: u64,
+}
+
+/// RAPL package-level GPU power tracker. Single domain per host —
+/// chips with multiple iGPUs are vanishingly rare and the kernel
+/// only exposes one `uncore`/`gt` RAPL subdomain regardless. Power
+/// is attributed to the first detected Intel card.
+#[derive(Debug, Default)]
+enum IntelRapl {
+    #[default]
+    Uninit,
+    Unavailable,
+    Ready {
+        energy_path: PathBuf,
+        prev: Option<EnergySample>,
+    },
+}
+
+/// `energy_uj` is a monotonic counter in microjoules; subtract two
+/// samples and divide by elapsed time to get watts.
+#[derive(Debug, Clone, Copy)]
+struct EnergySample {
+    when: Instant,
+    energy_uj: u64,
 }
 
 impl Tracker {
@@ -211,6 +239,9 @@ impl Tracker {
     /// first sample seeds the cache and leaves `busy_pct = None`;
     /// every subsequent tick produces a real number. Cards that
     /// disappear between ticks have their cache entry dropped.
+    /// Also attributes RAPL `uncore`/`gt` package power to the
+    /// first detected Intel card (kernel only exposes one such
+    /// domain regardless of how many iGPUs are present).
     fn merge_intel(&mut self, gpus: &mut [Gpu]) {
         if !gpus.iter().any(|g| g.vendor == GpuVendor::Intel) {
             return;
@@ -240,6 +271,46 @@ impl Tracker {
             self.intel_state.insert(addr, cur);
         }
         self.intel_state.retain(|k, _| seen.contains(k));
+        let rapl_watts = self.read_intel_rapl_watts(now);
+        if let Some(w) = rapl_watts {
+            if let Some(g) = gpus.iter_mut().find(|g| g.vendor == GpuVendor::Intel) {
+                g.power_watts = Some(w);
+            }
+        }
+    }
+
+    /// Lazy-initialise + sample the iGPU RAPL domain. Returns
+    /// `None` on the first call (seeds the prev sample), on any
+    /// permission / parse failure, and when no matching domain
+    /// exists. Subsequent calls return watts derived from the
+    /// `energy_uj` derivative.
+    fn read_intel_rapl_watts(&mut self, now: Instant) -> Option<f64> {
+        if matches!(self.intel_rapl, IntelRapl::Uninit) {
+            self.intel_rapl = match find_intel_gpu_rapl_domain() {
+                Some(p) => IntelRapl::Ready {
+                    energy_path: p,
+                    prev: None,
+                },
+                None => IntelRapl::Unavailable,
+            };
+        }
+        let IntelRapl::Ready { energy_path, prev } = &mut self.intel_rapl else {
+            return None;
+        };
+        let Some(energy_uj) = read_energy_uj(energy_path) else {
+            // First-read permission failure (or counter wrap on
+            // reload) — fall back permanently. Avoids per-tick
+            // EACCES noise on the common locked-down setup.
+            self.intel_rapl = IntelRapl::Unavailable;
+            return None;
+        };
+        let cur = EnergySample {
+            when: now,
+            energy_uj,
+        };
+        let watts = prev.and_then(|p| compute_rapl_watts(p, cur));
+        *prev = Some(cur);
+        watts
     }
 
     /// For each NVIDIA card we found via sysfs, replace the
@@ -535,6 +606,74 @@ fn compute_intel_busy_pct(prev: IntelSample, cur: IntelSample) -> Option<f64> {
     #[allow(clippy::cast_precision_loss)]
     let idle_frac = (drc6 as f64 / dt).min(1.0);
     Some(((1.0 - idle_frac) * 100.0).clamp(0.0, 100.0))
+}
+
+/// Walk `/sys/class/powercap/intel-rapl:*` looking for a subdomain
+/// whose `name` identifies the iGPU. Per Linux kernel docs, the
+/// domain is conventionally named `uncore` on client `SoCs` (the
+/// L3 + iGPU + display engine share one RAPL domain), or `gt` on
+/// some newer Xe parts. Substring `gpu` matches future-proof
+/// labellings. Returns the path to that subdomain (the directory
+/// containing `energy_uj`).
+fn find_intel_gpu_rapl_domain() -> Option<PathBuf> {
+    let entries = fs::read_dir("/sys/class/powercap").ok()?;
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(s) = name.to_str() else { continue };
+        // Top-level packages match `intel-rapl:N`. Skip MMIO clones
+        // (`intel-rapl-mmio:*`) and `psys` — they shadow the
+        // package's `uncore` subdomain or aren't iGPU-specific.
+        if s.starts_with("intel-rapl:") && s.matches(':').count() == 1 {
+            packages.push(e.path());
+        }
+    }
+    for pkg in packages {
+        let Ok(subs) = fs::read_dir(&pkg) else {
+            continue;
+        };
+        for s in subs.flatten() {
+            let Some(name) = read_trim(&s.path().join("name")) else {
+                continue;
+            };
+            if is_intel_gpu_rapl_name(&name) {
+                return Some(s.path());
+            }
+        }
+    }
+    None
+}
+
+/// Heuristic name match for the iGPU RAPL subdomain. Conservative —
+/// `core` and `dram` are the CPU package and memory channels, not
+/// the GPU.
+fn is_intel_gpu_rapl_name(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n == "uncore" || n == "gt" || n.contains("gpu") || n.starts_with("intel-gpu")
+}
+
+/// Read `energy_uj` and parse it. Returns `None` on any failure
+/// (typical post-CVE-2020-8694: mode 0400, EACCES for non-root).
+fn read_energy_uj(domain_path: &Path) -> Option<u64> {
+    read_trim(&domain_path.join("energy_uj"))?.parse().ok()
+}
+
+/// Watts = `Δμj / Δt_s / 1e6`. Skips zero-window samples and
+/// counter wraps (RAPL `energy_uj` is 32-bit on some chips so a
+/// wrap is plausible across hours of uptime — emit `None` rather
+/// than a negative spike).
+fn compute_rapl_watts(prev: EnergySample, cur: EnergySample) -> Option<f64> {
+    let dt = cur.when.duration_since(prev.when).as_secs_f64();
+    if dt <= 0.0 {
+        return None;
+    }
+    if cur.energy_uj < prev.energy_uj {
+        return None;
+    }
+    let dj = cur.energy_uj - prev.energy_uj;
+    #[allow(clippy::cast_precision_loss)]
+    let watts = (dj as f64) / 1_000_000.0 / dt;
+    Some(watts)
 }
 
 /// AMD `power1_average` lives in microwatts under
@@ -1087,6 +1226,54 @@ mod tests {
         // (lowercased + trimmed). Means a corrupted sysfs symlink
         // can't crash us, just won't match anything in the NVML map.
         assert_eq!(normalize_pci_addr("not-a-pci-addr"), "not-a-pci-addr");
+    }
+
+    #[test]
+    fn intel_gpu_rapl_name_matches_known_domains() {
+        assert!(is_intel_gpu_rapl_name("uncore"));
+        assert!(is_intel_gpu_rapl_name("gt"));
+        assert!(is_intel_gpu_rapl_name("intel-gpu"));
+        assert!(is_intel_gpu_rapl_name("gpu"));
+        assert!(is_intel_gpu_rapl_name(" UNCORE\n"));
+        // CPU + memory domains must NOT be picked up — those are
+        // the package's own consumption, not the iGPU.
+        assert!(!is_intel_gpu_rapl_name("core"));
+        assert!(!is_intel_gpu_rapl_name("dram"));
+        assert!(!is_intel_gpu_rapl_name("package-0"));
+        assert!(!is_intel_gpu_rapl_name("psys"));
+    }
+
+    #[test]
+    fn rapl_watts_derives_from_energy_delta() {
+        // 5 W draw over 2 s = 10 J = 10_000_000 µJ.
+        let now = Instant::now();
+        let prev = EnergySample {
+            when: now,
+            energy_uj: 1_000_000,
+        };
+        let cur = EnergySample {
+            when: now + std::time::Duration::from_secs(2),
+            energy_uj: 11_000_000,
+        };
+        let w = compute_rapl_watts(prev, cur).unwrap();
+        assert!((w - 5.0).abs() < 1e-9, "got {w}");
+    }
+
+    #[test]
+    fn rapl_watts_skips_zero_window_and_counter_wrap() {
+        let now = Instant::now();
+        let same = EnergySample {
+            when: now,
+            energy_uj: 1_000_000,
+        };
+        assert_eq!(compute_rapl_watts(same, same), None);
+        // Wrap-around (32-bit `energy_uj` on some chips). Don't
+        // emit a negative — caller will just show no number.
+        let wrap = EnergySample {
+            when: now + std::time::Duration::from_secs(1),
+            energy_uj: 100,
+        };
+        assert_eq!(compute_rapl_watts(same, wrap), None);
     }
 
     /// Live smoke: prints the tracker's view of the host's GPUs.
