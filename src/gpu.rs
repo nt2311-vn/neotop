@@ -1,5 +1,7 @@
 //! gpu.rs — GPU detection and activity reporting.
-//! Linux: `/sys/class/drm` + NVML. macOS: requires IOKit/Metal (not implemented).
+//! Linux: `/sys/class/drm` + NVML. macOS: `IOKit` `IOAccelerator`
+//! enumeration + `PerformanceStatistics` `CFDictionary` read; see
+//! `gpu_macos.rs` for the implementation.
 
 use std::collections::HashMap;
 use std::fs;
@@ -175,6 +177,11 @@ pub(crate) struct Tracker {
     /// then promoted to `Ready(path, prev)` or `Unavailable` (no
     /// matching domain or `energy_uj` unreadable post-CVE-2020-8694).
     intel_rapl: IntelRapl,
+    /// Per-card cache for the macOS IOKit backend (registry-entry
+    /// id → static fields). Empty on Linux. Populated on first
+    /// `snapshot()` call.
+    #[cfg(target_os = "macos")]
+    macos_state: crate::gpu_macos::MacosGpuState,
 }
 
 /// Per-Intel-card sample for RC6 derivative. Tiny (24 B) so the
@@ -230,7 +237,7 @@ impl Tracker {
         }
         #[cfg(target_os = "macos")]
         {
-            Vec::new()
+            self.macos_state.snapshot()
         }
     }
 

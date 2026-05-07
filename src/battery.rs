@@ -133,9 +133,7 @@ fn extract_json_value(json: &str, key: &str) -> Option<String> {
         let after_key = &json[idx + key_pattern.len()..];
         if let Some(start) = after_key.find(|c: char| c.is_ascii_digit()) {
             let value_part = &after_key[start..];
-            let end = value_part
-                .find(|c: char| c == ',' || c == '}')
-                .unwrap_or(value_part.len());
+            let end = value_part.find([',', '}']).unwrap_or(value_part.len());
             return Some(value_part[..end].trim().to_string());
         }
     }

@@ -220,6 +220,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

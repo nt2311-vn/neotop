@@ -38,6 +38,12 @@ jobs:
       - name: cargo clippy (macOS)
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # macOS now runs the full TUI (sysctl + libproc); execute the
+      # platform-agnostic tests on real hardware so a runtime
+      # regression in the macOS data path is caught here.
+      - name: cargo test (macOS)
+        run: cargo test --all-targets --locked
+
   # Fast cross-compile sanity check from Linux runners.  Catches
   # macOS compile errors in seconds without waiting for a macOS
   # runner slot.  Belt-and-braces: runs alongside `check-macos`.

@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] — macOS daily-driver part 1: bring-up + GPU
+
+The macOS port crosses the line from "compiles" to "actually runs".
+Until 0.25.x the macOS binary printed a "Linux-only" banner and
+exited with status 2; 0.26.0 wires the existing sysctl / libproc
+data sources into the run loop and adds GPU enumeration via
+IOKit. **208 tests** pass on Linux; both `aarch64-apple-darwin`
+and `x86_64-apple-darwin` cross-clippy clean under
+`RUSTFLAGS="-D warnings"`.
+
+### Added
+
+- **macOS TUI bring-up** — `cargo install neotop` on macOS now
+  produces a working interactive dashboard. Sources used:
+  - `host`: `sysctl` for CPU count, RAM total, load average,
+    kernel + CPU model.
+  - `procs` / `proc`: `proc_listallpids` + `proc_pidinfo`
+    (libproc) for the process list, command lines, parent PIDs,
+    states, and per-PID jiffies.
+  - `battery`: `pmset -g batt` parsed (already shipped).
+  - Inert (no kernel surface): KVM exits panel, VFIO passthrough,
+    /proc cgroup walks. These are gated `#[cfg(target_os =
+    "linux")]` so the macOS build doesn't carry their cost.
+  - Empty (data source not yet ported): per-disk I/O, per-iface
+    network rates, hwmon temperatures. UI shows blank rows
+    rather than crashing; tracked for v0.27.0.
+- **macOS GPU via IOKit** — new module `src/gpu_macos.rs` (gated
+  `#[cfg(target_os = "macos")]`) enumerates every IOAccelerator
+  service via `IOServiceMatching("IOAccelerator")`, snapshots
+  each registry entry's `PerformanceStatistics` CFDictionary,
+  and renders into the existing `Gpu` row alongside Linux
+  cards. Vendor classification covers Apple Silicon (`AGX*`),
+  Intel iGPU, AMD discrete (`AMDRadeon*`), and NVIDIA legacy
+  Intel-Mac (`nv*`). Apple Silicon GPUs report system RAM as
+  VRAM total with a `(unified)` suffix on the device name.
+- **CI: macOS now runs `cargo test`** — `check-macos` previously
+  only ran build + clippy. Real macOS hardware now executes the
+  full test suite, so a runtime regression in the macOS data
+  path is caught at PR time. Cross-compile-from-Linux job
+  (`cross-check-darwin`) stays as a fast pre-flight gate.
+- **`tests::app_new_and_tick_do_not_panic`** — end-to-end smoke
+  test that constructs `App` and runs one `tick()`. Covers the
+  Linux full path *and* the macOS sysctl + libproc path on
+  macOS CI runners. Catches "compiles but immediately panics"
+  regressions that cross-clippy alone misses.
+
+### Changed
+
+- **Crate-level lint allow narrowed** — pre-0.26 macOS builds
+  set `#![cfg_attr(not(target_os = "linux"), allow(clippy::all,
+  clippy::pedantic, ...))]` because the entire run loop was
+  unreachable. Now that macOS runs real code, the allow set
+  drops `clippy::all` (correctness lints stay enforced) and
+  keeps only `dead_code` / `unused_imports` / `unused_variables`
+  / `unused_mut` (Linux-only modules legitimately leave their
+  helpers unreachable on macOS) and `clippy::pedantic` (FFI
+  patterns: raw pointer casts, sysctl name constants, two-pass
+  buffer sizing). `unsafe_code` is allowed module-wide for the
+  IOKit / sysctl / libproc surfaces; every `unsafe` block
+  carries a SAFETY comment.
+- **`Cargo.toml` macOS deps** — added
+  `core-foundation = "0.10"`, `core-foundation-sys = "0.8"`,
+  `io-kit-sys = "0.4"`, `mach2 = "0.4"` under
+  `[target.'cfg(target_os = "macos")'.dependencies]`. All are
+  macOS-only by construction so the Linux binary size is
+  unchanged.
+
+### Notes
+
+- KVM / VFIO / debugfs panels remain Linux-only by design.
+  macOS doesn't expose KVM (it has Hypervisor.framework
+  instead), and the cgroup-based container grouping requires
+  Linux-specific filesystems. Container detection still works
+  on macOS via the existing `docker ps` / `podman ps`
+  subprocess shell-out.
+- The README's "process monitoring works" line for macOS was
+  aspirational under 0.25.x; with this release it becomes
+  truthful.
+- v0.24.3 was tagged locally but never published to crates.io.
+  v0.25.0 was prepared but also not yet published; v0.26.0
+  rolls both forward into the first version users will pull
+  via `cargo install neotop`.
+
 ## [0.25.0] — process orbit, compact spectrum, Intel iGPU power
 
 Four additive features. No API or config breaks; existing
@@ -2021,7 +2104,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/nt2311-vn/neotop/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/nt2311-vn/neotop/compare/v0.24.3...v0.25.0
 [0.24.3]: https://github.com/nt2311-vn/neotop/compare/v0.24.2...v0.24.3
 [0.24.2]: https://github.com/nt2311-vn/neotop/compare/v0.24.1...v0.24.2

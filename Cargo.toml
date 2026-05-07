@@ -1,6 +1,6 @@
 [package]
 name = "neotop"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -54,6 +54,16 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+# IOKit + Core Foundation bindings for GPU discovery
+# (`IOServiceMatching("IOAccelerator")` → `PerformanceStatistics`
+# CFDictionary) and temperature sensor reads (SMC user-client on
+# Intel; IOReport channel subscription on Apple Silicon). Both
+# crates are macOS-only by construction, so they add nothing to
+# the Linux build.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+io-kit-sys = "0.4"
+mach2 = "0.4"
 
 [features]
 default = ["nvml", "i915-pmu"]

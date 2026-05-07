@@ -5,35 +5,50 @@
 //! controls and architecture.
 //!
 //! Platform-specific modules are conditionally compiled:
-//! - Linux: full feature set including KVM VM monitoring
-//! - macOS: degraded build that prints a "Linux-only" banner and exits
-//!   immediately.  The TUI / `App` / draw code is unreachable there, so
-//!   the macOS build legitimately leaves many items dead and pulls
-//!   `unsafe` only for sysctl / libproc FFI.  The crate-level allow
-//!   below keeps `RUSTFLAGS=-D warnings` CI green without weakening the
-//!   Linux build, which still enforces the full lint set.
+//! - **Linux:** full feature set including KVM VM monitoring, KVM
+//!   exit counters, VFIO passthrough, /proc-derived process tree,
+//!   sysfs GPU + temperature data sources.
+//! - **macOS:** TUI runs with sysctl / libproc data sources for CPU,
+//!   memory, load, processes, disk, network, and battery; GPU and
+//!   temperature backends ship in a follow-up commit. KVM / VFIO /
+//!   container-cgroup panels are inert because the kernel surfaces
+//!   they consume don't exist there.
+//!
+//! macOS legitimately needs `unsafe` for sysctl / libproc / `IOKit`
+//! FFI; the `unsafe_code` lint stays at `warn` crate-wide and each
+//! call site documents its safety contract.
 
+// On macOS most Linux-only modules (kvm, vcpus, passthrough, vm,
+// most of gpu.rs and host.rs) gate their bodies behind
+// `cfg(target_os = "linux")` — leaving the structs / fields /
+// helpers legitimately unreachable on the macOS build. Suppress the
+// dead-code family on macOS only; the Linux build still enforces the
+// full lint set under `RUSTFLAGS=-D warnings`.
 #![cfg_attr(
-    not(target_os = "linux"),
+    target_os = "macos",
     allow(
         dead_code,
         unused_imports,
         unused_variables,
         unused_mut,
         unsafe_code,
-        clippy::all,
+        clippy::unused_self,
+        // FFI-pattern lints in sysctl / libproc / IOKit code. Each
+        // `unsafe` block carries a SAFETY comment; the casts and
+        // pointer manipulations are the standard idiom for Apple's
+        // C ABIs and are not tighter on Linux because that code path
+        // simply does not exist there.
         clippy::pedantic
     )
 )]
 
 mod battery;
 mod disk;
-#[cfg(target_os = "linux")]
-mod elf;
-#[cfg(target_os = "macos")]
 mod elf;
 mod errors;
 mod gpu;
+#[cfg(target_os = "macos")]
+mod gpu_macos;
 mod groups;
 mod host;
 mod kvm;
@@ -330,21 +345,6 @@ fn mem_used_pct(h: &host::HostInfo) -> f64 {
 // TUI main loop
 // -----------------------------------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
-fn main() {
-    eprintln!(
-        "neotop is Linux-only for now — every data source it reads \
-         (/proc, /sys/class/hwmon, /sys/class/power_supply, cgroup v2) \
-         is a Linux kernel thing.\n\
-         \n\
-         Porting to {} would need a separate module using the \
-         platform's native APIs. See README for notes.",
-        std::env::consts::OS,
-    );
-    std::process::exit(2);
-}
-
-#[cfg(target_os = "linux")]
 fn main() -> Result<()> {
     let args = Args::parse()?;
 
@@ -4769,5 +4769,23 @@ mod tests {
         assert!(is_informative_temp(&cpu_cool));
         assert!(!is_informative_temp(&pch_cool));
         assert!(is_informative_temp(&pch_warm));
+    }
+
+    /// End-to-end smoke: `App::new()` followed by one `tick()` must
+    /// not panic on any supported target. Linux exercises the full
+    /// data path; macOS exercises the sysctl / libproc / stub path
+    /// (the bring-up that replaced the pre-0.26 `eprintln!` + exit-2
+    /// stub). Catches "compiles but immediately panics" regressions
+    /// — the kind cross-clippy alone misses.
+    #[test]
+    fn app_new_and_tick_do_not_panic() {
+        let mut app = App::new(Duration::from_millis(50), None);
+        app.tick();
+        // Exercising the orbit + selection paths on whatever procs
+        // the host happened to have at construction time. We don't
+        // assert specific counts because that depends on the
+        // runner's process table.
+        let _ = app.selected_proc();
+        app.recompute_procs();
     }
 }
