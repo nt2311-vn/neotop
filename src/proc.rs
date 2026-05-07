@@ -332,6 +332,7 @@ pub(crate) fn format_limit_value(raw: &str, unit: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

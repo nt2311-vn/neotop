@@ -7,7 +7,9 @@
 [![CodeQL](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml/badge.svg)](https://github.com/nt2311-vn/neotop/actions/workflows/codeql.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
-**A Linux-first terminal system monitor that shows what generic tools hide.**
+**A Linux-first terminal system monitor that shows what generic
+tools hide. macOS support landed in v0.26.0 — degraded but
+functional.**
 
 Per-core CPU spectrum with SMT/NUMA grouping (HT siblings show as
 `c0a` / `c0b`, `lscpu`-style), multi-vendor GPU dashboards
@@ -217,18 +219,24 @@ Apache-2.0. See [`LICENSE`](LICENSE) for the full text.
 
 Items in progress:
 
-- macOS support — process monitoring works; GPU / disk / net / temp
-  data sources use Linux-specific paths and return empty on macOS.
+- macOS support — bring-up + GPU shipped in `v0.26.0`. Disk I/O,
+  per-interface network rates, and temperature sensors still
+  fall back to empty rows; tracked for `v0.27.0`.
 
 Items still open:
 
-- [ ] macOS: disk, network, GPU, and temperature data sources
-- [ ] Intel GPU **true per-engine** power draw (blocked upstream — i915 PMU
-  only exposes per-engine busy counters, not energy. Package-level
-  power via RAPL is already shipped in `v0.25.0`.)
+- [ ] macOS: per-disk I/O via IOKit (`IOServiceMatching("IOMedia")`)
+- [ ] macOS: per-iface network rates via `getifaddrs` + `IFDATA`
+- [ ] macOS: temperatures — SMC keys on Intel, IOReport on Apple
+  Silicon
+- [ ] Windows: ETW + PDH counters (separate epic)
+- [ ] Intel GPU **true per-engine** power draw (blocked upstream —
+  i915 PMU only exposes per-engine busy counters, not energy.
+  Package-level power via RAPL is already shipped in `v0.25.0`.)
 
 Recently shipped (see [`CHANGELOG.md`](CHANGELOG.md) for the full history):
 
+- [x] macOS TUI bring-up + GPU enumeration via IOKit `IOAccelerator` (`v0.26.0`)
 - [x] Process orbit chart in the detail pane (top-12 by CPU%, stable per-PID angle, bold-pulse on spawn) (`v0.25.0`)
 - [x] Per-core spectrum: 4 cols max (was 2) — halves the chart's vertical footprint (`v0.25.0`)
 - [x] SMT-aware spectrum labels (`c0a`/`c0b` for HT siblings) (`v0.25.0`)
