@@ -927,7 +927,7 @@ impl Tracker {
                         .into_owned()
                 };
 
-                let group = groups::classify_process(&command, None);
+                let group = groups::classify_process_with_pid(pid, &command);
 
                 let static_info = StaticInfo {
                     uid,

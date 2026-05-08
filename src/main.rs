@@ -43,7 +43,11 @@
 )]
 
 mod battery;
+#[cfg(target_os = "macos")]
+mod container_macos;
 mod disk;
+#[cfg(target_os = "macos")]
+mod disk_macos;
 mod elf;
 mod errors;
 mod gpu;
@@ -53,13 +57,19 @@ mod groups;
 mod host;
 mod kvm;
 mod net;
+#[cfg(target_os = "macos")]
+mod net_macos;
 mod orbit;
 mod passthrough;
 mod proc;
 mod procs;
 mod temp;
+#[cfg(target_os = "macos")]
+mod temp_macos;
 mod theme;
 mod topology;
+#[cfg(target_os = "macos")]
+mod topology_macos;
 mod vcpus;
 mod vm;
 

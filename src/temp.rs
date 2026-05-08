@@ -36,6 +36,11 @@ pub(crate) struct Tracker {
     parked: HashSet<PathBuf>,
 }
 
+/// Temperature scanner for macOS.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub(crate) struct Tracker;
+
 /// Outcome of a single tracker scan: temperature readings plus
 /// whatever non-fatal events the scan produced. Decoupled from
 /// `ErrorRing` so we can ship reports across thread boundaries via
@@ -114,6 +119,14 @@ impl Tracker {
             infos,
             errors,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Tracker {
+    /// Scan temperature sensors on macOS using IOKit
+    pub(crate) fn scan(&self) -> ScanReport {
+        crate::temp_macos::scan(self)
     }
 }
 

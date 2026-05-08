@@ -24,15 +24,15 @@ pub(crate) struct Iface {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Sample {
-    when: Instant,
-    rx: u64,
-    tx: u64,
+pub(crate) struct Sample {
+    pub(crate) when: Instant,
+    pub(crate) rx: u64,
+    pub(crate) tx: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
-    prev: HashMap<String, Sample>,
+    pub(crate) prev: HashMap<String, Sample>,
 }
 
 impl Tracker {
@@ -56,13 +56,7 @@ impl Tracker {
 
     #[cfg(target_os = "macos")]
     fn snapshot_macos(&mut self, now: Instant) -> Vec<Iface> {
-        // macOS network stats via sysctl net.iflist
-        // This is complex to implement in pure Rust due to the binary format.
-        // For now, return empty. A future implementation could:
-        // 1. Use `getifaddrs` from libc to enumerate interfaces
-        // 2. Query per-interface stats using sysctl with IF_DATA_* MIBs
-        // 3. Parse `netstat -ib` output as a fallback
-        Vec::new()
+        crate::net_macos::snapshot_macos(self, now)
     }
 
     /// Test seam: same logic as `snapshot`, but takes the raw file

@@ -57,47 +57,27 @@ struct CardStatic {
 }
 
 impl MacosGpuState {
-    /// Discover every IOAccelerator service and return one `Gpu`
-    /// per match. Empty `Vec` on platforms / configurations where
-    /// no GPU is exposed (headless servers, virtualised macOS).
+    /// Discover every GPU service and return one `Gpu` per match.
+    /// Tries multiple IOService classes: IOAccelerator (primary),
+    /// IOPCIDevice (fallback for discrete GPUs), IOGraphicsDevice
+    /// (fallback for headless systems). Empty `Vec` on platforms /
+    /// configurations where no GPU is exposed.
     pub(crate) fn snapshot(&mut self) -> Vec<Gpu> {
-        // SAFETY: `IOServiceMatching` returns a +1 retain on the
-        // returned dictionary; `IOServiceGetMatchingServices`
-        // consumes that retain. The iterator is released below.
-        let mut iter: io_kit_sys::types::io_iterator_t = 0;
-        unsafe {
-            let class = CString::from_vec_with_nul_unchecked(IO_ACCELERATOR_CLASS.to_vec());
-            let matching = IOServiceMatching(class.as_ptr());
-            if matching.is_null() {
-                return Vec::new();
-            }
-            let kr = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iter);
-            if kr != 0 {
-                return Vec::new();
-            }
-        }
-
         let mut out = Vec::new();
         let mut seen: Vec<u64> = Vec::new();
-        loop {
-            // SAFETY: `IOIteratorNext` returns 0 when the iterator
-            // is exhausted; we release every non-zero entry below.
-            let entry = unsafe { IOIteratorNext(iter) };
-            if entry == 0 {
-                break;
+
+        // Try IOAccelerator first (primary GPU class)
+        let class_names: &[&[u8]] = &[b"IOAccelerator\0", b"IOPCIDevice\0", b"IOGraphicsDevice\0"];
+
+        for class_name in class_names {
+            if let Some(mut gpus) = self.discover_class(class_name) {
+                for (id, gpu) in gpus {
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                        out.push(gpu);
+                    }
+                }
             }
-            if let Some((id, gpu)) = self.read_one(entry) {
-                seen.push(id);
-                out.push(gpu);
-            }
-            // SAFETY: `entry` came from `IOIteratorNext` (+1 retain).
-            unsafe {
-                IOObjectRelease(entry);
-            }
-        }
-        // SAFETY: iterator is +1 from `IOServiceGetMatchingServices`.
-        unsafe {
-            IOObjectRelease(iter);
         }
 
         // Drop cache entries for cards that have disappeared (eGPU
@@ -106,6 +86,51 @@ impl MacosGpuState {
         self.cached.retain(|id, _| seen.contains(id));
 
         out
+    }
+
+    /// Discover GPUs matching a specific IOService class.
+    fn discover_class(&mut self, class_name: &[u8]) -> Option<Vec<(u64, Gpu)>> {
+        let mut iter: io_kit_sys::types::io_iterator_t = 0;
+        unsafe {
+            let class = CString::from_vec_with_nul_unchecked(class_name.to_vec());
+            let matching = IOServiceMatching(class.as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            let kr = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iter);
+            if kr != 0 {
+                return None;
+            }
+        }
+
+        let mut out = Vec::new();
+        loop {
+            let entry = unsafe { IOIteratorNext(iter) };
+            if entry == 0 {
+                break;
+            }
+            // For IOPCIDevice, filter to only include GPU-like devices
+            // by checking for GPU-related properties
+            if class_name == b"IOPCIDevice\0" && !is_gpu_device(entry) {
+                unsafe { IOObjectRelease(entry) };
+                continue;
+            }
+            if let Some((id, gpu)) = self.read_one(entry) {
+                out.push((id, gpu));
+            }
+            unsafe {
+                IOObjectRelease(entry);
+            }
+        }
+        unsafe {
+            IOObjectRelease(iter);
+        }
+
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn read_one(&mut self, entry: io_kit_sys::types::io_registry_entry_t) -> Option<(u64, Gpu)> {
@@ -136,6 +161,49 @@ impl MacosGpuState {
             },
         ))
     }
+}
+
+/// Check if an IOPCIDevice is actually a GPU by examining its
+/// IOClass and properties. Returns true for VGA-compatible,
+/// 3D controller, and display devices.
+fn is_gpu_device(entry: io_kit_sys::types::io_registry_entry_t) -> bool {
+    let class_name = match io_object_class(entry) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Check for GPU-related IOClass patterns
+    let gpu_patterns = [
+        "IOPCIDevice",
+        "AGX",
+        "Intel",
+        "AMD",
+        "Radeon",
+        "NVIDIA",
+        "NV",
+        "display",
+        "VGA",
+        "3D",
+    ];
+
+    let class_lower = class_name.to_lowercase();
+    for pattern in &gpu_patterns {
+        if class_lower.contains(&pattern.to_lowercase()) {
+            return true;
+        }
+    }
+
+    // Also check the registry entry name
+    if let Some(name) = registry_entry_name(entry) {
+        let name_lower = name.to_lowercase();
+        for pattern in &gpu_patterns {
+            if name_lower.contains(&pattern.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Pull `IORegistryEntryID` for a service. Stable across the
