@@ -74,8 +74,14 @@ impl CpuTopology {
         }
     }
 
-    /// No-op on non-Linux: topology is Linux-sysfs-specific.
-    #[cfg(not(target_os = "linux"))]
+    /// Read topology from macOS sysctl.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn read() -> Self {
+        crate::topology_macos::read_topology()
+    }
+
+    /// No-op on other platforms.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn read() -> Self {
         Self::default()
     }

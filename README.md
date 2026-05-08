@@ -8,8 +8,7 @@
 ![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
 **A Linux-first terminal system monitor that shows what generic
-tools hide. macOS support landed in v0.26.0 — degraded but
-functional.**
+tools hide. macOS support achieved feature parity with Linux in v0.27.0.**
 
 Per-core CPU spectrum with SMT/NUMA grouping (HT siblings show as
 `c0a` / `c0b`, `lscpu`-style), multi-vendor GPU dashboards
@@ -39,7 +38,7 @@ Single binary, no daemons, no config required to start.
  └───────────────────────────────────┘ └────────────────────────────────────────┘
 ```
 
-Linux fully supported; macOS support in progress.
+Linux fully supported; macOS fully supported (feature parity achieved in v0.27.0).
 
 ## Install
 

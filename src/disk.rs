@@ -31,16 +31,16 @@ pub(crate) struct Disk {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Sample {
-    when: Instant,
-    sectors_read: u64,
-    sectors_written: u64,
-    time_io_ms: u64,
+pub(crate) struct Sample {
+    pub(crate) when: Instant,
+    pub(crate) sectors_read: u64,
+    pub(crate) sectors_written: u64,
+    pub(crate) time_io_ms: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
-    prev: HashMap<String, Sample>,
+    pub(crate) prev: HashMap<String, Sample>,
 }
 
 impl Tracker {
@@ -58,11 +58,7 @@ impl Tracker {
         }
         #[cfg(target_os = "macos")]
         {
-            // macOS disk I/O monitoring requires IOKit framework which is complex
-            // to bind from pure Rust. For now, return empty. A future implementation
-            // could use the `core-foundation-sys` and `io-kit-sys` crates to query
-            // IOKit for disk statistics, or parse `iostat -d` output.
-            Vec::new()
+            self.snapshot_macos(Instant::now())
         }
     }
 

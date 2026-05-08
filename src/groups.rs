@@ -235,6 +235,7 @@ pub(crate) enum GroupBand {
 }
 
 /// Top-level classifier: container > vm > runtime > system > native.
+#[cfg(target_os = "linux")]
 pub(crate) fn classify_process(cmdline: &str, cgroup: Option<&str>) -> Group {
     if let Some(c) = cgroup.and_then(parse_container_cgroup) {
         return Group::Container(c);
@@ -250,6 +251,48 @@ pub(crate) fn classify_process(cmdline: &str, cgroup: Option<&str>) -> Group {
         return Group::System;
     }
     Group::Native
+}
+
+/// Top-level classifier for macOS: uses process tree analysis for container detection.
+#[cfg(target_os = "macos")]
+pub(crate) fn classify_process(cmdline: &str, _cgroup: Option<&str>) -> Group {
+    // On macOS, we use the PID from the caller to walk the process tree
+    // This requires the PID to be passed separately, which is handled
+    // by the caller in procs.rs. For now, use cmdline-based detection.
+    if let Some(vm) = crate::vm::detect(cmdline) {
+        return Group::Vm(vm);
+    }
+    if let Some(lang) = classify_lang(cmdline) {
+        let app = extract_app(cmdline, lang);
+        return Group::Runtime(lang, app);
+    }
+    if is_system(cmdline) {
+        return Group::System;
+    }
+    Group::Native
+}
+
+/// macOS-specific classifier that includes PID for container detection.
+#[cfg(target_os = "macos")]
+pub(crate) fn classify_process_with_pid(pid: libc::pid_t, cmdline: &str) -> Group {
+    use std::sync::Mutex;
+
+    // Use a static detector to cache runtime PIDs
+    static DETECTOR: Mutex<Option<crate::container_macos::ContainerDetector>> = Mutex::new(None);
+
+    let mut detector = DETECTOR.lock().unwrap();
+    if detector.is_none() {
+        *detector = Some(crate::container_macos::ContainerDetector::new());
+    }
+
+    if let Some(detector) = detector.as_mut() {
+        if let Some(container) = detector.detect_container(pid) {
+            return Group::Container(container);
+        }
+    }
+
+    // Fall back to normal classification
+    classify_process(cmdline, None)
 }
 
 /// Public so `procs::Tracker` can call it after an ELF-based
@@ -868,6 +911,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn classify_process_container_wins_over_runtime() {
         // A node process inside a docker container is grouped with
         // the container, not lumped in with all other Node processes.
