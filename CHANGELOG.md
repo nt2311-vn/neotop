@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] — macOS: real CPU/memory sampling, full argv, drop phantom GPU
+
+Bug-fix release on top of v0.27.0. The macOS port shipped with several
+placeholders that surfaced as visible regressions: an empty per-core CPU
+chart, a hardcoded `0.0%` aggregate CPU, fabricated memory totals,
+runtime-band processes collapsing into a single bucket per language, and
+a misleading `(driver pending)` tag next to the Apple GPU.
+
+### Fixed
+
+- **macOS per-core + aggregate CPU%** — `host.rs` now samples real
+  `host_processor_info(PROCESSOR_CPU_LOAD_INFO)` ticks and derives
+  per-CPU + aggregate %CPU the same way the Linux `/proc/stat` path
+  does. The per-core spectrum/grid renders one cell per logical CPU,
+  making the core count visually obvious; aggregate `CPU%` animates
+  with real load instead of staying at `0.0%`.
+- **macOS memory composition** — replaced the fake
+  `mem_avail = total/2`, `mem_cached = total/4` with real values from
+  `host_statistics64(HOST_VM_INFO64)` (free / inactive / speculative /
+  purgeable / external pages), and real swap totals from
+  `sysctlbyname("vm.swapusage")`.
+- **macOS process grouping by application** — `procs.rs` now reads
+  full argv via `sysctl({CTL_KERN, KERN_PROCARGS2, pid})` and feeds it
+  to the runtime classifier. Previously every Java/Python/Node/Rust/Go
+  process collapsed into one bucket per language because `proc_pidpath`
+  returns only the executable, not arguments.
+- **macOS GPU `(driver pending)` false alarms** — `gpu_macos.rs` no
+  longer matches `"IOPCIDevice"` against itself in `is_gpu_device`,
+  and only walks the `IOPCIDevice` / `IOGraphicsDevice` fallback when
+  `IOAccelerator` returned nothing. Phantom non-GPU PCI nodes that the
+  host overview rendered as `(driver pending)` are gone.
+
 ## [0.27.0] — macOS feature parity: topology, containers, disk, network, temperature
 
 This release completes the macOS port to full feature parity with Linux. All missing features from v0.26.0 are now implemented using native macOS APIs (sysctl, IOKit, libproc). macOS users now have access to the same monitoring capabilities as Linux users.
@@ -2138,7 +2170,9 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/nt2311-vn/neotop/compare/v0.27.0...v0.27.1
+[0.27.0]: https://github.com/nt2311-vn/neotop/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/nt2311-vn/neotop/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/nt2311-vn/neotop/compare/v0.24.3...v0.25.0
 [0.24.3]: https://github.com/nt2311-vn/neotop/compare/v0.24.2...v0.24.3
