@@ -842,6 +842,97 @@ user3:x:1000:1000::/home/alice:/bin/zsh
     }
 }
 
+/// Read full argv for `pid` via `sysctl({CTL_KERN, KERN_PROCARGS2,
+/// pid})`. Layout: `[argc:i32][exec_path\0][padding\0...][argv[0]\0
+/// argv[1]\0...]`. We skip the exec path (proc_pidpath gives us a
+/// nicer one) and join argv with single spaces — matching the
+/// space-separated form the Linux `/proc/<pid>/cmdline` reader
+/// produces, so the existing classifier works unchanged.
+#[cfg(target_os = "macos")]
+fn read_proc_args_macos(pid: libc::pid_t) -> Option<String> {
+    use libc::c_void;
+
+    // SAFETY: two sysctl calls. First fetches `KERN_ARGMAX` so we
+    // can size the buffer; second fills it. Both write into stack
+    // / heap memory we own with correct sizes.
+    unsafe {
+        let mut argmax: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>() as libc::size_t;
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            std::ptr::addr_of_mut!(argmax).cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || argmax <= 0
+        {
+            return None;
+        }
+
+        let mut buf = vec![0u8; argmax as usize];
+        let mut buf_size = argmax as libc::size_t;
+        let mut mib2 = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        if libc::sysctl(
+            mib2.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &mut buf_size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        buf.truncate(buf_size);
+        if buf.len() < 4 {
+            return None;
+        }
+
+        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if argc <= 0 {
+            return None;
+        }
+        let argc = argc as usize;
+
+        let mut p = 4_usize;
+        // Skip the exec_path C string.
+        while p < buf.len() && buf[p] != 0 {
+            p += 1;
+        }
+        // Skip the padding NULs after exec_path.
+        while p < buf.len() && buf[p] == 0 {
+            p += 1;
+        }
+
+        let mut args: Vec<String> = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            if p >= buf.len() {
+                break;
+            }
+            let start = p;
+            while p < buf.len() && buf[p] != 0 {
+                p += 1;
+            }
+            if p > start {
+                args.push(String::from_utf8_lossy(&buf[start..p]).into_owned());
+            }
+            // Step past the terminator (if any).
+            if p < buf.len() {
+                p += 1;
+            }
+        }
+
+        if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Tracker {
     fn read_one_macos(
@@ -913,19 +1004,27 @@ impl Tracker {
                 let uid = if bsd_ok { binfo.pbi_uid } else { 0 };
                 let user = passwd.lookup(uid);
 
-                let mut pathbuf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-                libc::proc_pidpath(
-                    pid,
-                    pathbuf.as_mut_ptr().cast::<c_void>(),
-                    pathbuf.len() as u32,
-                );
-                let command = if pathbuf[0] == 0 {
-                    format!("[pid:{pid}]")
-                } else {
-                    std::ffi::CStr::from_ptr(pathbuf.as_ptr().cast())
-                        .to_string_lossy()
-                        .into_owned()
-                };
+                // Prefer full argv via `KERN_PROCARGS2` so the
+                // group classifier sees the script / jar / module
+                // name (without it every Java/Python/Node process
+                // collapses into a single bucket). Fall back to
+                // `proc_pidpath` for kernel tasks and PIDs we can't
+                // read args for.
+                let command = read_proc_args_macos(pid).unwrap_or_else(|| {
+                    let mut pathbuf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                    libc::proc_pidpath(
+                        pid,
+                        pathbuf.as_mut_ptr().cast::<c_void>(),
+                        pathbuf.len() as u32,
+                    );
+                    if pathbuf[0] == 0 {
+                        format!("[pid:{pid}]")
+                    } else {
+                        std::ffi::CStr::from_ptr(pathbuf.as_ptr().cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                });
 
                 let group = groups::classify_process_with_pid(pid, &command);
 
