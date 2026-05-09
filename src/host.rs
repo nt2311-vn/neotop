@@ -417,6 +417,7 @@ cache size      : 12288 KB
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc deprecates `mach_host_self`/`mach_task_self` in favour of the `mach2` crate, but `mach2` doesn't expose `mach_host_self` and these symbols are stable Apple ABI.
 mod macos {
     use super::*;
 
@@ -530,6 +531,166 @@ mod macos {
         }
     }
 
+    pub(crate) struct MemStats {
+        pub(crate) free: u64,
+        pub(crate) avail: u64,
+        pub(crate) cached: u64,
+    }
+
+    /// Sample per-CPU and aggregate tick counters via
+    /// `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`. Each logical
+    /// CPU yields four counters (USER, SYSTEM, IDLE, NICE); we
+    /// derive `idle` and `total` from those exactly the same way
+    /// the Linux `/proc/stat` path does so the shared `delta_pct`
+    /// works unchanged.
+    pub(crate) fn read_cpu_samples_macos(errors: &mut ErrorRing) -> CpuSamples {
+        let mut cpu_count: libc::natural_t = 0;
+        let mut info_array: libc::processor_info_array_t = std::ptr::null_mut();
+        let mut info_count: libc::mach_msg_type_number_t = 0;
+
+        // SAFETY: `host_processor_info` writes a Mach-allocated
+        // array we own. We must `vm_deallocate` it on success.
+        let kr = unsafe {
+            libc::host_processor_info(
+                libc::mach_host_self(),
+                libc::PROCESSOR_CPU_LOAD_INFO,
+                &mut cpu_count,
+                &mut info_array,
+                &mut info_count,
+            )
+        };
+        if kr != 0 || info_array.is_null() || cpu_count == 0 {
+            errors.push("host", "host_processor_info: kr != 0");
+            return CpuSamples::default();
+        }
+
+        let states = libc::CPU_STATE_MAX as usize;
+        let total_slots = info_count as usize;
+        let cpus = cpu_count as usize;
+
+        let mut per_core: Vec<CpuSample> = Vec::with_capacity(cpus);
+        let mut agg_idle: u64 = 0;
+        let mut agg_total: u64 = 0;
+
+        // SAFETY: `info_array` points to `total_slots` valid
+        // `integer_t` (i32) values. We read `cpus * states` of
+        // them; the kernel guarantees this layout.
+        unsafe {
+            for i in 0..cpus {
+                let base = i * states;
+                if base + states > total_slots {
+                    break;
+                }
+                let user = u64::from(*info_array.add(base + libc::CPU_STATE_USER as usize) as u32);
+                let sys = u64::from(*info_array.add(base + libc::CPU_STATE_SYSTEM as usize) as u32);
+                let idle = u64::from(*info_array.add(base + libc::CPU_STATE_IDLE as usize) as u32);
+                let nice = u64::from(*info_array.add(base + libc::CPU_STATE_NICE as usize) as u32);
+                let total = user + sys + idle + nice;
+                per_core.push(CpuSample { idle, total });
+                agg_idle += idle;
+                agg_total += total;
+            }
+
+            // Release the Mach-allocated buffer.
+            let bytes = (total_slots * std::mem::size_of::<libc::integer_t>()) as libc::vm_size_t;
+            let _ = libc::vm_deallocate(
+                libc::mach_task_self(),
+                info_array as libc::vm_address_t,
+                bytes,
+            );
+        }
+
+        CpuSamples {
+            aggregate: Some(CpuSample {
+                idle: agg_idle,
+                total: agg_total,
+            }),
+            per_core,
+        }
+    }
+
+    /// Read VM page statistics via `host_statistics64(HOST_VM_INFO64)`
+    /// and convert page counts to bytes using `vm_page_size`.
+    /// Returns `None` if the call fails.
+    pub(crate) fn read_vm_stats_macos() -> Option<MemStats> {
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count: libc::mach_msg_type_number_t = libc::HOST_VM_INFO64_COUNT;
+
+        // SAFETY: standard `host_statistics64` call with a
+        // correctly-sized output struct.
+        let kr = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                std::ptr::addr_of_mut!(stats).cast(),
+                &mut count,
+            )
+        };
+        if kr != 0 {
+            return None;
+        }
+
+        // SAFETY: `vm_page_size` is a process-global constant the
+        // kernel sets at startup. Always valid to read.
+        let page_size = unsafe { libc::vm_page_size } as u64;
+
+        let free = u64::from(stats.free_count) * page_size;
+        let inactive = u64::from(stats.inactive_count) * page_size;
+        let speculative = u64::from(stats.speculative_count) * page_size;
+        let purgeable = u64::from(stats.purgeable_count) * page_size;
+        let external = u64::from(stats.external_page_count) * page_size;
+
+        // Activity Monitor's "cached files" ≈ external (file-backed).
+        // Reclaimable ≈ inactive + speculative + purgeable + external.
+        let cached = inactive
+            .saturating_add(speculative)
+            .saturating_add(external);
+        // Available ≈ free + reclaimable. Mirrors what `MemAvailable`
+        // approximates on Linux.
+        let avail = free
+            .saturating_add(inactive)
+            .saturating_add(speculative)
+            .saturating_add(purgeable);
+
+        Some(MemStats {
+            free,
+            avail,
+            cached,
+        })
+    }
+
+    /// Read swap totals via `sysctlbyname("vm.swapusage")`. Returns
+    /// `(total_bytes, free_bytes)`. `None` if swap is unavailable.
+    pub(crate) fn read_swap_macos() -> Option<(u64, u64)> {
+        #[repr(C)]
+        #[derive(Default, Copy, Clone)]
+        struct XswUsage {
+            xsu_total: u64,
+            xsu_avail: u64,
+            xsu_used: u64,
+            xsu_pagesize: u32,
+            xsu_encrypted: u8,
+        }
+        let mut usage = XswUsage::default();
+        let mut size = std::mem::size_of::<XswUsage>() as libc::size_t;
+        let name = b"vm.swapusage\0";
+        // SAFETY: standard `sysctlbyname` query into a correctly
+        // sized POD struct.
+        let kr = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr().cast(),
+                std::ptr::addr_of_mut!(usage).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if kr != 0 {
+            return None;
+        }
+        Some((usage.xsu_total, usage.xsu_avail))
+    }
+
     pub(crate) fn read_cpu_model_macos() -> String {
         // SAFETY: two-pass `sysctl` with a correctly-sized `Vec<u8>` buffer.
         unsafe {
@@ -558,22 +719,39 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn read_cpu_samples(_errors: &mut ErrorRing) -> CpuSamples {
-    CpuSamples {
-        aggregate: Some(CpuSample {
-            idle: 0,
-            total: 100,
-        }),
-        per_core: vec![],
-    }
+pub(crate) fn read_cpu_samples(errors: &mut ErrorRing) -> CpuSamples {
+    macos::read_cpu_samples_macos(errors)
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn snapshot(_prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> HostInfo {
+pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> HostInfo {
     use macos::*;
+
+    let cur = read_cpu_samples_macos(errors);
+
+    let cpu_pct = match (prev.and_then(|p| p.aggregate), cur.aggregate) {
+        (Some(p), Some(c)) => delta_pct(p, c),
+        _ => None,
+    };
+
+    let per_core_pct: Vec<f64> = if let Some(prev) = prev {
+        cur.per_core
+            .iter()
+            .zip(prev.per_core.iter())
+            .filter_map(|(c, p)| delta_pct(*p, *c))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let cpu_count = read_cpu_count_macos();
     let mem_total = read_mem_total_macos();
+    let mem = read_vm_stats_macos().unwrap_or(MemStats {
+        free: mem_total / 4,
+        avail: mem_total / 2,
+        cached: mem_total / 4,
+    });
+    let (swap_total, swap_free) = read_swap_macos().unwrap_or((0, 0));
     let loads = read_loadavg_macos();
     let kernel = read_kernel_macos();
     let cpu_model = read_cpu_model_macos();
@@ -583,16 +761,16 @@ pub(crate) fn snapshot(_prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Ho
         cpu_count,
         cpu_model,
         mem_total_bytes: mem_total,
-        mem_avail_bytes: mem_total / 2,
-        mem_free_bytes: mem_total / 4,
+        mem_avail_bytes: mem.avail,
+        mem_free_bytes: mem.free,
         mem_buffers_bytes: 0,
-        mem_cached_bytes: mem_total / 4,
-        swap_total_bytes: 0,
-        swap_free_bytes: 0,
+        mem_cached_bytes: mem.cached,
+        swap_total_bytes: swap_total,
+        swap_free_bytes: swap_free,
         loadavg_1: loads.0,
         loadavg_5: loads.1,
         loadavg_15: loads.2,
-        cpu_pct: Some(0.0),
-        per_core_pct: vec![],
+        cpu_pct,
+        per_core_pct,
     }
 }

@@ -66,15 +66,33 @@ impl MacosGpuState {
         let mut out = Vec::new();
         let mut seen: Vec<u64> = Vec::new();
 
-        // Try IOAccelerator first (primary GPU class)
-        let class_names: &[&[u8]] = &[b"IOAccelerator\0", b"IOPCIDevice\0", b"IOGraphicsDevice\0"];
+        // Try IOAccelerator first (primary GPU class). On Apple
+        // Silicon and modern Intel Macs this returns the real GPU
+        // and there's no point in fanning out to PCI / graphics
+        // services — they only ever yield false positives we then
+        // render as "(driver pending)". Only fall back when
+        // IOAccelerator returned nothing, e.g. headless servers.
+        let primary: &[&[u8]] = &[b"IOAccelerator\0"];
+        let fallback: &[&[u8]] = &[b"IOPCIDevice\0", b"IOGraphicsDevice\0"];
 
-        for class_name in class_names {
-            if let Some(mut gpus) = self.discover_class(class_name) {
+        for class_name in primary {
+            if let Some(gpus) = self.discover_class(class_name) {
                 for (id, gpu) in gpus {
                     if !seen.contains(&id) {
                         seen.push(id);
                         out.push(gpu);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            for class_name in fallback {
+                if let Some(gpus) = self.discover_class(class_name) {
+                    for (id, gpu) in gpus {
+                        if !seen.contains(&id) {
+                            seen.push(id);
+                            out.push(gpu);
+                        }
                     }
                 }
             }
@@ -172,18 +190,12 @@ fn is_gpu_device(entry: io_kit_sys::types::io_registry_entry_t) -> bool {
         None => return false,
     };
 
-    // Check for GPU-related IOClass patterns
+    // GPU-class IOClass / name patterns. Note: do *not* include
+    // "IOPCIDevice" here — it matches every PCI device on the
+    // system and would let phantom non-GPU cards through, which
+    // the host overview then renders as "(driver pending)".
     let gpu_patterns = [
-        "IOPCIDevice",
-        "AGX",
-        "Intel",
-        "AMD",
-        "Radeon",
-        "NVIDIA",
-        "NV",
-        "display",
-        "VGA",
-        "3D",
+        "AGX", "Intel", "AMD", "Radeon", "NVIDIA", "NV", "display", "VGA", "3D",
     ];
 
     let class_lower = class_name.to_lowercase();
