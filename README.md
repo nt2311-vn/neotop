@@ -249,21 +249,21 @@ flowchart LR
     s_groups[groups.rs]
     s_elf[elf.rs]
   end
-  subgraph linux_impl["Linux impl  (#[cfg(target_os=linux)])"]
+  subgraph linux_impl["Linux impl (cfg target_os=linux)"]
     direction TB
-    l_stat[/proc/stat]
-    l_mem[/proc/meminfo]
-    l_exe[/proc/pid/exe + ELF]
-    l_kvm[debugfs / sysfs]
+    l_stat["/proc/stat"]
+    l_mem["/proc/meminfo"]
+    l_exe["/proc/pid/exe + ELF"]
+    l_kvm["debugfs / sysfs"]
   end
-  subgraph macos_impl["macOS impl  (#[cfg(target_os=macos)])"]
+  subgraph macos_impl["macOS impl (cfg target_os=macos)"]
     direction TB
-    m_cpu[host_processor_info]
-    m_mem[host_statistics64]
-    m_argv[KERN_PROCARGS2]
-    m_macho[Mach-O + FAT scan]
-    m_iokit[IOKit registry walk]
-    m_sysctl[sysctl trees]
+    m_cpu["host_processor_info"]
+    m_mem["host_statistics64"]
+    m_argv["KERN_PROCARGS2"]
+    m_macho["Mach-O + FAT scan"]
+    m_iokit["IOKit registry walk"]
+    m_sysctl["sysctl trees"]
   end
   s_host --> l_stat & l_mem
   s_host --> m_cpu & m_mem

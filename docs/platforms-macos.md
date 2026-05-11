@@ -17,7 +17,7 @@ flowchart LR
   mach --> hostinfo[host_processor_info<br/>host_statistics64]
   libproc --> pidinfo[proc_listallpids<br/>proc_pidinfo · proc_pidpath]
   iokit --> reg[IOServiceMatching:<br/>IOAccelerator · IOMedia]
-  macho --> exe[/proc-equivalent: exe at path]
+  macho --> exe["exe path from proc_pidpath"]
 ```
 
 ## Per-process (procs.rs + libproc)
@@ -75,13 +75,13 @@ buffer of `if_msghdr2` records. We walk it to pull 64-bit RX/TX counters
 ```mermaid
 flowchart LR
   ioacc[IOServiceMatching<br/>IOAccelerator] --> entries[matching iterator]
-  entries --> class{IOClass?}
-  class -- AGX* --> apple[Apple Silicon<br/>unified memory]
-  class -- Intel* --> intel[Intel iGPU]
-  class -- AMDRadeon* --> amd[AMD discrete]
-  class -- nv* --> nvidia[NVIDIA eGPU<br/>NVML dlopen]
+  entries --> ioclass{IOClass?}
+  ioclass -- AGX* --> apple[Apple Silicon<br/>unified memory]
+  ioclass -- Intel* --> intel[Intel iGPU]
+  ioclass -- AMDRadeon* --> amd[AMD discrete]
+  ioclass -- nv* --> nvidia[NVIDIA eGPU<br/>NVML dlopen]
   apple & intel & amd & nvidia --> props[IORegistryEntryCreateCFProperties]
-  props --> perf[PerformanceStatistics dict:<br/>Device Utilization %<br/>vramUsedBytes]
+  props --> perf["PerformanceStatistics dict:<br/>Device Utilization %<br/>vramUsedBytes"]
 ```
 
 The detector walks `IOAccelerator` first; fallback to `IOPCIDevice` /
@@ -134,16 +134,16 @@ Podman / containerd-named ancestor and tags descendants — but the
 ```mermaid
 flowchart TD
   open[open exe file] --> magic[read 4-byte magic LE]
-  magic --> fat{FAT_MAGIC or<br/>FAT_CIGAM?}
-  fat -- yes --> readArch[parse fat_arch<br/>big-endian<br/>seek to first slice]
-  fat -- no --> nativeMagic{MH_MAGIC{,64}<br/>or CIGAM variant?}
-  readArch --> scan[read up to 4 MiB rodata]
+  magic --> fat{"FAT_MAGIC or FAT_CIGAM?"}
+  fat -- yes --> readArch["parse fat_arch (big-endian)<br/>seek to first slice"]
+  fat -- no --> nativeMagic{"MH_MAGIC / MH_MAGIC_64<br/>or CIGAM variant?"}
+  readArch --> scan["read up to 4 MiB rodata"]
   nativeMagic -- yes --> scan
-  nativeMagic -- no --> fail[None]
+  nativeMagic -- no --> fail["None"]
   scan --> sigGo{"go.buildid / runtime.main /<br/>Go buildinf:"}
   scan --> sigRust{"library/std/src/ /<br/>/rustc/ / _RNv"}
-  sigGo -- hit --> outGo[Lang::Go]
-  sigRust -- hit --> outRust[Lang::Rust]
+  sigGo -- hit --> outGo["Lang::Go"]
+  sigRust -- hit --> outRust["Lang::Rust"]
 ```
 
 v0.27.2 fixed two bugs here: the magic was being decoded big-endian (so

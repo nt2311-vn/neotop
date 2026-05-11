@@ -11,7 +11,13 @@
 
 # Obsidian vault — per-user state and plugin binaries (plugins are
 # re-downloaded per machine from the community-plugins list).
+# Exception: the two mermaid plugins that make the charts in docs/
+# and README.md zoomable / draggable ship with the repo so a fresh
+# clone has them out of the box.
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json
 .obsidian/cache
-.obsidian/plugins/
+.obsidian/plugins/*
+!.obsidian/plugins/mermaid-popup/
+!.obsidian/plugins/mermaid-tools/
+.devin/
