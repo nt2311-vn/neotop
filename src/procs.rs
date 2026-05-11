@@ -1004,13 +1004,11 @@ impl Tracker {
                 let uid = if bsd_ok { binfo.pbi_uid } else { 0 };
                 let user = passwd.lookup(uid);
 
-                // Prefer full argv via `KERN_PROCARGS2` so the
-                // group classifier sees the script / jar / module
-                // name (without it every Java/Python/Node process
-                // collapses into a single bucket). Fall back to
-                // `proc_pidpath` for kernel tasks and PIDs we can't
-                // read args for.
-                let command = read_proc_args_macos(pid).unwrap_or_else(|| {
+                // Read the executable path once — we need it
+                // both as a fallback for the cmdline (kernel tasks
+                // and PIDs we can't read args for) and as the
+                // input to the Mach-O Go/Rust detector.
+                let exe_path: Option<String> = {
                     let mut pathbuf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
                     libc::proc_pidpath(
                         pid,
@@ -1018,15 +1016,46 @@ impl Tracker {
                         pathbuf.len() as u32,
                     );
                     if pathbuf[0] == 0 {
-                        format!("[pid:{pid}]")
+                        None
                     } else {
-                        std::ffi::CStr::from_ptr(pathbuf.as_ptr().cast())
-                            .to_string_lossy()
-                            .into_owned()
+                        Some(
+                            std::ffi::CStr::from_ptr(pathbuf.as_ptr().cast())
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
                     }
-                });
+                };
 
-                let group = groups::classify_process_with_pid(pid, &command);
+                // Prefer full argv via `KERN_PROCARGS2` so the
+                // group classifier sees the script / jar / module
+                // name (without it every Java/Python/Node process
+                // collapses into a single bucket).
+                let command = read_proc_args_macos(pid)
+                    .or_else(|| exe_path.clone())
+                    .unwrap_or_else(|| format!("[pid:{pid}]"));
+
+                let mut group = groups::classify_process_with_pid(pid, &command);
+                // cmdline-only classification can't tell Go or
+                // Rust binaries apart from any other Mach-O
+                // executable — they look like a single static
+                // binary named after the target. Inspect the
+                // Mach-O at `exe_path` as a second pass *only*
+                // when we'd otherwise tag the row Native (so we
+                // don't pay the I/O for processes that already
+                // classified as Container/VM/Runtime/System).
+                // Without this, every Rust/Go daemon on macOS
+                // falls into the headerless Native band and the
+                // group view never shows a `rust:<bin>` /
+                // `go:<bin>` aggregate row.
+                if matches!(group, Group::Native) {
+                    if let Some(ref exe) = exe_path {
+                        let path = std::path::PathBuf::from(exe);
+                        if let Some(lang) = crate::elf::detect_native_lang(&path) {
+                            let app = groups::argv0_basename_or_empty(&command);
+                            group = Group::Runtime(lang, app);
+                        }
+                    }
+                }
 
                 let static_info = StaticInfo {
                     uid,

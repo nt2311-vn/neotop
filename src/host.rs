@@ -534,6 +534,7 @@ mod macos {
     pub(crate) struct MemStats {
         pub(crate) free: u64,
         pub(crate) avail: u64,
+        pub(crate) buffers: u64,
         pub(crate) cached: u64,
     }
 
@@ -634,27 +635,45 @@ mod macos {
         // kernel sets at startup. Always valid to read.
         let page_size = unsafe { libc::vm_page_size } as u64;
 
-        let free = u64::from(stats.free_count) * page_size;
+        let free_pages = u64::from(stats.free_count) * page_size;
         let inactive = u64::from(stats.inactive_count) * page_size;
         let speculative = u64::from(stats.speculative_count) * page_size;
         let purgeable = u64::from(stats.purgeable_count) * page_size;
         let external = u64::from(stats.external_page_count) * page_size;
 
-        // Activity Monitor's "cached files" ≈ external (file-backed).
-        // Reclaimable ≈ inactive + speculative + purgeable + external.
-        let cached = inactive
-            .saturating_add(speculative)
-            .saturating_add(external);
-        // Available ≈ free + reclaimable. Mirrors what `MemAvailable`
-        // approximates on Linux.
+        // Map macOS VM counters onto the four-segment bar the
+        // renderer already draws for Linux (`used | buffers |
+        // cached | free`). The important invariant is that the
+        // segments must not double-count: `external_page_count`
+        // overlaps with `inactive_count` and `active_count`, so
+        // we can't treat "inactive" as a fifth segment.
+        //
+        // * `free` — Activity Monitor's "Free": genuinely free
+        //   (`free_count`) plus speculative pages that the kernel
+        //   will reuse on the next allocation (`speculative_count`).
+        // * `cached` — Activity Monitor's "Cached files":
+        //   file-backed pages (`external_page_count`). Subset of
+        //   active+inactive, reclaimable under pressure.
+        // * `buffers` — closest analogue for macOS is the
+        //   purgeable volatile pool (`purgeable_count`), which
+        //   the kernel can drop without paging.
+        // * `used` — left as the renderer's `total - (free + buf
+        //   + cached)`, which works out to wired + anonymous +
+        //   compressed = Activity Monitor's "Memory Used".
+        let free = free_pages.saturating_add(speculative);
+        let cached = external;
+        let buffers = purgeable;
+        // Available ≈ free + cached + buffers + inactive non-file
+        // (= what the kernel can hand out without paging).
         let avail = free
-            .saturating_add(inactive)
-            .saturating_add(speculative)
-            .saturating_add(purgeable);
+            .saturating_add(cached)
+            .saturating_add(buffers)
+            .saturating_add(inactive.saturating_sub(external));
 
         Some(MemStats {
             free,
             avail,
+            buffers,
             cached,
         })
     }
@@ -749,6 +768,7 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
     let mem = read_vm_stats_macos().unwrap_or(MemStats {
         free: mem_total / 4,
         avail: mem_total / 2,
+        buffers: 0,
         cached: mem_total / 4,
     });
     let (swap_total, swap_free) = read_swap_macos().unwrap_or((0, 0));
@@ -763,7 +783,7 @@ pub(crate) fn snapshot(prev: Option<&CpuSamples>, errors: &mut ErrorRing) -> Hos
         mem_total_bytes: mem_total,
         mem_avail_bytes: mem.avail,
         mem_free_bytes: mem.free,
-        mem_buffers_bytes: 0,
+        mem_buffers_bytes: mem.buffers,
         mem_cached_bytes: mem.cached,
         swap_total_bytes: swap_total,
         swap_free_bytes: swap_free,
