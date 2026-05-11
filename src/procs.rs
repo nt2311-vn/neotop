@@ -292,7 +292,7 @@ impl Tracker {
             // second pass *only* when we'd otherwise tag the row
             // Native (so we don't pay the I/O for processes that
             // already classified as Container/VM/Runtime/System).
-            if matches!(group, Group::Native) {
+            if matches!(group, Group::Native(_)) {
                 let exe = std::path::PathBuf::from(format!("{base}/exe"));
                 if let Some(lang) = crate::elf::detect_native_lang(&exe) {
                     // Compiled binary's argv0 basename *is* the
@@ -679,7 +679,7 @@ mod tests {
             read_bps: None,
             write_bps: None,
             command: "/usr/bin/BASH".into(),
-            group: Group::Native,
+            group: Group::Native(String::new()),
         };
         assert!(matches(&row, "bash"));
         assert!(matches(&row, "ALICE"));
@@ -760,7 +760,7 @@ mod tests {
             read_bps: None,
             write_bps: None,
             command: "café-server".into(),
-            group: Group::Native,
+            group: Group::Native(String::new()),
         };
         assert!(matches(&row, "café"));
         assert!(matches(&row, "CAF")); // ascii prefix still matches
@@ -837,7 +837,7 @@ user3:x:1000:1000::/home/alice:/bin/zsh
             read_bps: None,
             write_bps: None,
             command: format!("cmd{pid}"),
-            group: Group::Native,
+            group: Group::Native(String::new()),
         }
     }
 }
@@ -1047,7 +1047,7 @@ impl Tracker {
                 // falls into the headerless Native band and the
                 // group view never shows a `rust:<bin>` /
                 // `go:<bin>` aggregate row.
-                if matches!(group, Group::Native) {
+                if matches!(group, Group::Native(_)) {
                     if let Some(ref exe) = exe_path {
                         let path = std::path::PathBuf::from(exe);
                         if let Some(lang) = crate::elf::detect_native_lang(&path) {

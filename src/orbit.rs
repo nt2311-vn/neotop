@@ -255,7 +255,7 @@ mod tests {
             read_bps: None,
             write_bps: None,
             command: cmd.into(),
-            group: crate::groups::Group::Native,
+            group: crate::groups::Group::Native(String::new()),
         }
     }
 

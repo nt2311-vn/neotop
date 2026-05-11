@@ -160,8 +160,22 @@ pub(crate) enum Group {
     /// runtimes whose cmdline doesn't expose a script (e.g. a bare
     /// `python3` REPL); those still cluster as a single group.
     Runtime(Lang, String),
+    /// macOS `.app` bundle — every helper / renderer / GPU process
+    /// launched by a bundled app clusters under one row keyed on the
+    /// bundle name. Without this, Electron / Chromium / Xcode swarms
+    /// (20+ helper processes each) spread across many Native rows
+    /// and drown the group view. Only the macOS classifier produces
+    /// this variant today; the enum is shared across platforms so
+    /// match exhaustiveness stays uniform.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    App(String),
     System,
-    Native,
+    /// Catch-all "no known classifier" band. The payload is the
+    /// argv[0] basename so distinct native daemons (e.g. `sshd`,
+    /// `fish`, `zsh`, `git`, `mdworker`) each get their own
+    /// aggregate row instead of collapsing into a single giant
+    /// "native" bucket.
+    Native(String),
 }
 
 impl Group {
@@ -181,24 +195,31 @@ impl Group {
                     format!("{}:{} [{}]", l.label(), app, l.signature())
                 }
             }
+            Self::App(bundle) => format!("app:{bundle}"),
             Self::System => "system".into(),
-            Self::Native => "native".into(),
+            Self::Native(bin) => {
+                if bin.is_empty() {
+                    "native".into()
+                } else {
+                    format!("native:{bin}")
+                }
+            }
         }
     }
 
-    /// Stable order: container > vm > runtime > system > native.
-    /// Inside the runtime band, sub-key on app name so each app gets
-    /// its own bucket — the bug fix for "all Rust processes summed
-    /// into one row" that used to push the runtime band to the top
-    /// of CPU-sorted listings regardless of which app was actually
-    /// busy.
+    /// Stable order: container > vm > runtime > app > system > native.
+    /// Inside the runtime / app / native bands, sub-key on name so
+    /// each distinct app/binary gets its own bucket — the bug fix
+    /// for "all Rust processes summed into one row" extended to
+    /// every other band that could have collapsed the same way.
     pub(crate) fn sort_key(&self) -> String {
         match self {
             Self::Container(c) => format!("0_{}_{}", c.runtime.label(), c.id),
             Self::Vm(v) => format!("1_{}_{}", v.hypervisor.label(), v.name),
             Self::Runtime(l, app) => format!("2_{}_{}", l.label(), app),
-            Self::System => "3_system".into(),
-            Self::Native => "4_native".into(),
+            Self::App(bundle) => format!("3_app_{bundle}"),
+            Self::System => "4_system".into(),
+            Self::Native(bin) => format!("5_native_{bin}"),
         }
     }
 
@@ -207,8 +228,9 @@ impl Group {
             Self::Container(_) => GroupBand::Container,
             Self::Vm(_) => GroupBand::Vm,
             Self::Runtime(_, _) => GroupBand::Runtime,
+            Self::App(_) => GroupBand::App,
             Self::System => GroupBand::System,
-            Self::Native => GroupBand::Native,
+            Self::Native(_) => GroupBand::Native,
         }
     }
 
@@ -229,6 +251,7 @@ pub(crate) enum GroupBand {
     Container,
     Vm,
     Runtime,
+    App,
     System,
     #[default]
     Native,
@@ -250,7 +273,7 @@ pub(crate) fn classify_process(cmdline: &str, cgroup: Option<&str>) -> Group {
     if is_system(cmdline) {
         return Group::System;
     }
-    Group::Native
+    Group::Native(argv0_basename_or_empty(cmdline))
 }
 
 /// Top-level classifier for macOS: uses process tree analysis for container detection.
@@ -266,10 +289,52 @@ pub(crate) fn classify_process(cmdline: &str, _cgroup: Option<&str>) -> Group {
         let app = extract_app(cmdline, lang);
         return Group::Runtime(lang, app);
     }
+    // `.app` bundle detection: the argv[0] path is the full
+    // executable, so a bundled app like Xcode shows up as
+    // `/Applications/Xcode.app/Contents/MacOS/Xcode` — every
+    // helper / renderer / GPU process under that bundle shares
+    // the `Xcode.app` segment, which is the right clustering key.
+    if let Some(bundle) = extract_macos_app_bundle(cmdline) {
+        return Group::App(bundle);
+    }
     if is_system(cmdline) {
         return Group::System;
     }
-    Group::Native
+    Group::Native(argv0_basename_or_empty(cmdline))
+}
+
+/// Extract the bundle name from a macOS `.app` executable path.
+/// Returns `None` if the path doesn't contain a `.app/` segment.
+///
+/// Examples:
+/// * `/Applications/Xcode.app/Contents/MacOS/Xcode` → `Xcode`
+/// * `/Applications/Google Chrome.app/Contents/Frameworks/.../Google Chrome Helper (Renderer)` → `Google Chrome`
+/// * `/Users/x/Applications/Slack.app/Contents/MacOS/Slack` → `Slack`
+#[cfg(target_os = "macos")]
+pub(crate) fn extract_macos_app_bundle(cmdline: &str) -> Option<String> {
+    // argv[0] is the full executable path on macOS (from
+    // `KERN_PROCARGS2`). Fall back to the raw cmdline when there's
+    // no space yet — handles single-token "exe-only" cases too.
+    let argv0 = cmdline
+        .split('\0')
+        .next()
+        .unwrap_or(cmdline)
+        .split_whitespace()
+        .next()
+        .unwrap_or(cmdline);
+    // Walk path components looking for the *outermost* `*.app`. We
+    // deliberately pick the outer one so `Google Chrome Helper.app`
+    // (nested inside `Google Chrome.app/Contents/Frameworks/...`)
+    // still clusters under the parent `Google Chrome`.
+    let mut outer: Option<&str> = None;
+    for segment in argv0.split('/') {
+        if let Some(name) = segment.strip_suffix(".app") {
+            if outer.is_none() {
+                outer = Some(name);
+            }
+        }
+    }
+    outer.map(str::to_string)
 }
 
 /// macOS-specific classifier that includes PID for container detection.
@@ -942,10 +1007,11 @@ mod tests {
         );
         // Kernel threads (cmdline empty → procs.rs renders as `[kthreadd]`).
         assert_eq!(classify_process("[kthreadd]", None), Group::System);
-        // Anything else → Native.
+        // Anything else → Native(basename) so it aggregates with
+        // sibling binaries of the same name.
         assert_eq!(
             classify_process("/usr/local/bin/myapp --serve", None),
-            Group::Native,
+            Group::Native("myapp".into()),
         );
     }
 
@@ -959,19 +1025,22 @@ mod tests {
             id: "abc12345".into(),
         });
         let runtime = Group::Runtime(Lang::Java, "app.jar".into());
+        let app = Group::App("Xcode".into());
         let system = Group::System;
-        let native = Group::Native;
+        let native = Group::Native("myapp".into());
         let mut keys = [
             native.sort_key(),
             system.sort_key(),
+            app.sort_key(),
             runtime.sort_key(),
             containerised.sort_key(),
         ];
         keys.sort();
         assert_eq!(keys[0], containerised.sort_key());
         assert_eq!(keys[1], runtime.sort_key());
-        assert_eq!(keys[2], system.sort_key());
-        assert_eq!(keys[3], native.sort_key());
+        assert_eq!(keys[2], app.sort_key());
+        assert_eq!(keys[3], system.sort_key());
+        assert_eq!(keys[4], native.sort_key());
     }
 
     #[test]
@@ -1008,7 +1077,29 @@ mod tests {
             "python [GIL+asyncio]"
         );
         assert_eq!(Group::System.label(), "system");
-        assert_eq!(Group::Native.label(), "native");
+        assert_eq!(Group::Native(String::new()).label(), "native");
+        assert_eq!(Group::Native("sshd".into()).label(), "native:sshd");
+        assert_eq!(Group::App("Xcode".into()).label(), "app:Xcode");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn extract_macos_app_bundle_parses_common_layouts() {
+        assert_eq!(
+            extract_macos_app_bundle("/Applications/Xcode.app/Contents/MacOS/Xcode"),
+            Some("Xcode".into()),
+        );
+        // Nested helper bundle should still cluster under the
+        // outer (parent) `.app`.
+        assert_eq!(
+            extract_macos_app_bundle(
+                "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/Current/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+            ),
+            Some("Google Chrome".into()),
+        );
+        // Non-app path returns None so the classifier falls
+        // through to `is_system` / `Native`.
+        assert_eq!(extract_macos_app_bundle("/usr/bin/ssh user@host"), None,);
     }
 
     #[test]
