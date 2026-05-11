@@ -55,6 +55,8 @@ mod gpu;
 mod gpu_macos;
 mod groups;
 mod host;
+#[cfg(target_os = "macos")]
+mod ioreport_macos;
 mod kvm;
 mod net;
 #[cfg(target_os = "macos")]
@@ -63,6 +65,8 @@ mod orbit;
 mod passthrough;
 mod proc;
 mod procs;
+#[cfg(target_os = "macos")]
+mod smc_macos;
 mod temp;
 #[cfg(target_os = "macos")]
 mod temp_macos;

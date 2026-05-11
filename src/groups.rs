@@ -312,29 +312,22 @@ pub(crate) fn classify_process(cmdline: &str, _cgroup: Option<&str>) -> Group {
 /// * `/Users/x/Applications/Slack.app/Contents/MacOS/Slack` → `Slack`
 #[cfg(target_os = "macos")]
 pub(crate) fn extract_macos_app_bundle(cmdline: &str) -> Option<String> {
-    // argv[0] is the full executable path on macOS (from
-    // `KERN_PROCARGS2`). Fall back to the raw cmdline when there's
-    // no space yet — handles single-token "exe-only" cases too.
-    let argv0 = cmdline
-        .split('\0')
-        .next()
-        .unwrap_or(cmdline)
-        .split_whitespace()
-        .next()
-        .unwrap_or(cmdline);
-    // Walk path components looking for the *outermost* `*.app`. We
-    // deliberately pick the outer one so `Google Chrome Helper.app`
-    // (nested inside `Google Chrome.app/Contents/Frameworks/...`)
-    // still clusters under the parent `Google Chrome`.
-    let mut outer: Option<&str> = None;
-    for segment in argv0.split('/') {
-        if let Some(name) = segment.strip_suffix(".app") {
-            if outer.is_none() {
-                outer = Some(name);
-            }
-        }
+    // Scan the cmdline directly for the first `.app/` segment —
+    // do *not* try to extract argv[0] by whitespace, because Apple
+    // bundle paths legally contain spaces ("Google Chrome.app",
+    // "Visual Studio Code.app") and that would split mid-name.
+    // Slashes can't appear in path components, so walking back from
+    // the first `.app/` to the previous `/` always yields the
+    // correct bundle name.
+    let idx = cmdline.find(".app/")?;
+    let before = &cmdline[..idx];
+    let start = before.rfind('/').map_or(0, |p| p + 1);
+    let name = &before[start..];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
-    outer.map(str::to_string)
 }
 
 /// macOS-specific classifier that includes PID for container detection.

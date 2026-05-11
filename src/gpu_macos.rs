@@ -41,9 +41,28 @@ const IO_ACCELERATOR_CLASS: &[u8] = b"IOAccelerator\0";
 /// by the registry-entry-id which is stable across ticks for a
 /// given card. Apple Silicon GPU's id is fixed per boot; eGPU
 /// hot-plug invalidates the entry so a fresh discovery pass runs.
-#[derive(Debug, Default)]
+///
+/// `ioreport` is initialised lazily on the first tick that sees an
+/// AGX (Apple Silicon) card and held for the lifetime of the
+/// process. It owns a single subscription to the GPU performance-
+/// state channel which we delta across ticks; on Intel Macs the
+/// field stays `None` because IOReport's GPU group isn't populated.
+#[derive(Default)]
 pub(crate) struct MacosGpuState {
     cached: HashMap<u64, CardStatic>,
+    ioreport: Option<crate::ioreport_macos::GpuBusySampler>,
+    ioreport_tried: bool,
+}
+
+// Manual Debug because `GpuBusySampler` deliberately doesn't derive
+// it (the FFI handle isn't useful in debug output).
+impl std::fmt::Debug for MacosGpuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacosGpuState")
+            .field("cached", &self.cached)
+            .field("ioreport_loaded", &self.ioreport.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +178,24 @@ impl MacosGpuState {
             .entry(id)
             .or_insert_with(|| classify(entry, &props))
             .clone();
-        let (busy_pct, vram_used) = read_perf_stats(&props, stat.vendor);
+        let (mut busy_pct, vram_used) = read_perf_stats(&props, stat.vendor);
+
+        // Apple Silicon GPUs increasingly stop populating
+        // `Device Utilization %` in IOReg — Apple migrated the
+        // canonical telemetry into IOReport. Fall back to it for
+        // AGX cards when the IOReg dict didn't give us a number.
+        if busy_pct.is_none() && stat.unified_memory {
+            if !self.ioreport_tried {
+                self.ioreport_tried = true;
+                self.ioreport = crate::ioreport_macos::GpuBusySampler::new();
+            }
+            if let Some(s) = self.ioreport.as_mut() {
+                if let Some(b) = s.sample() {
+                    busy_pct = Some(b);
+                }
+            }
+        }
+
         let name = if stat.unified_memory {
             format!("{} (unified)", stat.name)
         } else {

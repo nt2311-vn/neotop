@@ -1,240 +1,149 @@
-//! temp_macos.rs — temperature sensor reading on macOS.
+//! temp_macos.rs — temperature sensor reader for macOS.
 //!
-//! Uses IOKit to read temperature sensors:
-//! - Intel Macs: SMC (System Management Controller) via AppleSMC driver
-//! - Apple Silicon: IOReport framework for thermal sensors
+//! Talks to AppleSMC (see [`crate::smc_macos`] for the protocol) and
+//! returns a `ScanReport` shaped exactly like the Linux hwmon path
+//! so the cross-platform `temp::Tracker` doesn't care which OS the
+//! readings came from. Both Intel and Apple Silicon Macs route
+//! through the same SMC user-client; only the key vocabulary
+//! differs and we probe the union (see `SENSOR_KEYS`).
 //!
-//! This is a simplified implementation that provides basic temperature
-//! readings for the most common sensors.
+//! The IOKit `IOAccelerator` fallback for GPU temperature is kept
+//! as a last resort — some macOS releases stop reporting `TG0*` /
+//! `Tg0*` via SMC, but the GPU's own IOReg dictionary still carries
+//! a `Temperature` field. Belt-and-braces.
 
-use core_foundation::base::{CFType, TCFType};
-use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::base::TCFType;
+use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
-use core_foundation::string::{CFString, CFStringRef};
+use core_foundation::string::CFString;
 use io_kit_sys::{
     kIOMasterPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
     IOServiceGetMatchingServices, IOServiceMatching,
 };
 use std::ffi::CString;
 
+use crate::smc_macos::{SmcClient, SENSOR_KEYS};
 use crate::temp::{Reading, ScanReport, Tracker};
-
-/// AppleSMC service for Intel Macs
-const APPLE_SMC_CLASS: &[u8] = b"AppleSMC\0";
-
-/// IOReport service for Apple Silicon
-const IO_REPORT_CLASS: &[u8] = b"IOReport\0";
 
 pub(crate) fn scan(tracker: &Tracker) -> ScanReport {
     tracker.scan_macos()
 }
 
 impl Tracker {
-    /// Scan temperature sensors on macOS
+    /// Drive the platform-specific scan. The cached SMC client
+    /// lives for the lifetime of the function call — opening costs
+    /// one IOKit round-trip, well under 1 ms.
     fn scan_macos(&self) -> ScanReport {
-        // Detect architecture
-        let is_apple_silicon = self.is_apple_silicon();
+        let mut readings: Vec<Reading> = Vec::new();
+        let mut errors: Vec<(&'static str, String)> = Vec::new();
 
-        if is_apple_silicon {
-            self.scan_apple_silicon()
-        } else {
-            self.scan_intel()
-        }
-    }
-
-    /// Check if running on Apple Silicon
-    fn is_apple_silicon(&self) -> bool {
-        // Use sysctl to check hw.machine for arm64
-        const CTL_HW: i32 = 6;
-        const HW_MACHINE: i32 = 1;
-        let mut value = [0i8; 32];
-        let mut len = value.len() as libc::size_t;
-        let mut mib = [CTL_HW, HW_MACHINE];
-
-        let result = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                2,
-                value.as_mut_ptr() as *mut libc::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if result == 0 {
-            let bytes: Vec<u8> = value
-                .iter()
-                .take_while(|&&c| c != 0)
-                .map(|&c| c as u8)
-                .collect();
-            let machine = unsafe { std::str::from_utf8_unchecked(&bytes) };
-            machine.starts_with("arm")
-        } else {
-            false
-        }
-    }
-
-    /// Scan temperature sensors on Intel Macs via SMC
-    fn scan_intel(&self) -> ScanReport {
-        let mut readings = Vec::new();
-
-        // Try to read from AppleSMC
-        if let Some(temp) = self.read_smc_temperature() {
-            readings.push(Reading {
-                label: "CPU".to_string(),
-                celsius: temp,
-            });
+        match SmcClient::open() {
+            Some(smc) => {
+                for (key, label) in SENSOR_KEYS {
+                    if let Some(c) = smc.read_temperature(key) {
+                        // Filter outliers — a missing-but-not-reported
+                        // sensor sometimes returns 0 K (-273) or
+                        // wildly positive values. Anything outside a
+                        // plausible silicon range is junk.
+                        if (-40.0..=125.0).contains(&c) && c.abs() > 0.5 {
+                            readings.push(Reading {
+                                label: (*label).to_string(),
+                                celsius: c,
+                            });
+                        }
+                    }
+                }
+            }
+            None => {
+                errors.push(("temp", "AppleSMC: IOServiceOpen failed".into()));
+            }
         }
 
-        // Try to read GPU temperature if available
-        if let Some(temp) = self.read_gpu_temperature() {
-            readings.push(Reading {
-                label: "GPU".to_string(),
-                celsius: temp,
-            });
+        // Belt-and-braces: walk `IOAccelerator` for any GPU that
+        // still surfaces `Temperature` in its IOReg dict. This is
+        // the only way to see Apple Silicon dGPU readings on the
+        // few external NVIDIA cards still supported.
+        if let Some(temp) = read_ioacc_gpu_temperature() {
+            if !readings.iter().any(|r| r.label.starts_with("GPU")) {
+                readings.push(Reading {
+                    label: "GPU".to_string(),
+                    celsius: temp,
+                });
+            }
         }
 
         ScanReport {
             readings,
             infos: Vec::new(),
-            errors: Vec::new(),
+            errors,
         }
     }
+}
 
-    /// Scan temperature sensors on Apple Silicon via IOReport
-    fn scan_apple_silicon(&self) -> ScanReport {
-        let mut readings = Vec::new();
-
-        // Apple Silicon temperature sensors are exposed via IOReport
-        // This is a simplified implementation that reads common sensors
-        if let Some(temp) = self.read_ioreport_temperature("TC0E") {
-            readings.push(Reading {
-                label: "CPU Efficiency".to_string(),
-                celsius: temp,
-            });
+/// Walk every `IOAccelerator` and return the first `Temperature`
+/// (or `Device Temperature` / `GPU Temperature`) value we find.
+/// Some drivers report deci-Celsius — divide by 10 if the reading
+/// is implausibly large.
+fn read_ioacc_gpu_temperature() -> Option<f64> {
+    // SAFETY: IOKit's matching/iteration APIs are documented; we
+    // release every retained object on every return path.
+    unsafe {
+        let class = CString::new("IOAccelerator").ok()?;
+        let matching = IOServiceMatching(class.as_ptr());
+        if matching.is_null() {
+            return None;
         }
-
-        if let Some(temp) = self.read_ioreport_temperature("TC0P") {
-            readings.push(Reading {
-                label: "CPU Performance".to_string(),
-                celsius: temp,
-            });
-        }
-
-        if let Some(temp) = self.read_ioreport_temperature("TG0D") {
-            readings.push(Reading {
-                label: "GPU".to_string(),
-                celsius: temp,
-            });
-        }
-
-        ScanReport {
-            readings,
-            infos: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-
-    /// Read temperature from SMC on Intel Macs
-    fn read_smc_temperature(&self) -> Option<f64> {
-        // This is a simplified implementation. A full implementation would:
-        // 1. Open AppleSMC user client
-        // 2. Send SMC keys for temperature sensors
-        // 3. Parse the response
-
-        // For now, return None as this requires complex SMC protocol handling
-        // A production implementation would use the SMC keys like "TC0C", "TC0D", etc.
-        None
-    }
-
-    /// Read GPU temperature via IOKit
-    fn read_gpu_temperature(&self) -> Option<f64> {
-        // Try to read from IOAccelerator services
         let mut iter: io_kit_sys::types::io_iterator_t = 0;
-
-        unsafe {
-            let class = CString::new("IOAccelerator").ok()?;
-            let matching = IOServiceMatching(class.as_ptr());
-            if matching.is_null() {
-                return None;
-            }
-            let kr = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iter);
-            if kr != 0 {
-                return None;
-            }
+        if IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iter) != 0 {
+            return None;
         }
 
+        let mut found: Option<f64> = None;
         loop {
-            let entry = unsafe { IOIteratorNext(iter) };
+            let entry = IOIteratorNext(iter);
             if entry == 0 {
                 break;
             }
-
-            if let Some(temp) = self.read_temperature_from_entry(entry) {
-                unsafe { IOObjectRelease(entry) };
-                unsafe { IOObjectRelease(iter) };
-                return Some(temp);
+            if let Some(t) = temperature_from_entry(entry) {
+                found = Some(t);
+                IOObjectRelease(entry);
+                break;
             }
-
-            unsafe { IOObjectRelease(entry) };
+            IOObjectRelease(entry);
         }
-
-        unsafe { IOObjectRelease(iter) };
-        None
+        IOObjectRelease(iter);
+        found
     }
+}
 
-    /// Read temperature from IOReport on Apple Silicon
-    fn read_ioreport_temperature(&self, _sensor_key: &str) -> Option<f64> {
-        // IOReport is complex and requires subscribing to report channels
-        // This is a placeholder for a full implementation
-        None
+unsafe fn temperature_from_entry(entry: io_kit_sys::types::io_registry_entry_t) -> Option<f64> {
+    let mut props: core_foundation_sys::dictionary::CFMutableDictionaryRef = std::ptr::null_mut();
+    if IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null_mut(), 0) != 0
+        || props.is_null()
+    {
+        return None;
     }
-
-    /// Read temperature from a specific IOKit registry entry
-    fn read_temperature_from_entry(
-        &self,
-        entry: io_kit_sys::types::io_registry_entry_t,
-    ) -> Option<f64> {
-        let props = self.copy_properties(entry)?;
-
-        // Try common temperature keys
-        let temp_keys = ["Temperature", "Device Temperature", "GPU Temperature"];
-        for key in &temp_keys {
-            if let Some(temp) = self.read_cfnumber_f64(&props, key) {
-                // Convert from whatever units the driver uses to Celsius
-                // Some drivers report in deci-Celsius, some in Celsius
-                let celsius = if temp > 1000.0 { temp / 10.0 } else { temp };
-                return Some(celsius);
+    let dict: CFDictionary = CFDictionary::wrap_under_create_rule(props.cast());
+    for key in ["Temperature", "Device Temperature", "GPU Temperature"] {
+        if let Some(raw) = read_cfnumber_f64(&dict, key) {
+            let c = if raw > 1000.0 { raw / 10.0 } else { raw };
+            if (-40.0..=125.0).contains(&c) && c.abs() > 0.5 {
+                return Some(c);
             }
         }
-
-        None
     }
+    None
+}
 
-    fn copy_properties(
-        &self,
-        entry: io_kit_sys::types::io_registry_entry_t,
-    ) -> Option<CFDictionary> {
-        let mut props: core_foundation_sys::dictionary::CFMutableDictionaryRef =
-            std::ptr::null_mut();
-        let kr = unsafe {
-            IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null_mut(), 0)
-        };
-        if kr != 0 || props.is_null() {
-            return None;
-        }
-        Some(unsafe { CFDictionary::wrap_under_create_rule(props.cast()) })
+unsafe fn read_cfnumber_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
+    let _ = dict; // borrow check
+    let cf_key = CFString::new(key);
+    let value: *const std::ffi::c_void = dict
+        .find(cf_key.as_concrete_TypeRef().cast::<std::ffi::c_void>())
+        .map(|v| *v)?;
+    if value.is_null() {
+        return None;
     }
-
-    fn read_cfnumber_f64(&self, dict: &CFDictionary, key: &str) -> Option<f64> {
-        let key = CFString::new(key);
-        let value: *const std::ffi::c_void =
-            dict.find(key.as_concrete_TypeRef().cast()).map(|v| *v)?;
-        if value.is_null() {
-            return None;
-        }
-        let num = unsafe { CFNumber::wrap_under_get_rule(value.cast()) };
-        num.to_f64()
-    }
+    let num = CFNumber::wrap_under_get_rule(value.cast());
+    num.to_f64().or_else(|| num.to_i64().map(|n| n as f64))
 }

@@ -933,6 +933,34 @@ fn read_proc_args_macos(pid: libc::pid_t) -> Option<String> {
     }
 }
 
+/// Read lifetime disk-I/O byte counters for `pid` via
+/// `proc_pid_rusage(RUSAGE_INFO_V2)`. Returns `(Some(read_bytes),
+/// Some(write_bytes))` on success and `(None, None)` if the call
+/// fails (PID gone, sandboxed, kernel task). Pairs with
+/// [`blend_rate`] to produce per-tick throughput.
+#[cfg(target_os = "macos")]
+fn read_rusage_io_macos(pid: libc::pid_t) -> (Option<u64>, Option<u64>) {
+    // SAFETY: `proc_pid_rusage` writes a fixed-size struct into
+    // the buffer we hand it. `RUSAGE_INFO_V2` is the smallest
+    // flavour that carries `ri_diskio_*`; V3/V4 are supersets so
+    // requesting V2 is forward-compatible.
+    unsafe {
+        let mut info: libc::rusage_info_v2 = std::mem::zeroed();
+        let kr = libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::addr_of_mut!(info).cast::<libc::rusage_info_t>(),
+        );
+        if kr != 0 {
+            return (None, None);
+        }
+        (
+            Some(info.ri_diskio_bytesread),
+            Some(info.ri_diskio_byteswritten),
+        )
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Tracker {
     fn read_one_macos(
@@ -1086,14 +1114,36 @@ impl Tracker {
                 }
             };
 
+            // Per-process disk I/O via `proc_pid_rusage(pid,
+            // RUSAGE_INFO_V2, …)`. Returns lifetime byte counters
+            // for both read + write that we delta across ticks
+            // (mirroring the Linux `/proc/<pid>/io` flow). V2 is
+            // the oldest revision that carries `ri_diskio_*`, so
+            // it's the right choice for max compatibility.
+            let (read_bytes, write_bytes) = read_rusage_io_macos(pid);
+            let prev_ref = self.prev.get(&pid).copied();
+            let dt = prev_ref.map_or(0.0, |p| now.duration_since(p.when).as_secs_f64());
+            let (read_bps, smoothed_read_bps) = blend_rate(
+                prev_ref.and_then(|p| p.read_bytes),
+                read_bytes,
+                dt,
+                prev_ref.map_or(0.0, |p| p.smoothed_read_bps),
+            );
+            let (write_bps, smoothed_write_bps) = blend_rate(
+                prev_ref.and_then(|p| p.write_bytes),
+                write_bytes,
+                dt,
+                prev_ref.map_or(0.0, |p| p.smoothed_write_bps),
+            );
+
             let sample = Sample {
                 when: now,
                 jiffies,
                 smoothed_cpu,
-                read_bytes: None,
-                write_bytes: None,
-                smoothed_read_bps: 0.0,
-                smoothed_write_bps: 0.0,
+                read_bytes,
+                write_bytes,
+                smoothed_read_bps,
+                smoothed_write_bps,
             };
 
             let row = ProcessRow {
@@ -1105,8 +1155,8 @@ impl Tracker {
                 cpu_pct,
                 rss_bytes: tinfo.pti_resident_size,
                 threads: tinfo.pti_threadnum,
-                read_bps: None,
-                write_bps: None,
+                read_bps,
+                write_bps,
                 command: info_cache.command.clone(),
                 group: info_cache.group.clone(),
             };

@@ -25,15 +25,15 @@ pie showData
 | Swap | ✅ | ✅ | `/proc/meminfo` · `vm.swapusage` |
 | Load average | ✅ | ✅ | `/proc/loadavg` · `vm.loadavg` |
 | Process list + full cmdline | ✅ | ✅ (v0.27.1 fix) | `/proc/<pid>/cmdline` · `KERN_PROCARGS2` |
-| Per-process disk I/O | ✅ | ⚠ | `/proc/<pid>/io` · *taskinfo SPI needed* |
+| Per-process disk I/O | ✅ | ✅ (v0.28) | `/proc/<pid>/io` · `proc_pid_rusage(RUSAGE_INFO_V2)` |
 | Per-disk I/O rates | ✅ | ✅ | `/proc/diskstats` · IOKit `IOMedia` |
 | Per-iface network rates | ✅ | ✅ | `/proc/net/dev` · `NET_RT_IFLIST2` |
-| Temperatures | ✅ | ⚠ stub | `/sys/class/hwmon` · *full SMC pending* |
-| Battery | ✅ | ⚠ not wired | `/sys/class/power_supply` · *IOPowerSources pending* |
+| Temperatures | ✅ | ✅ (v0.28) | `/sys/class/hwmon` · AppleSMC user-client (Intel + Apple Silicon keys) |
+| Battery | ✅ | ✅ (v0.28) | `/sys/class/power_supply` · IOKit `IOPSCopyPowerSourcesInfo` |
 | GPU NVIDIA | ✅ | ✅ | NVML dlopen |
 | GPU AMD | ✅ | ✅ | `amdgpu` sysfs · `AMDRadeon*` IOKit |
 | GPU Intel discrete | ✅ | ✅ | `i915_pmu` · `IntelAccelerator*` IOKit |
-| GPU Apple Silicon busy% | — | ⚠ unreliable | needs private IOReport SPI |
+| GPU Apple Silicon busy% | — | ✅ (v0.28) | IOReport SPI via dlopen (`GPU Stats / GPU Performance State` channel) |
 | KVM exits / vCPU pinning | ✅ | — | debugfs (Linux subsystem) |
 | VFIO / vhost / tap | ✅ | — | sysfs |
 | Group — Container | ✅ | ⚠ host-only | cgroup · proc-tree heuristic |

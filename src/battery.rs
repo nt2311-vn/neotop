@@ -1,11 +1,11 @@
 //! battery.rs — battery status from `/sys/class/power_supply`.
 //!
-//! macOS: uses `system_profiler SPPowerDataType` for battery info.
+//! macOS: reads `IOPSCopyPowerSourcesInfo` directly from IOKit
+//! (faster than forking `system_profiler`, no JSON parsing, no shell
+//! dependency, and gives us the same fields Activity Monitor shows).
 
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // `name` shown in future multi-battery variants
@@ -80,64 +80,124 @@ pub(crate) fn snapshot() -> Vec<Battery> {
 
 #[cfg(target_os = "macos")]
 fn snapshot_macos() -> Vec<Battery> {
-    // Use system_profiler to get battery info on macOS
-    let output = match Command::new("system_profiler")
-        .args(["SPPowerDataType", "-json"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use io_kit_sys::ps::keys::{
+        kIOPSCurrentCapacityKey, kIOPSIsChargingKey, kIOPSMaxCapacityKey, kIOPSNameKey,
+        kIOPSPowerSourceStateKey,
+    };
+    use io_kit_sys::ps::power_sources::{
+        IOPSCopyPowerSourcesInfo, IOPSCopyPowerSourcesList, IOPSGetPowerSourceDescription,
     };
 
-    let json_str = match String::from_utf8(output.stdout) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // SAFETY: IOPS APIs return retained / borrowed CF objects per
+    // their +1/+0 ownership rules; we wrap them with the matching
+    // `wrap_under_*_rule` so Rust drops them correctly.
+    unsafe {
+        let blob = IOPSCopyPowerSourcesInfo();
+        if blob.is_null() {
+            return Vec::new();
+        }
+        let blob = CFType::wrap_under_create_rule(blob);
 
-    // Parse JSON to extract battery info
-    // system_profiler returns complex nested JSON, so we do a simple text search
-    // for the key fields we need
-    let percent = extract_json_value(&json_str, "\"ChargeRemaining\"")
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0);
+        let list = IOPSCopyPowerSourcesList(blob.as_concrete_TypeRef());
+        if list.is_null() {
+            return Vec::new();
+        }
+        let list: CFArray<CFType> = CFArray::wrap_under_create_rule(list);
 
-    let status_raw =
-        extract_json_value(&json_str, "\"BatteryPower\"").unwrap_or_else(|| "Unknown".to_string());
+        let mut out = Vec::with_capacity(list.len() as usize);
+        for ps in list.iter() {
+            let desc_ref =
+                IOPSGetPowerSourceDescription(blob.as_concrete_TypeRef(), ps.as_concrete_TypeRef());
+            if desc_ref.is_null() {
+                continue;
+            }
+            let desc: CFDictionary = CFDictionary::wrap_under_get_rule(desc_ref);
 
-    let status = if status_raw.contains("AC Power") {
-        "Charging".to_string()
-    } else if status_raw.contains("Battery Power") {
-        "Discharging".to_string()
-    } else {
-        status_raw
-    };
+            // SAFETY: IOPS key constants are `*const c_char` to
+            // static NUL-terminated string literals; safe to wrap
+            // into `&CStr` and decode as UTF-8 for `CFString`.
+            let key = |k: *const std::os::raw::c_char| -> CFString {
+                CFString::from(std::ffi::CStr::from_ptr(k).to_str().unwrap_or(""))
+            };
+            let get_num = |k: *const std::os::raw::c_char| -> Option<i64> {
+                let v: *const std::ffi::c_void =
+                    desc.find(key(k).as_concrete_TypeRef().cast()).map(|v| *v)?;
+                if v.is_null() {
+                    return None;
+                }
+                CFNumber::wrap_under_get_rule(v.cast()).to_i64()
+            };
+            let get_str = |k: *const std::os::raw::c_char| -> Option<String> {
+                let v: *const std::ffi::c_void =
+                    desc.find(key(k).as_concrete_TypeRef().cast()).map(|v| *v)?;
+                if v.is_null() {
+                    return None;
+                }
+                Some(CFString::wrap_under_get_rule(v.cast()).to_string())
+            };
+            let get_bool = |k: *const std::os::raw::c_char| -> Option<bool> {
+                let v: *const std::ffi::c_void =
+                    desc.find(key(k).as_concrete_TypeRef().cast()).map(|v| *v)?;
+                if v.is_null() {
+                    return None;
+                }
+                Some(CFBoolean::wrap_under_get_rule(v.cast()).into())
+            };
 
-    if percent == 0 {
-        return Vec::new();
+            let cur = get_num(kIOPSCurrentCapacityKey);
+            let max = get_num(kIOPSMaxCapacityKey);
+            let Some(percent) = pct(cur, max) else {
+                continue;
+            };
+            let name = get_str(kIOPSNameKey).unwrap_or_else(|| "Battery".to_string());
+            // `kIOPSPowerSourceStateKey` is "AC Power" / "Battery
+            // Power"; `kIOPSIsChargingKey` is a boolean. Combine
+            // into the same string vocabulary the Linux side uses
+            // so `Theme::battery_color` works without branching.
+            let state = get_str(kIOPSPowerSourceStateKey);
+            let charging = get_bool(kIOPSIsChargingKey).unwrap_or(false);
+            let status = match (state.as_deref(), charging, percent) {
+                (Some("AC Power"), true, _) => "Charging",
+                (Some("AC Power"), false, 100) => "Full",
+                (Some("AC Power"), false, _) => "Not charging",
+                (Some("Battery Power"), _, _) => "Discharging",
+                _ => "Unknown",
+            }
+            .to_string();
+
+            out.push(Battery {
+                name,
+                percent,
+                status,
+                // IOPS doesn't expose instantaneous wattage in the
+                // public dictionary; that data is private to
+                // `AppleSmartBattery` IOService and needs an
+                // additional IOReg walk. Leave as `None` for now —
+                // the UI already handles `None` cleanly.
+                watts: None,
+            });
+        }
+        out
     }
-
-    vec![Battery {
-        name: "Battery".to_string(),
-        percent,
-        status,
-        watts: None, // system_profiler doesn't provide wattage easily
-    }]
 }
 
+/// Compute `0..=100` from `current / max`, clamping out-of-range
+/// values. Returns `None` if either side is missing or `max` is
+/// non-positive (kernel hasn't populated the dict yet).
 #[cfg(target_os = "macos")]
-fn extract_json_value(json: &str, key: &str) -> Option<String> {
-    // Simple JSON value extraction for known keys
-    // This is a pragmatic approach to avoid adding a JSON dependency
-    let key_pattern = format!("{}:", key);
-    if let Some(idx) = json.find(&key_pattern) {
-        let after_key = &json[idx + key_pattern.len()..];
-        if let Some(start) = after_key.find(|c: char| c.is_ascii_digit()) {
-            let value_part = &after_key[start..];
-            let end = value_part.find([',', '}']).unwrap_or(value_part.len());
-            return Some(value_part[..end].trim().to_string());
-        }
+fn pct(cur: Option<i64>, max: Option<i64>) -> Option<u8> {
+    let (cur, max) = (cur?, max?);
+    if max <= 0 {
+        return None;
     }
-    None
+    let raw = (cur.saturating_mul(100) / max).clamp(0, 100);
+    u8::try_from(raw).ok()
 }
 
 /// `capacity` sysfs file holds an integer 0..=100. We trim whitespace
