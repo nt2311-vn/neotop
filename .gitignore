@@ -9,15 +9,10 @@
 .idea/
 .vscode/
 
-# Obsidian vault — per-user state and plugin binaries (plugins are
-# re-downloaded per machine from the community-plugins list).
-# Exception: the two mermaid plugins that make the charts in docs/
-# and README.md zoomable / draggable ship with the repo so a fresh
-# clone has them out of the box.
+# Obsidian vault — per-user UI state + local caches. Plugin binaries
+# are tracked so a fresh clone gets the same toolset as neosandbox
+# without waiting for Obsidian's community-plugin downloader.
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json
 .obsidian/cache
-.obsidian/plugins/*
-!.obsidian/plugins/mermaid-popup/
-!.obsidian/plugins/mermaid-tools/
 .devin/
