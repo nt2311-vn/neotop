@@ -1,0 +1,42 @@
+/* Full-width mermaid diagrams */
+.markdown-preview-view .mermaid,
+.markdown-rendered .mermaid {
+  background: transparent;
+  text-align: center;
+  margin: 1.5em 0;
+  padding: 1em;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  cursor: zoom-in;
+  transition: all .2s;
+  overflow: auto;
+}
+.markdown-preview-view .mermaid:hover,
+.markdown-rendered .mermaid:hover {
+  border-color: var(--interactive-accent);
+}
+.markdown-preview-view .mermaid svg,
+.markdown-rendered .mermaid svg {
+  max-width: 100% !important;
+  height: auto !important;
+  width: auto !important;
+}
+
+/* Click any mermaid to enter zoom mode (toggle the .mermaid-zoomed class via plugin or theme) */
+.mermaid-zoomed {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 9999 !important;
+  background: var(--background-primary) !important;
+  padding: 2rem !important;
+  cursor: zoom-out !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+.mermaid-zoomed svg {
+  width: 95vw !important;
+  height: 95vh !important;
+  max-width: none !important;
+  max-height: none !important;
+}

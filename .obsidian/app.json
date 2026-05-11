@@ -1,20 +1,23 @@
 {
+  "showInlineTitle": true,
   "alwaysUpdateLinks": true,
-  "attachmentFolderPath": "docs/assets",
-  "newFileLocation": "folder",
-  "newFileFolderPath": "docs",
-  "newLinkFormat": "shortest",
-  "useMarkdownLinks": false,
-  "defaultViewMode": "preview",
-  "livePreview": true,
+  "useMarkdownLinks": true,
+  "newLinkFormat": "relative",
+  "attachmentFolderPath": "docs/attachments",
+  "showLineNumber": true,
+  "showFrontmatter": true,
   "readableLineLength": true,
   "strictLineBreaks": false,
-  "showUnsupportedFiles": false,
-  "trashOption": "local",
-  "promptDelete": true,
-  "foldHeading": true,
-  "foldIndent": true,
+  "tabSize": 2,
   "spellcheck": false,
-  "showLineNumber": false,
-  "tabSize": 2
+  "promptDelete": true,
+  "trashOption": "system",
+  "userIgnoreFilters": [
+    "node_modules/",
+    ".venv/",
+    "target/",
+    "graphify-out/",
+    "/^\\.git\\//",
+    "/LICENSE$/"
+  ]
 }
