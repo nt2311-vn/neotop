@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.2] — macOS: memory bar segments, Rust/Go group detection
+
+Follow-up bug-fix release after v0.27.1. Two visible regressions that the
+v0.27.1 rewrite didn't catch:
+
+### Fixed
+
+- **macOS memory composition bar** — the v0.27.1 VM-stats mapping
+  double-counted reclaimable pages (`cached = inactive + speculative +
+  external`, but `external_page_count` is itself a subset of
+  `inactive_count + active_count`). `used = total − free − buffers −
+  cached` collapsed toward zero and the four-segment bar looked
+  nearly empty. Re-mapped onto non-overlapping Linux segments:
+  `free = free + speculative`, `buffers = purgeable`,
+  `cached = external` (file-backed), leaving `used` ≈ Activity
+  Monitor's "Memory Used" (wired + anonymous + compressed).
+- **macOS Rust/Go group detection** — `src/elf.rs`'s Mach-O detector
+  read the 4-byte file magic big-endian, but native Mach-O files on
+  `x86_64` / `arm64` store MH_MAGIC_64 as `CF FA ED FE` (little-endian
+  `0xFEEDFACF`). Decoded the wrong way it became `0xCFFAEDFE` and
+  matched nothing, so every binary was rejected before any string
+  scan. Plus the scan was capped at 8 KiB, far too small to hit
+  `library/std/src/` in a release binary. Fixed: read magic LE,
+  accept native + byte-swapped + 32/64-bit variants, walk the
+  `fat_header` of universal binaries into the first slice, scan up
+  to 4 MiB. And `src/procs.rs` now invokes the detector from the
+  macOS Native-fallback path (mirroring the Linux
+  `/proc/<pid>/exe` branch), so Rust/Go daemons surface in the
+  group view with their own `rust:<bin>` / `go:<bin>` header +
+  aggregate CPU/RSS + process count instead of hiding in the
+  headerless Native band.
+
 ## [0.27.1] — macOS: real CPU/memory sampling, full argv, drop phantom GPU
 
 Bug-fix release on top of v0.27.0. The macOS port shipped with several
@@ -2170,7 +2202,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.27.2...HEAD
+[0.27.2]: https://github.com/nt2311-vn/neotop/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/nt2311-vn/neotop/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/nt2311-vn/neotop/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/nt2311-vn/neotop/compare/v0.25.0...v0.26.0
