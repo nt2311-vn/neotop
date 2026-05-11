@@ -1,0 +1,10 @@
+{
+  "accentColor": "#cba6f7",
+  "theme": "obsidian",
+  "translucency": false,
+  "baseFontSize": 14,
+  "monospaceFontFamily": "JetBrains Mono,Fira Code,monospace",
+  "textFontFamily": "Inter,system-ui,sans-serif",
+  "cssTheme": "",
+  "showViewHeader": true
+}

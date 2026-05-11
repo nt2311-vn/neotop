@@ -4369,7 +4369,11 @@ mod tests {
         ];
         let names = groups::ContainerNames::default();
         let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
-        assert_eq!(v.len(), 4, "native header + member + docker header + member");
+        assert_eq!(
+            v.len(),
+            4,
+            "native header + member + docker header + member"
+        );
         assert_eq!(v[0].header.as_ref().unwrap().label, "native:myapp");
         assert_eq!(rows[v[1].idx].pid, 20);
         assert_eq!(v[2].header.as_ref().unwrap().label, "docker:abc12");

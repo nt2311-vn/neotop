@@ -1,0 +1,20 @@
+{
+  "alwaysUpdateLinks": true,
+  "attachmentFolderPath": "docs/assets",
+  "newFileLocation": "folder",
+  "newFileFolderPath": "docs",
+  "newLinkFormat": "shortest",
+  "useMarkdownLinks": false,
+  "defaultViewMode": "preview",
+  "livePreview": true,
+  "readableLineLength": true,
+  "strictLineBreaks": false,
+  "showUnsupportedFiles": false,
+  "trashOption": "local",
+  "promptDelete": true,
+  "foldHeading": true,
+  "foldIndent": true,
+  "spellcheck": false,
+  "showLineNumber": false,
+  "tabSize": 2
+}
