@@ -400,8 +400,8 @@ fn snapshot_macos(pid: i64) -> Option<Snapshot> {
         };
 
         let mem = Mem {
-            rss_bytes: info.pti_resident_size as u64,
-            vsz_bytes: info.pti_virtual_size as u64,
+            rss_bytes: info.pti_resident_size,
+            vsz_bytes: info.pti_virtual_size,
         };
 
         Some(Snapshot {

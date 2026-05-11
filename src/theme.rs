@@ -56,6 +56,7 @@ pub(crate) struct Theme {
     pub group_container: Color,
     pub group_vm: Color,
     pub group_runtime: Color,
+    pub group_app: Color,
     pub group_system: Color,
     pub group_native: Color,
 
@@ -169,6 +170,7 @@ impl ThemePreset {
                 group_container: Color::Rgb(137, 180, 250), // Blue
                 group_vm: Color::Rgb(203, 166, 247),        // Mauve
                 group_runtime: Color::Rgb(148, 226, 213),   // Teal
+                group_app: Color::Rgb(249, 226, 175),       // Yellow
                 group_system: Color::Rgb(147, 153, 178),    // Overlay2
                 group_native: Color::Rgb(108, 112, 134),    // Overlay0
 
@@ -232,6 +234,7 @@ impl ThemePreset {
                 group_container: Color::Cyan,
                 group_vm: Color::Blue,
                 group_runtime: Color::Yellow,
+                group_app: Color::Magenta,
                 group_system: Color::Gray,
                 group_native: Color::Gray,
 
@@ -292,6 +295,7 @@ impl ThemePreset {
                 group_container: Color::Indexed(81),
                 group_vm: Color::Indexed(67),
                 group_runtime: Color::Indexed(228),
+                group_app: Color::Indexed(214),
                 group_system: Color::Indexed(244),
                 group_native: Color::Indexed(244),
 
@@ -353,6 +357,7 @@ impl ThemePreset {
                 group_container: Color::White,
                 group_vm: Color::White,
                 group_runtime: Color::White,
+                group_app: Color::White,
                 group_system: Color::White,
                 group_native: Color::White,
 
@@ -497,6 +502,7 @@ struct ConfigColors {
     group_container: Option<String>,
     group_vm: Option<String>,
     group_runtime: Option<String>,
+    group_app: Option<String>,
     group_system: Option<String>,
     group_native: Option<String>,
     battery_good: Option<String>,
@@ -562,6 +568,7 @@ fn apply_overrides(mut theme: Theme, colors: &ConfigColors) -> Theme {
         group_container,
         group_vm,
         group_runtime,
+        group_app,
         group_system,
         group_native,
         battery_good,
@@ -678,6 +685,7 @@ impl Theme {
             crate::groups::GroupBand::Container => self.group_container,
             crate::groups::GroupBand::Vm => self.group_vm,
             crate::groups::GroupBand::Runtime => self.group_runtime,
+            crate::groups::GroupBand::App => self.group_app,
             crate::groups::GroupBand::System => self.group_system,
             crate::groups::GroupBand::Native => self.group_native,
         }

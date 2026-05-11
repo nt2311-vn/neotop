@@ -1,0 +1,11 @@
+{
+  "baseFontSize": 15,
+  "showViewHeader": true,
+  "nativeMenus": false,
+  "translucency": false,
+  "theme": "obsidian",
+  "enabledCssSnippets": [
+    "docs-readable"
+  ],
+  "cssTheme": "AnuPpuccin"
+}

@@ -527,7 +527,7 @@ mod macos {
         unsafe {
             let os_type = sysctl_str(&[CTL_KERN, KERN_OSTYPE]);
             let os_release = sysctl_str(&[CTL_KERN, KERN_OSRELEASE]);
-            format!("{} {}", os_type, os_release)
+            format!("{os_type} {os_release}")
         }
     }
 

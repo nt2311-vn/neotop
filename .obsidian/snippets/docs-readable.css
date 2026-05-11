@@ -1,0 +1,32 @@
+.markdown-rendered .mermaid,
+.markdown-source-view .mermaid {
+  display: flex;
+  justify-content: center;
+  overflow-x: auto;
+  max-width: 100%;
+  background: var(--background-primary);
+  padding: 0.5rem 0;
+}
+
+.markdown-rendered .mermaid svg,
+.markdown-source-view .mermaid svg {
+  max-width: none !important;
+  height: auto !important;
+}
+
+.markdown-preview-view pre.language-mermaid,
+.markdown-preview-view code.language-mermaid {
+  background: transparent;
+}
+
+.markdown-rendered table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.markdown-rendered h1,
+.markdown-rendered h2 {
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 0.2em;
+}

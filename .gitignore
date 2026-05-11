@@ -8,3 +8,11 @@
 *.swo
 .idea/
 .vscode/
+
+# Obsidian vault — per-user UI state + local caches. Plugin binaries
+# are tracked so a fresh clone gets the same toolset as neosandbox
+# without waiting for Obsidian's community-plugin downloader.
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache
+.devin/

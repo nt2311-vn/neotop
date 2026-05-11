@@ -1,0 +1,23 @@
+{
+  "showInlineTitle": true,
+  "alwaysUpdateLinks": true,
+  "useMarkdownLinks": true,
+  "newLinkFormat": "relative",
+  "attachmentFolderPath": "docs/attachments",
+  "showLineNumber": true,
+  "showFrontmatter": true,
+  "readableLineLength": true,
+  "strictLineBreaks": false,
+  "tabSize": 2,
+  "spellcheck": false,
+  "promptDelete": true,
+  "trashOption": "system",
+  "userIgnoreFilters": [
+    "node_modules/",
+    ".venv/",
+    "target/",
+    "graphify-out/",
+    "/^\\.git\\//",
+    "/LICENSE$/"
+  ]
+}
