@@ -62,8 +62,8 @@ libc = "0.2"
 # the Linux build.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
-io-kit-sys = "0.4"
-mach2 = "0.4"
+io-kit-sys = "0.5"
+mach2 = "0.6"
 
 [features]
 default = ["nvml", "i915-pmu"]

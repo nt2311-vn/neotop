@@ -351,7 +351,7 @@ mod tests {
         assert!(s.sample().is_none(), "first sample yields no delta yet");
         std::thread::sleep(std::time::Duration::from_millis(200));
         let v = s.sample();
-        eprintln!("GPU busy = {:?}", v);
+        eprintln!("GPU busy = {v:?}");
         if let Some(b) = v {
             assert!((0.0..=100.0).contains(&b));
         }

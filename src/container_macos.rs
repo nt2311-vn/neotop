@@ -209,6 +209,6 @@ impl ContainerDetector {
         }
 
         // Fallback: use PID as ID (not ideal but functional)
-        Some(format!("{:x}", pid))
+        Some(format!("{pid:x}"))
     }
 }

@@ -1,6 +1,6 @@
 //! battery.rs — battery status from `/sys/class/power_supply`.
 //!
-//! macOS: reads `IOPSCopyPowerSourcesInfo` directly from IOKit
+//! macOS: reads `IOPSCopyPowerSourcesInfo` directly from `IOKit`
 //! (faster than forking `system_profiler`, no JSON parsing, no shell
 //! dependency, and gives us the same fields Activity Monitor shows).
 

@@ -193,7 +193,7 @@ impl crate::net::Tracker {
 
         // Fallback: generate a placeholder name based on offset
         // This is not ideal but ensures we don't crash
-        Some(format!("if{}", offset))
+        Some(format!("if{offset}"))
     }
 
     fn skip_iface(&self, name: &str) -> bool {
