@@ -273,36 +273,110 @@ mod tests {
     }
 }
 
+/// Mach-O file-magic values. Mach-O files store the magic in the
+/// target CPU's native byte order, so on little-endian hosts a
+/// native Mach-O reads `FE ED FA CF` → `0xFEEDFACF` when decoded
+/// little-endian. A *foreign-endian* slice shows up as the CIGAM
+/// form. Universal binaries wrap one-or-more slices in a
+/// `fat_header` that's always big-endian, hence the distinct
+/// `FAT` magic values.
+#[cfg(target_os = "macos")]
+const MH_MAGIC: u32 = 0xFEED_FACE; // 32-bit, native byte order
+#[cfg(target_os = "macos")]
+const MH_CIGAM: u32 = 0xCEFA_EDFE; // 32-bit, byte-swapped
+#[cfg(target_os = "macos")]
+const MH_MAGIC_64: u32 = 0xFEED_FACF; // 64-bit, native byte order
+#[cfg(target_os = "macos")]
+const MH_CIGAM_64: u32 = 0xCFFA_EDFE; // 64-bit, byte-swapped
+#[cfg(target_os = "macos")]
+const FAT_MAGIC: u32 = 0xCAFE_BABE; // universal, big-endian header
+#[cfg(target_os = "macos")]
+const FAT_CIGAM: u32 = 0xBEBA_FECA; // universal, seen on LE hosts
+
+/// Scan up to this many bytes searching for Rust / Go signature
+/// strings. Release binaries keep those strings in `__TEXT,__cstring`
+/// / `__TEXT,__const` which is usually within the first few MB of
+/// a modern Mach-O. 4 MiB is a compromise between hit rate and
+/// per-tick I/O cost (this runs once per PID, result is cached).
+#[cfg(target_os = "macos")]
+const MACHO_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Inspect the Mach-O at `exe_path` and return the language it was
+/// built with, if detectable by strings the compiler leaves in
+/// rodata. Returns `None` on any error (file unreadable, not
+/// Mach-O, magic bytes didn't match, etc.).
 #[cfg(target_os = "macos")]
 pub(crate) fn detect_native_lang(exe_path: &Path) -> Option<Lang> {
-    // macOS Mach-O parsing for Go/Rust detection
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
     let mut f = std::fs::File::open(exe_path).ok()?;
-    let mut hdr = [0u8; 32];
-    f.read_exact(&mut hdr).ok()?;
+    let mut magic_buf = [0u8; 4];
+    f.read_exact(&mut magic_buf).ok()?;
+    let magic = u32::from_le_bytes(magic_buf);
 
-    // Mach-O magic: 0xFEEDFACE (32-bit) or 0xFEEDFACF (64-bit)
-    let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    if magic != 0xFEEDFACE && magic != 0xFEEDFACF {
+    // Universal / fat binary: the file starts with a big-endian
+    // `fat_header { magic, nfat_arch }` followed by `nfat_arch`
+    // `fat_arch { cputype, cpusubtype, offset, size, align }`.
+    // We only need the first slice's byte offset so we can seek
+    // there and fall through to the same single-arch scan.
+    let mut scan_offset: u64 = 0;
+    if magic == FAT_MAGIC || magic == FAT_CIGAM {
+        let mut fat_hdr = [0u8; 4 + 4 + 5 * 4]; // nfat_arch + first fat_arch
+        if f.read_exact(&mut fat_hdr).is_err() {
+            return None;
+        }
+        // `fat_arch.offset` is the 3rd u32 of the fat_arch record,
+        // which lives at bytes [12..16] of our combined read
+        // (skipping nfat_arch at [0..4] and fat_arch.cputype +
+        // cpusubtype at [4..12]).
+        let arch_offset = u32::from_be_bytes([fat_hdr[12], fat_hdr[13], fat_hdr[14], fat_hdr[15]]);
+        scan_offset = u64::from(arch_offset);
+        if f.seek(SeekFrom::Start(scan_offset)).is_err() {
+            return None;
+        }
+        // Re-read magic from the selected slice; it must be one of
+        // the native or byte-swapped MH_* forms.
+        if f.read_exact(&mut magic_buf).is_err() {
+            return None;
+        }
+        let inner = u32::from_le_bytes(magic_buf);
+        if !matches!(inner, MH_MAGIC | MH_CIGAM | MH_MAGIC_64 | MH_CIGAM_64) {
+            return None;
+        }
+    } else if !matches!(magic, MH_MAGIC | MH_CIGAM | MH_MAGIC_64 | MH_CIGAM_64) {
         return None;
     }
 
-    // Read first 8KB of file for string search
-    let mut buf = vec![0u8; 8192];
-    if f.read_exact(&mut buf).is_err() {
+    // Rewind to the start of the Mach-O slice and scan a bounded
+    // prefix of it for language signature strings. We don't walk
+    // the `__LINKEDIT` / section tables — for the cost-benefit of
+    // a per-PID classifier a substring match against
+    // `library/std/src/`, `/rustc/`, and the Go runtime symbol
+    // names is sufficient and matches what tools like `file(1)`
+    // would tell the user.
+    if f.seek(SeekFrom::Start(scan_offset)).is_err() {
         return None;
     }
+    let mut buf = vec![0u8; MACHO_SCAN_BYTES];
+    let n = f.read(&mut buf).ok()?;
+    let data = &buf[..n];
 
-    // Go detection: look for common Go runtime strings
-    if contains(&buf, b"go.buildid")
-        || contains(&buf, b"runtime.g")
-        || contains(&buf, b"runtime.main")
-        || contains(&buf, b"Go build ID")
+    // Go signatures. `go.buildid` is the most reliable modern
+    // marker; older binaries may only have `runtime.` symbols.
+    if contains(data, b"go.buildid")
+        || contains(data, b"Go buildinf:")
+        || contains(data, b"runtime.goexit")
+        || contains(data, b"runtime.main")
     {
         return Some(Lang::Go);
     }
 
-    // Rust detection: look for common Rust std strings
-    if contains(&buf, b"library/std/src/") || contains(&buf, b"/rustc/") || contains(&buf, b"std::")
+    // Rust signatures. `library/std/src/` is embedded for panic
+    // locations; `/rustc/<hash>/` appears when rustc's sysroot path
+    // is baked into debug-info or panic paths. `_RNv` is the v0
+    // mangling prefix.
+    if contains(data, b"library/std/src/") || contains(data, b"/rustc/") || contains(data, b"_RNv")
     {
         return Some(Lang::Rust);
     }
