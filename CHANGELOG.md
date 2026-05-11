@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] — universal grouping + macOS feature-complete
+
+Headline: every visible row in **group view** (`g`) now lives in a
+named aggregate, and the macOS port is feature-complete with Linux
+across CPU, memory, disk, network, **temperature**, **battery**, and
+**Apple Silicon GPU busy %**.
+
+### Added
+
+- **`Group::App(String)`** — a new band, macOS-only, that clusters
+  every process whose executable path contains a `*.app/` segment
+  under one row keyed on the *outermost* bundle name. Electron /
+  Chromium / Xcode / Finder swarms (often 20+ helper PIDs each) now
+  collapse into `app:Visual Studio Code (24)`, `app:Google Chrome
+  (34)`, `app:Slack (8)`, etc. Theme: new `group_app` colour field
+  in every preset (Catppuccin, ANSI, 256-colour, monochrome) plus
+  TOML override.
+- **`Group::Native(String)`** carries the argv[0] basename so the
+  catch-all band, which used to collapse silently into one
+  headerless "native" tail, now produces one aggregate row per
+  binary: `native:sshd (3)`, `native:fish (2)`, `native:mdworker
+  (5)`, `native:git (1)`. Only the System band remains headerless
+  (launchd / kernel daemons would drown real workloads).
+- **macOS per-process disk I/O** — `proc_pid_rusage(pid,
+  RUSAGE_INFO_V2, …)` reads `ri_diskio_{bytesread,byteswritten}`,
+  fed into the same `blend_rate` EMA the Linux `/proc/<pid>/io`
+  path uses. Process detail pane finally shows DISK R / DISK W
+  rates on macOS.
+- **macOS battery via IOKit** — new `IOPSCopyPowerSourcesInfo`
+  flow in `battery.rs` replaces the v0.27.0 `system_profiler`
+  shell-out. One syscall, no JSON regex, status vocabulary matches
+  the Linux side ("Charging" / "Full" / "Not charging" /
+  "Discharging") so `Theme::battery_color` works without branching.
+- **macOS temperatures via AppleSMC user-client** — new
+  `src/smc_macos.rs` module implements the `IOServiceOpen` +
+  `IOConnectCallStructMethod` protocol with selectors 9
+  (`SMC_CMD_READ_KEYINFO`) and 5 (`SMC_CMD_READ_BYTES`). Decodes
+  `sp78` (Intel 8.8 fixed-point) and `flt ` (Apple Silicon LE
+  float32) sensors. Probes the union of well-known Intel
+  (`TC0P`, `TG0P`, `Ts0P`, `TB0T`) and Apple Silicon (`Tp01..Tp0f`
+  P-cores, `Te05/Te0L` E-cores, `Tg05..Tg0T` GPU clusters,
+  `TaLP/TaRP` ambient) keys so the same scanner works on both
+  architectures.
+- **Apple Silicon GPU busy %** — new `src/ioreport_macos.rs`
+  module wraps Apple's private `IOReport` framework via
+  `dlopen` + `dlsym` (the framework ships no public header and
+  has no Rust crate; macmon / asitop / tegrastats-style ports all
+  bind it this way). `GpuBusySampler` subscribes to the
+  `GPU Stats / GPU Performance State` channel and computes busy
+  % from non-idle residency over the tick-delta window. First
+  tick yields `None` (no delta yet) then real values from tick 2
+  onward, mirroring how host CPU % works. `gpu_macos.rs` falls
+  back to this path when the IOReg `PerformanceStatistics` dict
+  doesn't expose `Device Utilization %` — increasingly common on
+  M-series macs as Apple migrates telemetry to `IOReport`.
+- **Documentation vault** — new `docs/` Obsidian vault and
+  `.obsidian/` config (shared plugins + theme with the sibling
+  `neosandbox` project). Mermaid charts throughout README.md and
+  the new docs cover the tick loop, module topology, grouping
+  pipeline, platform delegation, and the macOS data-source map.
+  See `docs/index.md` for the entry point.
+
+### Changed
+
+- **Grouping rendering** — only the System band still suppresses
+  its banner. Native, App, Runtime, VM, Container all emit
+  headers with count + total CPU + total RSS so the "headerless
+  catch-all tail" is gone.
+- **macOS Mach-O language scan** (`elf.rs`) — wider scan budget
+  (4 MiB up from 8 KiB) so `library/std/src/` / `go.buildid`
+  signatures reliably land within range for release binaries.
+  Magic decoding handles both LE single-arch Mach-O and the
+  big-endian `fat_header` of universal binaries, walking into the
+  first slice for the scan.
+
+### Fixed
+
+- `extract_macos_app_bundle` no longer splits argv[0] by
+  whitespace — Apple bundle names legally contain spaces
+  ("Google Chrome.app", "Visual Studio Code.app"). The classifier
+  now scans the whole cmdline for the first `.app/` segment.
+- Six clippy issues that only the older rust-1.88 clippy caught
+  (stable + nightly let them through): `doc_markdown` on the new
+  battery doc comment, `uninlined_format_args` in container /
+  host / net / ioreport modules, and redundant `as u64` casts in
+  `proc.rs`.
+
+### Dependencies
+
+- `io-kit-sys` `0.4` → `0.5` (Dependabot PR #26 folded inline).
+- `mach2` `0.4` → `0.6` (Dependabot PR #25 folded inline).
+
+Neither bump changed the FFI surface neotop uses; lockfile-only
+update.
+
 ## [0.27.2] — macOS: memory bar segments, Rust/Go group detection
 
 Follow-up bug-fix release after v0.27.1. Two visible regressions that the
@@ -2202,7 +2297,8 @@ keeps the parsers test-locked.
 
 The five-task plan in `PLAN.md` is the basis for this release.
 
-[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.27.2...HEAD
+[Unreleased]: https://github.com/nt2311-vn/neotop/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/nt2311-vn/neotop/compare/v0.27.2...v0.28.0
 [0.27.2]: https://github.com/nt2311-vn/neotop/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/nt2311-vn/neotop/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/nt2311-vn/neotop/compare/v0.26.0...v0.27.0
