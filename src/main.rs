@@ -1963,14 +1963,50 @@ fn draw_per_core_spectrum(
 /// Minimum sparkline width per column when rendering side-by-side.
 const SPECTRUM_MIN_SPARK: u16 = 12;
 
-/// How many cores fit side-by-side at this width (1..=4).
+/// Max columns we'll ever pack side-by-side, regardless of width.
+/// Above this, sparklines get so narrow that the time-series signal
+/// is gone and the grid stops being readable.
+const SPECTRUM_MAX_COLS: u32 = 6;
+
+/// How many cores fit side-by-side at this width.
+///
+/// Strategy: among column counts that physically fit, prefer the
+/// one that spreads cores most evenly across rows. A 10-core box
+/// at wide terminals previously rendered as 4 cols × 3 rows with
+/// only 1 core in the last column (the original bug); now it
+/// renders as 2 cols × 5 rows, perfectly balanced.
+///
+/// Rules in priority order:
+/// 1. Among cols ∈ `[2, max_fit]`, pick the smallest waste
+///    `(cols·rows − num_cores)`.
+/// 2. Break ties by preferring **larger** cols so the grid uses
+///    horizontal real estate when it can.
+/// 3. If `max_fit == 1`, return 1 (narrow terminal — one core per
+///    row is the only option).
 fn spectrum_cores_per_row(width: u16, num_cores: usize) -> usize {
     if num_cores <= 1 {
         return 1;
     }
     let one = u32::from(SPECTRUM_FIXED_W) + u32::from(SPECTRUM_MIN_SPARK);
-    let fits = u32::from(width) / one.max(1);
-    fits.clamp(1, 4) as usize
+    let max_fit = (u32::from(width) / one.max(1)).clamp(1, SPECTRUM_MAX_COLS) as usize;
+    let max_fit = max_fit.min(num_cores);
+    if max_fit <= 1 {
+        return 1;
+    }
+    let waste = |cols: usize| -> usize {
+        let rows = num_cores.div_ceil(cols);
+        rows * cols - num_cores
+    };
+    let mut best = max_fit;
+    let mut best_waste = waste(max_fit);
+    for cols in (2..max_fit).rev() {
+        let w = waste(cols);
+        if w < best_waste {
+            best = cols;
+            best_waste = w;
+        }
+    }
+    best
 }
 
 /// Build the per-core spectrum row label. Format matches the
@@ -4566,6 +4602,38 @@ mod tests {
         assert_eq!(spectrum_cores_per_row(80, 8), 2);
         assert_eq!(spectrum_cores_per_row(40, 8), 1);
         assert_eq!(spectrum_cores_per_row(200, 1), 1);
+    }
+
+    #[test]
+    fn spectrum_cores_per_row_balances_ten_cores_on_wide_terminal() {
+        // Regression: at 200 cols (max_fit=5) a 10-core box used to
+        // render as 4 cols × 3 rows with one orphan in the last
+        // column. Pick the layout with zero wasted slots instead.
+        let cols = spectrum_cores_per_row(200, 10);
+        assert_eq!(cols, 5, "10 cores should fill 5×2 perfectly");
+        assert_eq!(10 % cols, 0);
+    }
+
+    #[test]
+    fn spectrum_cores_per_row_balances_six_cores() {
+        // 6 cores at 200 cols: max_fit=5 → cols=3 (6/3=2, zero waste).
+        let cols = spectrum_cores_per_row(200, 6);
+        assert_eq!(cols, 3);
+        assert_eq!(6 % cols, 0);
+    }
+
+    #[test]
+    fn spectrum_cores_per_row_minimises_waste_when_prime() {
+        // 11 cores at 200 cols (max_fit=5): 5 wastes 4 slots, 4
+        // wastes only 1. Pick the layout that wastes the least —
+        // tie-break to the largest column count.
+        assert_eq!(spectrum_cores_per_row(200, 11), 4);
+    }
+
+    #[test]
+    fn spectrum_cores_per_row_handles_sixteen_cores() {
+        // 16 cores at 200 cols: 16/4=4 wins (zero waste, largest cols).
+        assert_eq!(spectrum_cores_per_row(200, 16), 4);
     }
 
     #[test]
