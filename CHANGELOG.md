@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] — macOS: real RAM total, balanced per-core grid
+
+Patch release on top of v0.28.0. Two visible regressions in the
+header band on macOS:
+
+### Fixed
+
+- **macOS MEM badge stuck at `0 B/0 B (0.0%)`** — `read_mem_total_macos`
+  and `read_cpu_count_macos` called `sysctl` with a one-element MIB
+  (`[HW_MEMSIZE]` / `[HW_NCPU]`). Those names are sub-keys of `CTL_HW`,
+  so the call silently failed and returned 0. With `mem_total_bytes`
+  zero, the four-segment memory bar collapsed and the badge read
+  `0 B/0 B (0.0%)`. Rewrote `sysctl_int` / `sysctl_u64` to take a full
+  MIB slice and pass `[CTL_HW, HW_MEMSIZE]` / `[CTL_HW, HW_NCPU]`. The
+  buggy one-element form is no longer expressible.
+- **Uneven per-core CPU spectrum grid** — `spectrum_cores_per_row`
+  capped at 4 columns and always picked the largest count that fit,
+  so a 10-core box on a wide terminal rendered as 4×3 with a single
+  orphan core in the last column. Now picks the layout with the
+  fewest wasted slots (tie-breaking to the wider column count), with
+  the cap raised to 6. Concrete outcomes: 10 cores → 5×2, 6 cores →
+  3×2, 8/16 cores → 4 cols (unchanged), 11 cores (prime) → 4 cols.
+
 ## [0.27.2] — macOS: memory bar segments, Rust/Go group detection
 
 Follow-up bug-fix release after v0.27.1. Two visible regressions that the
