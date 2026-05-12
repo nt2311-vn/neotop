@@ -432,15 +432,20 @@ mod macos {
     const VM_LOADAVG: i32 = 2;
 
     /// SAFETY: `sysctl` is a well-documented POSIX syscall. We pass a
-    /// valid single-element MIB, a valid writable pointer with correct
-    /// size, and null/0 for the new-value arguments (read-only query).
-    unsafe fn sysctl_int(name: i32) -> i32 {
+    /// valid MIB slice, a valid writable pointer with correct size, and
+    /// null/0 for the new-value arguments (read-only query).
+    ///
+    /// The MIB must be a full path, e.g. `[CTL_HW, HW_NCPU]`. Passing
+    /// a one-element MIB like `[HW_NCPU]` silently fails (`HW_NCPU`
+    /// is not a top-level CTL id) and returns 0 — the bug that hid
+    /// total RAM and CPU count on macOS before this fix.
+    unsafe fn sysctl_int(mib: &[i32]) -> i32 {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::size_t;
-        let mut mib = [name];
+        let mib_ptr = mib.as_ptr().cast_mut();
         libc::sysctl(
-            mib.as_mut_ptr(),
-            1,
+            mib_ptr,
+            mib.len() as libc::c_uint,
             &mut value as *mut _ as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
@@ -450,13 +455,13 @@ mod macos {
     }
 
     /// SAFETY: Same rationale as `sysctl_int`; output buffer sized for `u64`.
-    unsafe fn sysctl_u64(name: i32) -> u64 {
+    unsafe fn sysctl_u64(mib: &[i32]) -> u64 {
         let mut value: u64 = 0;
         let mut len = std::mem::size_of::<u64>() as libc::size_t;
-        let mut mib = [name];
+        let mib_ptr = mib.as_ptr().cast_mut();
         libc::sysctl(
-            mib.as_mut_ptr(),
-            1,
+            mib_ptr,
+            mib.len() as libc::c_uint,
             &mut value as *mut _ as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
@@ -496,12 +501,12 @@ mod macos {
 
     pub(crate) fn read_cpu_count_macos() -> usize {
         // SAFETY: delegates to `sysctl_int` — see its SAFETY comment.
-        unsafe { sysctl_int(HW_NCPU) as usize }
+        unsafe { sysctl_int(&[CTL_HW, HW_NCPU]) as usize }
     }
 
     pub(crate) fn read_mem_total_macos() -> u64 {
         // SAFETY: delegates to `sysctl_u64` — see its SAFETY comment.
-        unsafe { sysctl_u64(HW_MEMSIZE) }
+        unsafe { sysctl_u64(&[CTL_HW, HW_MEMSIZE]) }
     }
 
     pub(crate) fn read_loadavg_macos() -> (f64, f64, f64) {
