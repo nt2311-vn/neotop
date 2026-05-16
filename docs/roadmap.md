@@ -5,21 +5,6 @@ epics open as GitHub issues too.
 
 ## Near-term (next few patches)
 
-- [ ] **Apple Silicon GPU busy %** — the IOKit `PerformanceStatistics`
-  dict doesn't reliably expose `Device Utilization %` on M-series.
-  Switch to the private IOReport SPI (subscribe to `GPU` channel,
-  read energy / utilization counters). Matches what `powermetrics` and
-  `macmon` do. [[platforms-macos#Temperatures (temp_macos.rs)]] for the
-  same SPI for temps.
-- [ ] **macOS temperature — Intel SMC**. Implement the full `AppleSMC`
-  user-client protocol: `SMC_CMD_READ_KEYINFO` → `SMC_CMD_READ_BYTES`
-  for `TC0P`, `TG0P`, `Ts0P`, `TA0P`, `TB0T`. Decode per-key formats
-  (`fpe2`, `sp78`).
-- [ ] **macOS temperature — Apple Silicon IOReport**. Subscribe to
-  `Energy Model` + `CPU Stats` channels; read `processorTemperature`
-  samples.
-- [ ] **macOS battery** — `IOPSCopyPowerSourcesInfo()` / `IOPowerSources`.
-  Feed existing `Battery` struct; wire into `draw_host`.
 - [ ] **Container false-positives on macOS** — tighten
   `container_macos::is_runtime_ancestor` so Docker Desktop UI helpers
   (`Docker Desktop Helper (Renderer)` etc.) don't get tagged as
@@ -49,8 +34,6 @@ epics open as GitHub issues too.
 - [ ] **Per-user recent-apps drawer.** The orbit chart picks top-12 by
   CPU now. Add a mode that remembers the last N "heavy" PIDs across
   the session so they stay visually anchored.
-- [ ] **Mouse click selection.** Ratatui supports mouse events; wire
-  them to select the row under the cursor.
 
 ## Cross-cutting
 
@@ -66,6 +49,9 @@ epics open as GitHub issues too.
 See [`../CHANGELOG.md`](../CHANGELOG.md) for the full history.
 Recent highlights:
 
+- [x] Apple Silicon GPU busy% via IOReport SPI (`v0.28`)
+- [x] Full AppleSMC temperature protocol — Intel + Apple Silicon (`v0.28`)
+- [x] macOS battery via `IOPSCopyPowerSourcesInfo` (`v0.28`)
 - [x] Universal grouping — `App` band + named `Native` (`v0.28`)
 - [x] macOS memory bar + Rust/Go group detection (`v0.27.2`)
 - [x] macOS real CPU / mem sampling + full argv (`v0.27.1`)
