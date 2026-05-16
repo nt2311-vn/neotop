@@ -24,6 +24,10 @@ include = [
     "CHANGELOG.md",
 ]
 
+[lib]
+name = "neotop"
+path = "src/lib.rs"
+
 [[bin]]
 name = "neotop"
 path = "src/main.rs"
