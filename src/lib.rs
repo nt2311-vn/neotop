@@ -162,6 +162,7 @@ fn print_help() {
              s            cycle sort: CPU → MEM → PID → CMD\n    \
              t            toggle tree view\n    \
              g            toggle group view\n    \
+             a            toggle orbit heavy-PID anchor mode\n    \
              H            toggle per-core CPU spectrum\n    \
              /            enter filter mode\n    \
              K            SIGTERM selected pid (confirmed)\n    \
@@ -477,6 +478,14 @@ struct App {
     /// new top-N to populate `orbit_frame.new_pids`, which the
     /// renderer uses to bold-pulse newly-spawned processes.
     orbit_prev_pids: std::collections::HashSet<i32>,
+    /// Session-scoped memory of bursty PIDs; consulted only when
+    /// `anchor_mode` is on so the default top-N selection is
+    /// bit-identical to the pre-anchor build path.
+    anchor: orbit::HeavyAnchor,
+    anchor_mode: bool,
+    /// Monotonic tick counter for `HeavyAnchor::observe`'s recency
+    /// tiebreaker. Distinct from `slow_tick_counter`, which cycles.
+    tick_count: u64,
 
     // Per-vCPU tracker; only snapshot for the *selected* VM each
     // tick so a host with 50+ guests doesn't melt /proc.
@@ -592,6 +601,9 @@ impl App {
             cpu_topology: topology::CpuTopology::read(),
             orbit_frame: orbit::OrbitFrame::default(),
             orbit_prev_pids: std::collections::HashSet::new(),
+            anchor: orbit::HeavyAnchor::default(),
+            anchor_mode: false,
+            tick_count: 0,
             vcpu_tracker: vcpus::Tracker::new(clk_tck),
             selected_vcpus: Vec::new(),
             kvm_tracker: kvm::Tracker::new(),
@@ -671,7 +683,17 @@ impl App {
         // Rebuild the orbit frame off the freshly-snapshotted procs.
         // Cheap: top-N selection over `procs_all` once per tick,
         // PID set diff for the bold-pulse.
-        let new_orbit = orbit::OrbitFrame::build(&self.procs_all, &self.orbit_prev_pids);
+        self.tick_count = self.tick_count.wrapping_add(1);
+        self.anchor.observe(&self.procs_all, self.tick_count);
+        let new_orbit = if self.anchor_mode {
+            orbit::OrbitFrame::build_with_anchors(
+                &self.procs_all,
+                &self.orbit_prev_pids,
+                &self.anchor.anchor_pids(),
+            )
+        } else {
+            orbit::OrbitFrame::build(&self.procs_all, &self.orbit_prev_pids)
+        };
         self.orbit_prev_pids = new_orbit.pid_set();
         self.orbit_frame = new_orbit;
         self.recompute_procs();
@@ -1429,6 +1451,9 @@ fn handle_normal_key(app: &mut App, k: crossterm::event::KeyEvent) {
             app.reanchor_proc_selection(pinned);
             app.clamp_selections();
         }
+        KeyCode::Char('a') => {
+            app.anchor_mode = !app.anchor_mode;
+        }
         KeyCode::Char('H') => {
             // Spectrum ↔ compact grid. Capital H to avoid shadowing
             // a future vim-style left-motion key.
@@ -1584,6 +1609,12 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, h: &host::HostInfo, theme: &the
         kv_line(
             "  g ",
             "toggle group view (container / runtime / system / native, with totals)",
+            kb,
+            dim,
+        ),
+        kv_line(
+            "  a ",
+            "orbit chart: anchor heavy PIDs (keep bursty workloads visible)",
             kb,
             dim,
         ),
@@ -1747,7 +1778,7 @@ fn draw_main(f: &mut ratatui::Frame<'_>, app: &mut App) {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(14), Constraint::Min(6)])
                 .split(split[1]);
-            draw_proc_orbit(f, v[0], &app.orbit_frame, &app.theme);
+            draw_proc_orbit(f, v[0], &app.orbit_frame, &app.theme, app.anchor_mode);
             v[1]
         } else {
             split[1]
@@ -2219,10 +2250,14 @@ fn draw_proc_orbit(
     area: Rect,
     frame: &orbit::OrbitFrame,
     theme: &theme::Theme,
+    anchor_mode: bool,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" process orbit · busy = bigger radius ");
+    let title = if anchor_mode {
+        " process orbit · busy = bigger radius · anchor "
+    } else {
+        " process orbit · busy = bigger radius "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 20 || inner.height < 4 {
