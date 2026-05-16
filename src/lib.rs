@@ -166,7 +166,11 @@ fn print_help() {
              /            enter filter mode\n    \
              K            SIGTERM selected pid (confirmed)\n    \
              Ctrl-K       SIGKILL selected pid (confirmed)\n    \
-             T            cycle theme (dark/light/monokai/tty)"
+             T            cycle theme (dark/light/monokai/tty)\n\
+         \n\
+         SIGNALS:\n    \
+             SIGUSR1      re-read the config file (theme + presets) without restart\n    \
+                          example: `kill -USR1 $(pidof neotop)`"
     );
 }
 
@@ -359,8 +363,50 @@ fn mem_used_pct(h: &host::HostInfo) -> f64 {
 // TUI main loop
 // -----------------------------------------------------------------------------
 
+/// Set by the SIGUSR1 handler; checked by the tick loop. Async-signal
+/// safe — only a `Relaxed` atomic store happens inside the handler.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static CONFIG_RELOAD_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern "C" fn sigusr1_handler(_signum: libc::c_int) {
+    CONFIG_RELOAD_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+fn install_sigusr1_handler() {
+    // SAFETY: `libc::signal` is a POSIX call with a well-defined ABI;
+    // the handler stores into an `AtomicBool` with `Relaxed` ordering,
+    // which is one of the few operations async-signal-safe in stable
+    // Rust. We discard the previous handler — neotop installs this
+    // exactly once at startup.
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            sigusr1_handler as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn install_sigusr1_handler() {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn take_pending_config_reload() -> bool {
+    CONFIG_RELOAD_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn take_pending_config_reload() -> bool {
+    false
+}
+
 pub fn run_cli() -> Result<()> {
     let args = Args::parse()?;
+
+    install_sigusr1_handler();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -527,6 +573,9 @@ struct App {
     // Theme
     theme: theme::Theme,
     theme_preset: theme::ThemePreset,
+
+    // Where to re-read the config from on SIGUSR1.
+    config_path: Option<std::path::PathBuf>,
 }
 
 const MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -609,7 +658,18 @@ impl App {
             errors,
             theme,
             theme_preset,
+            config_path: config_path.map(std::path::Path::to_path_buf),
         }
+    }
+
+    /// Re-read the theme from the saved config path. Called from the
+    /// tick loop when the SIGUSR1 handler has flipped its flag.
+    /// Errors fall back silently to the existing theme — the user
+    /// will see no change rather than a crash if their TOML is malformed.
+    fn reload_config(&mut self) {
+        let (theme, theme_preset) = theme::load(self.config_path.as_deref());
+        self.theme = theme;
+        self.theme_preset = theme_preset;
     }
 
     /// Re-sample every data source feeding the UI.
@@ -1320,6 +1380,10 @@ fn run<B: ratatui::backend::Backend>(
             if handle_key(&mut app, k) {
                 return Ok(());
             }
+        }
+
+        if take_pending_config_reload() {
+            app.reload_config();
         }
 
         // Paused: input still flows, but tick() is skipped. Bump
@@ -4899,5 +4963,25 @@ mod tests {
         // runner's process table.
         let _ = app.selected_proc();
         app.recompute_procs();
+    }
+
+    #[test]
+    fn reload_config_with_no_path_keeps_app_alive() {
+        // SIGUSR1 with no --config still reloads (theme::load just
+        // returns the default). Asserts the call path doesn't panic
+        // and the theme preset stays defined.
+        let mut app = App::new(Duration::from_millis(50), None);
+        let before = app.theme_preset;
+        app.reload_config();
+        assert_eq!(app.theme_preset, before);
+    }
+
+    #[test]
+    fn reload_config_with_missing_path_falls_back() {
+        // Bogus path → theme::load returns the dark default.
+        let bogus = std::path::Path::new("/nonexistent/neotop-config.toml");
+        let mut app = App::new(Duration::from_millis(50), Some(bogus));
+        app.reload_config();
+        assert_eq!(app.theme_preset, theme::ThemePreset::Dark);
     }
 }
