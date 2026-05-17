@@ -3167,12 +3167,38 @@ fn paused_badge(theme: &theme::Theme) -> Span<'static> {
 
 fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let total = app.procs_all.len();
-    let visible = app.procs_visible.len();
+    // In group / group+tree mode `procs_visible` interleaves synthetic
+    // group-header rows with member processes; counting headers would
+    // make `visible` exceed `total`. Only real process rows count.
+    let visible = app
+        .procs_visible
+        .iter()
+        .filter(|r| r.header.is_none())
+        .count();
     let mode_label = match app.list_mode {
         ListMode::Flat => " flat",
         ListMode::Tree => " tree",
         ListMode::Group => " group",
         ListMode::GroupTree => " group+tree",
+    };
+    let groups = app
+        .procs_visible
+        .iter()
+        .filter(|r| r.header.is_some())
+        .count();
+    let count_span = match app.list_mode {
+        ListMode::Group | ListMode::GroupTree => {
+            format!(
+                "  {groups} groups · {visible}/{total} processes ·{mode_label} · sort {}{}",
+                app.procs_sort.label(),
+                app.procs_sort.arrow(),
+            )
+        }
+        _ => format!(
+            "  {visible}/{total} processes ·{mode_label} · sort {}{}",
+            app.procs_sort.label(),
+            app.procs_sort.arrow(),
+        ),
     };
     let mut title = vec![
         Span::styled(
@@ -3182,11 +3208,7 @@ fn draw_title_procs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .bg(app.theme.badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  {visible}/{total} processes ·{mode_label} · sort {}{}",
-            app.procs_sort.label(),
-            app.procs_sort.arrow(),
-        )),
+        Span::raw(count_span),
     ];
     if app.paused {
         title.push(paused_badge(&app.theme));
@@ -4622,6 +4644,41 @@ mod tests {
             "java:app.jar [vthreads]"
         );
         assert_eq!(rows[v[1].idx].pid, 1);
+    }
+
+    #[test]
+    fn grouped_process_count_excludes_synthetic_headers() {
+        // Regression: title bar used to show `visible/total` where
+        // `visible = procs_visible.len()`, but in group mode that
+        // includes synthetic header rows — producing nonsense like
+        // `436/367 processes` when 69 group headers were stacked
+        // on top of 367 real rows.
+        let rows = vec![
+            p_with_group(
+                1,
+                "java -jar",
+                20.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Java, "app.jar".into()),
+            ),
+            p_with_group(
+                2,
+                "node server",
+                5.0,
+                0,
+                groups::Group::Runtime(groups::Lang::Node, "server.js".into()),
+            ),
+        ];
+        let names = groups::ContainerNames::default();
+        let v = compute_visible_grouped(&rows, procs::SortBy::Cpu, "", &names, false);
+        let headers = v.iter().filter(|r| r.header.is_some()).count();
+        let members = v.iter().filter(|r| r.header.is_none()).count();
+        assert_eq!(headers, 2, "one header per distinct group");
+        assert_eq!(members, rows.len(), "every real process appears once");
+        assert!(
+            members <= rows.len(),
+            "real-process count never exceeds total"
+        );
     }
 
     fn iface(name: &str, rx: Option<u64>, tx: Option<u64>) -> net::Iface {
