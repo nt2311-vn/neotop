@@ -5077,3 +5077,64 @@ mod tests {
         assert_eq!(app.theme_preset, theme::ThemePreset::Dark);
     }
 }
+
+// Bench-only public hooks. Stable owned-input / owned-output signatures
+// so the rest of the crate can keep its types `pub(crate)`. Not part
+// of any stable API; gated behind `#[doc(hidden)]` so rustdoc users
+// don't see them.
+#[doc(hidden)]
+pub mod bench_api {
+    /// Classify a process by argv + optional cgroup hint. Returns a
+    /// `Debug` repr of the resulting `Group` so benches don't need to
+    /// see the `Group` enum.
+    #[cfg(target_os = "linux")]
+    pub fn classify_to_debug(cmdline: &str, cgroup: Option<&str>) -> String {
+        format!("{:?}", crate::groups::classify_process(cmdline, cgroup))
+    }
+
+    /// End-to-end /proc snapshot. Returns the row count so the
+    /// compiler can't optimise the call away.
+    #[cfg(target_os = "linux")]
+    pub fn run_procs_snapshot() -> usize {
+        let mut tracker = crate::procs::Tracker::default();
+        let passwd = crate::procs::PasswdCache::load();
+        let clk = crate::proc::clk_tck();
+        tracker.snapshot(&passwd, clk).len()
+    }
+
+    /// Build an orbit frame from `n_rows` synthetic processes whose
+    /// CPU% varies linearly across the range. `prev_pid_count` controls
+    /// how many of those PIDs were "present last tick" (drives the
+    /// `new_pids` diff cost). Returns the resulting frame size.
+    pub fn run_orbit_build(n_rows: usize, prev_pid_count: usize) -> usize {
+        use crate::groups::Group;
+        use crate::orbit::OrbitFrame;
+        use crate::procs::ProcessRow;
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            clippy::cast_precision_loss
+        )]
+        let rows: Vec<ProcessRow> = (0..n_rows)
+            .map(|i| ProcessRow {
+                pid: (i as i32).saturating_add(1),
+                ppid: 1,
+                uid: 1000,
+                user: "u".into(),
+                state: 'S',
+                cpu_pct: Some(((i as f64) / (n_rows.max(1) as f64)) * 100.0),
+                rss_bytes: 4096,
+                threads: 1,
+                read_bps: None,
+                write_bps: None,
+                command: format!("synthetic-cmd-{i}"),
+                group: Group::Native(String::new()),
+            })
+            .collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let prev_pids: std::collections::HashSet<i32> =
+            (1..=(prev_pid_count.min(n_rows) as i32)).collect();
+        OrbitFrame::build(&rows, &prev_pids).processes.len()
+    }
+}
