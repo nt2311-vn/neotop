@@ -17,6 +17,37 @@ use std::time::Instant;
 
 use crate::groups::{Container, ContainerRuntime};
 
+const RUNTIME_BASENAMES: &[&str] = &[
+    "com.docker.backend",
+    "com.docker.virtualization",
+    "com.docker.vmnetd",
+    "docker",
+    "dockerd",
+    "podman",
+    "podman-mac-helper",
+    "containerd",
+    "containerd-shim",
+    "containerd-shim-runc-v2",
+];
+
+fn classify_runtime_basename(name: &str) -> Option<ContainerRuntime> {
+    if !RUNTIME_BASENAMES.contains(&name) {
+        return None;
+    }
+    match name {
+        "com.docker.backend"
+        | "com.docker.virtualization"
+        | "com.docker.vmnetd"
+        | "docker"
+        | "dockerd" => Some(ContainerRuntime::Docker),
+        "podman" | "podman-mac-helper" => Some(ContainerRuntime::Podman),
+        "containerd" | "containerd-shim" | "containerd-shim-runc-v2" => {
+            Some(ContainerRuntime::Containerd)
+        }
+        _ => None,
+    }
+}
+
 /// Cache of parent PIDs to avoid repeated syscalls
 #[derive(Debug, Default)]
 pub(crate) struct ContainerDetector {
@@ -114,15 +145,6 @@ impl ContainerDetector {
 
     /// Find PIDs of known container runtime processes
     fn find_runtime_pids(&self) -> Vec<pid_t> {
-        let runtime_names = [
-            "com.docker.backend",
-            "docker",
-            "podman",
-            "containerd",
-            "containerd-shim",
-            "qemu-system-x86_64", // Used by Docker Desktop Linux VM
-        ];
-
         let mut pids = Vec::new();
 
         // Get all PIDs using proc_listallpids
@@ -144,12 +166,8 @@ impl ContainerDetector {
                 continue;
             }
             if let Some(name) = self.get_proc_name(pid) {
-                let name_lower = name.to_lowercase();
-                for runtime in &runtime_names {
-                    if name_lower.contains(runtime) {
-                        pids.push(pid);
-                        break;
-                    }
+                if classify_runtime_basename(&name).is_some() {
+                    pids.push(pid);
                 }
             }
         }
@@ -180,20 +198,8 @@ impl ContainerDetector {
 
     /// Check if a PID is a container runtime and return the runtime type
     fn check_runtime(&self, pid: pid_t) -> Option<ContainerRuntime> {
-        if let Some(name) = self.get_proc_name(pid) {
-            let name_lower = name.to_lowercase();
-            if name_lower.contains("docker") {
-                return Some(ContainerRuntime::Docker);
-            } else if name_lower.contains("podman") {
-                return Some(ContainerRuntime::Podman);
-            } else if name_lower.contains("containerd") {
-                return Some(ContainerRuntime::Containerd);
-            } else if name_lower.contains("qemu") {
-                // Docker Desktop uses QEMU for the Linux VM
-                return Some(ContainerRuntime::Docker);
-            }
-        }
-        None
+        let name = self.get_proc_name(pid)?;
+        classify_runtime_basename(&name)
     }
 
     /// Extract container ID from a process
@@ -210,5 +216,39 @@ impl ContainerDetector {
 
         // Fallback: use PID as ID (not ideal but functional)
         Some(format!("{pid:x}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_desktop_helper_renderer_is_not_runtime() {
+        assert_eq!(
+            classify_runtime_basename("Docker Desktop Helper (Renderer)"),
+            None
+        );
+    }
+
+    #[test]
+    fn docker_desktop_app_is_not_runtime() {
+        assert_eq!(classify_runtime_basename("Docker Desktop"), None);
+    }
+
+    #[test]
+    fn com_docker_backend_is_docker_runtime() {
+        assert_eq!(
+            classify_runtime_basename("com.docker.backend"),
+            Some(ContainerRuntime::Docker)
+        );
+    }
+
+    #[test]
+    fn containerd_shim_is_containerd_runtime() {
+        assert_eq!(
+            classify_runtime_basename("containerd-shim-runc-v2"),
+            Some(ContainerRuntime::Containerd)
+        );
     }
 }
