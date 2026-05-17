@@ -12,9 +12,97 @@
 //! Pure helpers + `compute_glyphs`; the renderer in `main.rs` walks
 //! the returned `Vec<Cell>` and paints each instruction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::procs::ProcessRow;
+
+/// CPU% at or above which a PID is recorded as "heavy" for the
+/// session. Picked low enough to catch bursty workloads that spend
+/// most of their life idle, high enough that a brief uptick on
+/// every desktop process doesn't fill the anchor table.
+pub(crate) const HEAVY_THRESHOLD: f64 = 20.0;
+
+/// Cap on `HeavyAnchor::heavy`. Keeps the structure bounded across
+/// long sessions on busy hosts; 32 comfortably exceeds the orbit
+/// chart's `ORBIT_TOP_N` so eviction only fires once the user has
+/// genuinely outgrown the chart's display capacity.
+pub(crate) const HEAVY_MAX: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct HeavyEntry {
+    peak_cpu: f64,
+    last_seen_tick: u64,
+}
+
+/// Session-scoped memory of PIDs that have ever crossed
+/// `HEAVY_THRESHOLD`. The orbit chart consults this set when the
+/// user toggles anchor mode so a bursty workload keeps its slot
+/// between bursts instead of dropping out of the top-N every time
+/// it goes briefly idle.
+///
+/// Eviction is by peak CPU rather than recency: a process that
+/// hit 90% an hour ago is more interesting to keep visible than
+/// one that just barely crossed the threshold a moment ago.
+#[derive(Debug, Default)]
+pub(crate) struct HeavyAnchor {
+    heavy: HashMap<i32, HeavyEntry>,
+}
+
+impl HeavyAnchor {
+    pub(crate) fn observe(&mut self, rows: &[ProcessRow], tick: u64) {
+        for r in rows {
+            let cpu = r.cpu_pct.unwrap_or(0.0);
+            if cpu < HEAVY_THRESHOLD {
+                continue;
+            }
+            self.heavy
+                .entry(r.pid)
+                .and_modify(|e| {
+                    if cpu > e.peak_cpu {
+                        e.peak_cpu = cpu;
+                    }
+                    e.last_seen_tick = tick;
+                })
+                .or_insert(HeavyEntry {
+                    peak_cpu: cpu,
+                    last_seen_tick: tick,
+                });
+        }
+        while self.heavy.len() > HEAVY_MAX {
+            let victim = self
+                .heavy
+                .iter()
+                .min_by(|(_, a), (_, b)| {
+                    a.peak_cpu
+                        .partial_cmp(&b.peak_cpu)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.last_seen_tick.cmp(&b.last_seen_tick))
+                })
+                .map(|(pid, _)| *pid);
+            if let Some(pid) = victim {
+                self.heavy.remove(&pid);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn anchor_pids(&self) -> HashSet<i32> {
+        self.heavy.keys().copied().collect()
+    }
+
+    // Provided for callers that learn of a PID exit out-of-band;
+    // the current orbit path lets eviction handle stale PIDs.
+    #[allow(dead_code)]
+    pub(crate) fn forget(&mut self, pid: i32) {
+        self.heavy.remove(&pid);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear(&mut self) {
+        self.heavy.clear();
+    }
+}
 
 /// One process represented on the orbit ring.
 #[derive(Debug, Clone)]
@@ -64,6 +152,21 @@ impl OrbitFrame {
     /// `prev_pids` is the PID set from the previous tick; PIDs in
     /// the new top-N but not in `prev_pids` go into `new_pids`.
     pub(crate) fn build(rows: &[ProcessRow], prev_pids: &HashSet<i32>) -> Self {
+        Self::build_with_anchors(rows, prev_pids, &HashSet::new())
+    }
+
+    /// Like `build`, but reserve slots at the front of the frame
+    /// for every PID in `anchors` that's still alive in `rows`.
+    /// Anchored rows skip the top-N CPU race so a bursty workload
+    /// stays visible while idle. The remaining slots fill from
+    /// the non-anchored rows by CPU desc, matching `build`'s
+    /// ordering rule. When `anchors` is empty the output is
+    /// bit-identical to `build` (pinned by tests).
+    pub(crate) fn build_with_anchors(
+        rows: &[ProcessRow],
+        prev_pids: &HashSet<i32>,
+        anchors: &HashSet<i32>,
+    ) -> Self {
         let mut ranked: Vec<(&ProcessRow, f64)> = rows
             .iter()
             .filter(|r| !r.command.is_empty())
@@ -77,9 +180,28 @@ impl OrbitFrame {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.pid.cmp(&b.0.pid))
         });
-        ranked.truncate(ORBIT_TOP_N);
 
-        let processes: Vec<OrbitProc> = ranked
+        let mut picked: Vec<(&ProcessRow, f64)> = Vec::with_capacity(ORBIT_TOP_N);
+        if !anchors.is_empty() {
+            for entry in &ranked {
+                if picked.len() >= ORBIT_TOP_N {
+                    break;
+                }
+                if anchors.contains(&entry.0.pid) {
+                    picked.push(*entry);
+                }
+            }
+        }
+        for entry in &ranked {
+            if picked.len() >= ORBIT_TOP_N {
+                break;
+            }
+            if anchors.is_empty() || !anchors.contains(&entry.0.pid) {
+                picked.push(*entry);
+            }
+        }
+
+        let processes: Vec<OrbitProc> = picked
             .into_iter()
             .map(|(r, cpu)| OrbitProc {
                 pid: r.pid,
@@ -360,6 +482,83 @@ mod tests {
         assert!(frame.new_pids.contains(&10));
         assert!(!frame.new_pids.contains(&20));
         assert!(frame.new_pids.contains(&30));
+    }
+
+    #[test]
+    fn build_with_anchors_empty_matches_build() {
+        let rows = vec![
+            mk_proc(10, 90.0, 'R', "hot"),
+            mk_proc(20, 50.0, 'R', "warm"),
+            mk_proc(30, 1.0, 'S', "cool"),
+            mk_proc(40, 0.0, 'S', "idle"),
+            mk_proc(50, 50.0, 'R', "tie"),
+        ];
+        let mut prev = HashSet::new();
+        prev.insert(20);
+        let a = OrbitFrame::build(&rows, &prev);
+        let b = OrbitFrame::build_with_anchors(&rows, &prev, &HashSet::new());
+        let pids_a: Vec<i32> = a.processes.iter().map(|p| p.pid).collect();
+        let pids_b: Vec<i32> = b.processes.iter().map(|p| p.pid).collect();
+        assert_eq!(pids_a, pids_b);
+        assert_eq!(a.new_pids, b.new_pids);
+    }
+
+    #[test]
+    fn heavy_anchor_observes_only_above_threshold() {
+        let rows = vec![mk_proc(1, 5.0, 'S', "quiet"), mk_proc(2, 25.0, 'R', "busy")];
+        let mut anchor = HeavyAnchor::default();
+        anchor.observe(&rows, 0);
+        let pids = anchor.anchor_pids();
+        assert!(!pids.contains(&1));
+        assert!(pids.contains(&2));
+    }
+
+    #[test]
+    fn heavy_anchor_evicts_lowest_peak_when_full() {
+        let mut anchor = HeavyAnchor::default();
+        // First HEAVY_MAX entries each have a unique, ascending peak;
+        // pid 1000 owns the lowest peak (HEAVY_THRESHOLD).
+        for i in 0..HEAVY_MAX {
+            #[allow(clippy::cast_precision_loss)]
+            let cpu = HEAVY_THRESHOLD + i as f64;
+            let pid = 1000 + i32::try_from(i).unwrap();
+            anchor.observe(&[mk_proc(pid, cpu, 'R', "x")], 0);
+        }
+        assert_eq!(anchor.anchor_pids().len(), HEAVY_MAX);
+        // One more heavy PID with a higher peak forces eviction of
+        // the lowest-peak entry (pid 1000).
+        anchor.observe(&[mk_proc(9999, 99.0, 'R', "x")], 1);
+        let pids = anchor.anchor_pids();
+        assert_eq!(pids.len(), HEAVY_MAX);
+        assert!(!pids.contains(&1000));
+        assert!(pids.contains(&9999));
+    }
+
+    #[test]
+    fn build_with_anchors_reserves_slot_for_quiet_anchor() {
+        // ORBIT_TOP_N hot rows would normally crowd out the quiet
+        // anchored PID; the anchor reservation must rescue it.
+        let mut rows: Vec<ProcessRow> = (0..ORBIT_TOP_N)
+            .map(|i| mk_proc(100 + i32::try_from(i).unwrap(), 50.0, 'R', "hot"))
+            .collect();
+        let quiet_pid = 7;
+        rows.push(mk_proc(quiet_pid, 0.5, 'S', "ghost"));
+        let mut anchors = HashSet::new();
+        anchors.insert(quiet_pid);
+        let frame = OrbitFrame::build_with_anchors(&rows, &HashSet::new(), &anchors);
+        assert!(frame.processes.iter().any(|p| p.pid == quiet_pid));
+        assert_eq!(frame.processes.len(), ORBIT_TOP_N);
+    }
+
+    #[test]
+    fn heavy_anchor_updates_peak() {
+        let mut anchor = HeavyAnchor::default();
+        anchor.observe(&[mk_proc(42, 25.0, 'R', "x")], 0);
+        anchor.observe(&[mk_proc(42, 30.0, 'R', "x")], 1);
+        assert_eq!(anchor.heavy.get(&42).map(|e| e.peak_cpu), Some(30.0));
+        // A lower subsequent reading must not lower the peak.
+        anchor.observe(&[mk_proc(42, 22.0, 'R', "x")], 2);
+        assert_eq!(anchor.heavy.get(&42).map(|e| e.peak_cpu), Some(30.0));
     }
 
     #[test]
