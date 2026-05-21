@@ -46,7 +46,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # Scorecard examines repo metadata + git history; full
           # history is not needed, but the default fetch-depth
@@ -55,7 +55,7 @@ jobs:
           persist-credentials: false
 
       - name: scorecard
-        uses: ossf/scorecard-action@v2.4.3
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
         with:
           results_file: results.sarif
           results_format: sarif
@@ -67,7 +67,7 @@ jobs:
           publish_results: true
 
       - name: upload scorecard SARIF
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4.35.5
         with:
           sarif_file: results.sarif
 
@@ -75,7 +75,7 @@ jobs:
       # GitHub trims SARIF for the Security tab; the artifact is
       # the full unfiltered output.
       - name: upload scorecard artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scorecard-results
           path: results.sarif
