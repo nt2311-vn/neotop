@@ -6,12 +6,10 @@
 //! The sysctl CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_IFLIST2 returns
 //! a binary structure containing interface names and statistics.
 
-use libc::{c_int, c_void, size_t};
-use std::collections::HashMap;
-use std::mem;
+use libc::{c_char, c_int, c_uint, c_void, size_t};
 use std::time::Instant;
 
-use crate::net::{Iface, Sample, Tracker};
+use crate::net::{Iface, Sample};
 
 /// sysctl MIB for NET_RT_IFLIST2
 const NET_RT_IFLIST2: c_int = 6;
@@ -89,12 +87,10 @@ impl crate::net::Tracker {
             // Get interface name from if_msghdr2
             let ifm2 = unsafe { *(buf.as_ptr().add(offset) as *const libc::if_msghdr2) };
 
-            let name = self.get_if_name(ifm2.ifm_data.ifi_type as i32, offset, buf);
-            if name.is_none() {
+            let Some(name) = if_index_to_name(c_uint::from(ifm2.ifm_index)) else {
                 offset += ifm.ifm_msglen as usize;
                 continue;
-            }
-            let name = name.unwrap();
+            };
 
             if self.skip_iface(&name) {
                 offset += ifm.ifm_msglen as usize;
@@ -149,53 +145,6 @@ impl crate::net::Tracker {
         ifaces
     }
 
-    fn get_if_name(&self, _if_type: i32, offset: usize, buf: &[u8]) -> Option<String> {
-        // The interface name is embedded in the if_msghdr structure
-        // For simplicity, we'll extract it from the sockaddr structures
-        // that follow the header. This is a simplified implementation.
-
-        // In a full implementation, we would parse the sockaddr structures
-        // that follow the if_msghdr to extract the interface name.
-        // For now, we'll use a heuristic approach.
-
-        // Skip the header
-        let header_size = mem::size_of::<libc::if_msghdr2>();
-        if offset + header_size > buf.len() {
-            return None;
-        }
-
-        // Try to find the interface name in the data
-        // This is a simplified approach - a full implementation would
-        // properly parse the sockaddr structures
-        let data_start = offset + header_size;
-        if data_start >= buf.len() {
-            return None;
-        }
-
-        // Look for a null-terminated string that could be the interface name
-        let mut name_end = data_start;
-        while name_end < buf.len() && buf[name_end] != 0 {
-            name_end += 1;
-        }
-
-        if name_end > data_start {
-            let name_bytes = &buf[data_start..name_end];
-            if let Ok(name) = std::str::from_utf8(name_bytes) {
-                // Filter out obviously non-interface names
-                if name.len() >= 2
-                    && name.len() <= 16
-                    && name.chars().all(|c| c.is_alphanumeric() || c == '-')
-                {
-                    return Some(name.to_string());
-                }
-            }
-        }
-
-        // Fallback: generate a placeholder name based on offset
-        // This is not ideal but ensures we don't crash
-        Some(format!("if{offset}"))
-    }
-
     fn skip_iface(&self, name: &str) -> bool {
         // Skip loopback and virtual interfaces
         name == "lo0"
@@ -203,4 +152,24 @@ impl crate::net::Tracker {
             || name.starts_with("utun")
             || name.starts_with("tun")
     }
+}
+
+/// Resolve a kernel interface index to its name via `if_indextoname(3)`.
+///
+/// Returns `None` when the index is unknown (interface vanished between
+/// the sysctl snapshot and this call) or the kernel-returned name is not
+/// valid UTF-8.
+fn if_index_to_name(index: c_uint) -> Option<String> {
+    // IFNAMSIZ is 16 on Darwin and already includes the trailing NUL.
+    let mut buf: [c_char; libc::IFNAMSIZ] = [0; libc::IFNAMSIZ];
+    // SAFETY: `buf` is a valid writable buffer of IF_NAMESIZE bytes, which
+    // is the contract `if_indextoname` documents. The returned pointer
+    // either equals `buf.as_mut_ptr()` on success or is null on failure.
+    let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` points into `buf`, which is null-terminated by libc.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    cstr.to_str().ok().map(str::to_owned)
 }
