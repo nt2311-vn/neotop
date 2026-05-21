@@ -14,6 +14,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Default to read-only; jobs widen explicitly when they need more.
+# Satisfies OpenSSF Scorecard's Token-Permissions check.
+permissions: read-all
+
 jobs:
   # Cross-platform build verification — ensures code compiles on macOS
   # even though Linux has the full feature set.  This job is
@@ -24,13 +28,13 @@ jobs:
     name: check (macos-latest)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
       - name: cargo build (macOS)
         run: cargo build --locked
@@ -51,14 +55,14 @@ jobs:
     name: cross-check (aarch64-apple-darwin)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           targets: aarch64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
       - name: cargo check --target aarch64-apple-darwin
         run: cargo check --target aarch64-apple-darwin --locked
@@ -78,14 +82,14 @@ jobs:
         # `stable` keeps us honest about the latest compiler too.
         rust: [stable, "1.88"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -115,19 +119,19 @@ jobs:
   security:
     name: security
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # Required for Semgrep's SARIF upload to the security tab on
-      # public repos. Harmless on private repos that disable it.
-      security-events: write
+    # Inherits top-level `permissions: read-all`. Previously this job
+    # widened to `security-events: write` for Semgrep's SARIF upload,
+    # but `semgrep/semgrep-action` is archived upstream; we drop the
+    # write scope to keep this job least-privileged. CodeQL covers
+    # the SAST → Security tab path in `codeql.yml`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           # Bust the cache when the lockfile or deny config moves —
           # both directly affect the audit / deny verdicts.
@@ -148,7 +152,7 @@ jobs:
       # versions, banned crates, sources, advisories. Stricter
       # than audit. Configured in `deny.toml` at the repo root.
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.9
         with:
           command: check advisories licenses bans sources
 
@@ -159,7 +163,10 @@ jobs:
       # excluded via .semgrepignore. Non-blocking so new findings
       # surface in logs without failing the pipeline.
       - name: semgrep
-        uses: semgrep/semgrep-action@v1
+        # semgrep/semgrep-action is archived/deprecated upstream as of
+        # 2024. Pinned for reproducibility; plan to migrate to a direct
+        # `semgrep ci` invocation or rely on CodeQL.
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
         continue-on-error: true
         with:
           config: >-

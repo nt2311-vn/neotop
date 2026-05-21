@@ -12,23 +12,22 @@ concurrency:
   group: security-${{ github.ref }}
   cancel-in-progress: true
 
+# Default to read-only; this workflow does not need any write scope
+# now that the (deprecated) Semgrep SARIF upload has been dropped.
+permissions: read-all
+
 jobs:
   scan:
     name: security-scan
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # Required for Semgrep's SARIF upload to the security tab on
-      # public repos. Harmless on private repos that disable it.
-      security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           # Bust the cache when the lockfile or deny config moves —
           # both directly affect the audit / deny verdicts.
@@ -49,7 +48,7 @@ jobs:
       # versions, banned crates, sources, advisories. Stricter
       # than audit. Configured in `deny.toml` at the repo root.
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.9
         with:
           command: check advisories licenses bans sources
 
@@ -60,7 +59,10 @@ jobs:
       # excluded via .semgrepignore. Non-blocking so new findings
       # surface in logs without failing the pipeline.
       - name: semgrep
-        uses: semgrep/semgrep-action@v1
+        # semgrep/semgrep-action is archived/deprecated upstream as of
+        # 2024. Pinned for reproducibility; plan to migrate to a direct
+        # `semgrep ci` invocation or rely on CodeQL.
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
         continue-on-error: true
         with:
           config: >-
