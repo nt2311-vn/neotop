@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] — orbit anchor mode, SIGUSR1 reload, macOS net names
+
+Minor release on top of v0.28.1. Mostly additive — one new TUI
+feature, one operational nicety, a handful of macOS / process-list
+fixes, and the foundation work (lib/bin split + criterion benches)
+that future contributors will build on.
+
+### Added
+
+- **Orbit heavy-PID anchor mode (`a`)** — bursty workloads (compilers,
+  container builds, batch jobs) routinely drop out of the orbit chart's
+  top-N between bursts, making them hard to track visually as the dot
+  vanishes and reappears at a different slot every spike. Anchor mode
+  remembers any PID that ever crossed 20 % CPU this session and reserves
+  a slot for it on the ring even when its current CPU is near zero, so
+  the gaps between bursts are visible as data instead of noise. Toggle
+  with lowercase `a`; off by default. Session memory is bounded at 32
+  PIDs, evicting the lowest peak CPU first (last-seen tick as
+  tiebreaker) so the historically most-interesting workload stays
+  visible.
+- **`SIGUSR1` reloads the config without restarting** — iterating on
+  the TOML used to require quitting and relaunching the TUI to see
+  theme changes (apart from the four-way `T` cycle, which ignores the
+  file). `kill -USR1 $(pidof neotop)` now re-reads the config and
+  refreshes the theme without dropping a single tick. Linux + macOS
+  only; the handler body is one async-signal-safe `Relaxed` atomic
+  store.
+- **Criterion benchmarks** — `benches/classify.rs`,
+  `benches/orbit_build.rs`, `benches/procs_snapshot.rs` cover the three
+  hottest call paths; a doc-hidden `bench_api` module wraps the
+  internal `pub(crate)` calls behind stable owned-input / owned-output
+  signatures so the crate's real type surface stays unchanged.
+- **CLI smoke integration test** — `tests/cli_smoke.rs` exercises
+  `--help`, `--version`, and unknown-flag handling against the built
+  binary so a release that hangs the CLI flag parser fails CI.
+
+### Fixed
+
+- **macOS network interface names** — `src/net_macos.rs` was scanning
+  the `sysctl` buffer with a heuristic that frequently produced strings
+  like `if01023` / `ig232131` (the buffer offset rendered as text)
+  instead of real interface names. Replaced the heuristic with a
+  single `if_indextoname(3)` call against the `ifm_index` already
+  present in the `if_msghdr2` struct the kernel returns. Names now
+  match `ifconfig` (`en0`, `bridge0`, `awdl0`, etc.) exactly.
+- **macOS container-runtime allowlist** — Docker Desktop ships several
+  Electron helper processes (`Docker Desktop Helper (Renderer)`,
+  `Docker Desktop Helper (GPU)`, etc.) whose basenames contain the
+  substring `docker`. The previous substring check in
+  `find_runtime_pids` / `check_runtime` tagged every one of those
+  helpers as a container runtime and fabricated bogus container IDs
+  for unrelated UI processes. Replaced with an exact, case-sensitive
+  basename allowlist (`com.docker.backend`, `com.docker.virtualization`,
+  `com.docker.vmnetd`, `docker`, `dockerd`, `podman`,
+  `podman-mac-helper`, `containerd`, `containerd-shim`,
+  `containerd-shim-runc-v2`) routed through a single
+  `classify_runtime_basename` helper. Dropped the
+  `qemu-system-x86_64` entry — generic QEMU is not a container runtime
+  and is already covered by the VM group.
+- **Process count in group / group+tree mode** — `procs_visible`
+  interleaves synthetic group-header rows with member processes, and
+  the previous code counted headers as processes. The result was
+  nonsense like `436/367 processes` when 69 group headers were
+  stacked on top of 367 real rows. Now filters to `header.is_none()`
+  for the visible count and surfaces the header count separately as
+  `N groups` in the title for grouped modes. Regression test pins
+  `members ≤ total`.
+
+### Changed
+
+- **Lib + bin split** — all module declarations and the TUI driver
+  moved out of `main.rs` into a new `lib.rs`. `main.rs` is now a
+  three-line shim that calls `neotop::run_cli()`. Integration tests
+  under `tests/` and criterion benches under `benches/` can now
+  `use neotop::*`. Modules become `pub mod X` because that is the
+  surface area benches and integration tests need; the crate is
+  consumed almost exclusively as a binary (`cargo install neotop`)
+  and the lib API is internal-use, not promised stable across patch
+  releases.
+
+### Security / CI
+
+- **Workflow hardening (Scorecard cleanup)** — every `uses:` line in
+  the five workflow files is now pinned to a 40-char commit SHA with a
+  trailing `# vX.Y.Z` comment (Dependabot still proposes updates).
+  Every workflow declares `permissions: read-all` at the top level;
+  individual jobs widen only when strictly necessary. The deprecated
+  Semgrep SARIF-upload widening (`security-events: write`) is dropped
+  from the `security` job in `ci.yml` and `security.yml` — CodeQL
+  covers the SAST → Security tab path. Clears 40 OpenSSF Scorecard
+  findings (33 × `PinnedDependenciesID`, 7 × `TokenPermissionsID`).
+
 ## [0.28.1] — macOS: real RAM total, balanced per-core grid
 
 Patch release on top of v0.28.0. Two visible regressions in the
