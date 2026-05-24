@@ -152,7 +152,7 @@ jobs:
       # versions, banned crates, sources, advisories. Stricter
       # than audit. Configured in `deny.toml` at the repo root.
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.9
+        uses: EmbarkStudios/cargo-deny-action@a531616d8ce3b9177443e48a1159bc945a099823 # v2.0.9
         with:
           command: check advisories licenses bans sources
 
